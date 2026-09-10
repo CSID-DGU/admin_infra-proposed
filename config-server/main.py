@@ -70,6 +70,8 @@ UID_MAX = int(os.getenv("UID_MAX", "0")) or None
 # 사용자 Pod NodePort 대역 — 클러스터 전체에서 공유되므로 스택끼리 같은 순간 같은 포트를 고르지 않게 나눈다.
 NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
+# 제안 시스템 조건(noprobe | full). 실제 접근 시험(probe)을 수행할지를 이 값 하나로 가른다.
+VERIFY_MODE = os.getenv("VERIFY_MODE", "noprobe")
 app.config.from_mapping({
     # Namespace
     "NAMESPACE": "ailab-infra",

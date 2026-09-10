@@ -1,0 +1,73 @@
+# config-server용(인증 없음, 운영 redis-bg와 같은 이름)과 admin_be용(비밀번호 있음, 운영 my-redis와 같은 방식)
+# 두 대. 실험 스택은 영속화가 필요 없어 디스크를 쓰지 않는다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-bg-master
+  namespace: __NS__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-bg
+  template:
+    metadata:
+      labels:
+        app: redis-bg
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-bg-master
+  namespace: __NS__
+spec:
+  selector:
+    app: redis-bg
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-redis
+  namespace: __NS__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admin-redis
+  template:
+    metadata:
+      labels:
+        app: admin-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command: ["sh", "-c", "exec redis-server --requirepass \"$REDIS_PASSWORD\" --save '' --appendonly no"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: stack-db
+                  key: admin_redis
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-redis
+  namespace: __NS__
+spec:
+  selector:
+    app: admin-redis
+  ports:
+    - port: 6379
