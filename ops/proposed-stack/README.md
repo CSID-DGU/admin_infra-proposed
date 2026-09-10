@@ -37,7 +37,7 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | 3 | DB 비밀번호를 무작위로 만들어 `stack-db` 시크릿에 저장(한 번만) |
 | 4 | MySQL 한 대에 `pod_port_db`, `operation_state_db`, `web_admin`을 만들고 `infra-sql`의 테이블 정의 적용 |
 | 5 | Redis 두 대(config-server용 인증 없음, admin_be용 비밀번호) |
-| 6 | 이미지 저장 PVC |
+| 6 | 이미지 저장소는 임시 디스크를 씀(사용자 이미지 커밋·재시작용이라 실험에 필요 없음) |
 | 7 | 계정 대장 경로 생성 |
 | 8 | config-server 설치. NFS·NAS·Kerberos·farm 설정은 운영 릴리스 값을 그대로 쓰고 스택별 값만 덮어씀 |
 | 9 | admin_be 설치. 운영 이미지를 digest로 고정하고 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스와 DNS 외에는 나가는 연결을 네트워크 정책으로 막음 |
