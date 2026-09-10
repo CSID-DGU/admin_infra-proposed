@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
 #
-#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)>
+#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지]
 #
 # admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
 # 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
@@ -9,6 +9,7 @@ set -euo pipefail
 
 STACK=${1:?"스택 이름(noprobe|full)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
+FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 [ -r /etc/kubernetes/ci-deployer.conf ] && export KUBECONFIG=/etc/kubernetes/ci-deployer.conf
@@ -20,8 +21,8 @@ PROD_BE_NS=default
 # 할당 값. 운영(UID 20000대, NodePort 30000~32767 전체, config-server 30082, admin_be 30083)과
 # 겹치지 않게 잡았다. 바꿀 때는 docs/환경 구축 가이드의 표도 같이 고친다.
 case "$STACK" in
-  noprobe) UID_MIN=50000; UID_MAX=54999; NP_MIN=32000; NP_MAX=32249; CONFIG_NODEPORT=30182; PREFIX=exp-np- ;;
-  full)    UID_MIN=55000; UID_MAX=59999; NP_MIN=32250; NP_MAX=32499; CONFIG_NODEPORT=30282; PREFIX=exp-fu- ;;
+  noprobe) UID_MIN=50000; UID_MAX=54999; NP_MIN=32000; NP_MAX=32249; CONFIG_NODEPORT=30182; FE_NODEPORT=30183; PREFIX=exp-np- ;;
+  full)    UID_MIN=55000; UID_MAX=59999; NP_MIN=32250; NP_MAX=32499; CONFIG_NODEPORT=30282; FE_NODEPORT=30283; PREFIX=exp-fu- ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 NS=ailab-$STACK
@@ -39,10 +40,12 @@ PROD_POD=$(running_pod "$PROD_NS" app=containerssh-config-server)
 [ -n "$PROD_POD" ] || { echo "운영 config-server Pod를 찾지 못함"; exit 1; }
 USED=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
 [ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
-TAKEN=$(kubectl get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{range .spec.ports[*]}{.nodePort}{" "}{end}{"\n"}{end}' \
-  | awk -v ns="$NS" -v p="$CONFIG_NODEPORT" '$1 != ns { for (i = 2; i <= NF; i++) if ($i == p) c++ } END { print c+0 }')
-[ "$TAKEN" = 0 ] || { echo "nodePort $CONFIG_NODEPORT를 다른 네임스페이스가 쓰고 있음"; exit 1; }
-echo "UID $UID_MIN~$UID_MAX 비어 있음, config-server nodePort $CONFIG_NODEPORT 사용 가능"
+for PORT in "$CONFIG_NODEPORT" "$FE_NODEPORT"; do
+  TAKEN=$(kubectl get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{range .spec.ports[*]}{.nodePort}{" "}{end}{"\n"}{end}' \
+    | awk -v ns="$NS" -v p="$PORT" '$1 != ns { for (i = 2; i <= NF; i++) if ($i == p) c++ } END { print c+0 }')
+  [ "$TAKEN" = 0 ] || { echo "nodePort $PORT를 다른 네임스페이스가 쓰고 있음"; exit 1; }
+done
+echo "UID $UID_MIN~$UID_MAX 비어 있음, nodePort $CONFIG_NODEPORT(config-server)·$FE_NODEPORT(프론트엔드) 사용 가능"
 
 step "네임스페이스 $NS"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -153,9 +156,17 @@ kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
 kubectl -n "$NS" rollout status deployment/admin-redis --timeout=5m
 echo "admin_be 이미지: ${ADMIN_IMAGE##*@}"
 
+step "프론트엔드"
+if [ -n "$FE_IMAGE" ]; then
+  render "$HERE/admin-fe.yaml" | sed -e "s|__FE_IMAGE__|$FE_IMAGE|" -e "s|__FE_NODEPORT__|$FE_NODEPORT|" | kubectl apply -f -
+  kubectl -n "$NS" rollout status deployment/ailab-frontend --timeout=5m
+else
+  echo "프론트엔드 이미지가 없어 건너뜀"
+fi
+
 step "검증 (테스트 계정 ${PREFIX}000 생성 후 삭제)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" python - <<'PY'
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" python - <<'PY'
 import base64, os, sys, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
@@ -170,6 +181,16 @@ try:
     check("admin_be(WAS) 응답", True, r.status_code)
 except Exception as e:
     check("admin_be(WAS) 응답", False, type(e).__name__)
+fe = os.environ.get("FE", "")
+if fe:
+    try:
+        r = requests.get(f"{fe}/", timeout=10)
+        check("프론트엔드 응답", r.status_code == 200, r.status_code)
+        # /api/는 nginx가 이 스택의 admin_be로 넘긴다. 502·504면 대상이 틀렸거나 닿지 않는 것이다.
+        r = requests.get(f"{fe}/api/requests/config/{name}", timeout=10)
+        check("프론트엔드 /api/ → 스택 admin_be", r.status_code not in (502, 503, 504), r.status_code)
+    except Exception as e:
+        check("프론트엔드 응답", False, type(e).__name__)
 requests.delete(f"{base}/accounts/users/{name}", timeout=120)  # 이전 실행에서 남은 것이 있으면 정리
 r = requests.put(f"{base}/accounts/users", timeout=120, json={
     "request_id": f"smoke-{name}", "name": name, "passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode(),
@@ -189,6 +210,7 @@ LEAK=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- sh -c "grep -c '^${PREFIX}' /ku
 step "완료"
 echo "네임스페이스      $NS"
 echo "config-server     $RELEASE (nodePort $CONFIG_NODEPORT, 이미지 태그 ${IMAGE##*:})"
+[ -n "$FE_IMAGE" ] && echo "프론트엔드        nodePort $FE_NODEPORT (http://<노드 IP>:$FE_NODEPORT)"
 echo "UID 대역          $UID_MIN~$UID_MAX"
 echo "NodePort 대역     $NP_MIN~$NP_MAX"
 echo "테스트 계정 접두어 $PREFIX"
