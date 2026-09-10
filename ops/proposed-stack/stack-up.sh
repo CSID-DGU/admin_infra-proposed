@@ -134,7 +134,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set service.nodePort="$CONFIG_NODEPORT" \
   --set nfs.kubeSharePath="$KUBE_SHARE/exp-$STACK" \
   --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
-  --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" \
+  --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
   --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
   --set verifyMode="$STACK" \
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
@@ -182,8 +182,8 @@ fi
 
 step "검증 (테스트 계정 ${PREFIX}000 생성 후 삭제)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" FE_HOST="$FE_HOST" python - <<'PY'
-import base64, os, sys, requests
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" PREFIX="$PREFIX" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" FE_HOST="$FE_HOST" python - <<'PY'
+import base64, os, sys, time, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
 ok = True
@@ -192,11 +192,20 @@ def check(label, cond, detail=""):
     print(("OK  " if cond else "NG  ") + label + ("" if cond else f"  ({detail})"))
     ok = ok and cond
 was = os.environ.get("ADMIN_BE_INTERNAL_URL", "")
-try:
-    r = requests.get(f"{was}/api/requests/config/{name}", timeout=10)
-    check("admin_be(WAS) 응답", True, r.status_code)
-except Exception as e:
-    check("admin_be(WAS) 응답", False, type(e).__name__)
+# admin_be를 막 교체한 직후에는 옛 Pod 주소로 가는 연결이 잠시 남을 수 있어 1분까지 기다린다.
+err = ""
+for _ in range(12):
+    try:
+        requests.get(f"{was}/api/requests/config/{name}", timeout=5)
+        err = ""
+        break
+    except Exception as e:
+        err = type(e).__name__
+        time.sleep(5)
+check("admin_be(WAS) 응답", not err, err)
+# 접두어 없는 이름은 거절돼야 한다. 이 이름은 스택 계정 대장에 없어서, 막히지 않더라도 404로 끝나고 아무것도 건드리지 않는다.
+r = requests.delete(f"{base}/accounts/users/guardprobe000", timeout=30)
+check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
 fe = os.environ.get("FE", "")
 if fe:
     try:

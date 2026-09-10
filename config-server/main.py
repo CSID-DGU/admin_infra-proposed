@@ -72,6 +72,31 @@ NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
 # 제안 시스템 조건(noprobe | full). 실제 접근 시험(probe)을 수행할지를 이 값 하나로 가른다.
 VERIFY_MODE = os.getenv("VERIFY_MODE", "noprobe")
+# 실험 스택은 AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이것들은 이름으로 식별된다.
+# 접두어를 주면 그 접두어로 시작하지 않는 이름은 받지 않아, 운영 계정을 덮어쓰거나 지우지 못하게 한다.
+# 비워 두면(운영) 제한 없음.
+ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "")
+
+
+@app.before_request
+def _enforce_account_prefix():
+    if not ACCOUNT_PREFIX or request.method not in ("POST", "PUT", "DELETE"):
+        return None
+    names = []
+    if request.view_args and "username" in request.view_args:
+        names.append(request.view_args["username"])
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        if request.path in ("/create-pod", "/migrate"):
+            names.append(body.get("username"))
+        elif request.path == "/accounts/users" and request.method == "PUT":
+            names.append(body.get("name"))
+    bad = [n for n in names if n is not None and not str(n).startswith(ACCOUNT_PREFIX)]
+    if bad:
+        app.logger.warning(f"[PREFIX] 접두어 없는 계정 거절: {bad} ({request.method} {request.path})")
+        return jsonify({"status": "error",
+                        "message": f"이 환경은 '{ACCOUNT_PREFIX}'로 시작하는 계정만 다룹니다"}), 403
+    return None
 app.config.from_mapping({
     # Namespace
     # 사용자 Pod·Service·keytab 시크릿을 만들고 지우는 네임스페이스. 차트가 config.namespace를 넣어 준다.

@@ -58,6 +58,8 @@ spec:
               value: "{{ .Values.accounts.uidMin }}"
             - name: UID_MAX
               value: "{{ .Values.accounts.uidMax }}"
+            - name: ACCOUNT_PREFIX
+              value: "{{ .Values.accounts.prefix }}"
             - name: NODEPORT_MIN
               value: "{{ .Values.nodeport.min }}"
             - name: NODEPORT_MAX
