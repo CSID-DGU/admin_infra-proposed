@@ -1,0 +1,83 @@
+# 운영 admin_be 이미지를 그대로 쓰고 설정만 덮어쓴다(admin-be-config 시크릿의 SPRING_APPLICATION_JSON).
+# config-server가 Pod를 만들 때 사용자 설정을 여기서 조회하므로 스택마다 한 대가 필요하다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-prod
+  namespace: __NS__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admin-prod
+  template:
+    metadata:
+      labels:
+        app: admin-prod
+      annotations:
+        # 설정 시크릿이 바뀌면 다시 뜨도록
+        ailab.dgu/config-hash: "__CONFIG_HASH__"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: admin-prod
+          image: __ADMIN_IMAGE__
+          args: ["--spring.profiles.active=prod"]
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: admin-be-config
+          env:
+            - name: SPRING_DATASOURCE_HIKARI_INITIALIZATION_FAIL_TIMEOUT
+              value: "-1"
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-prod
+  namespace: __NS__
+spec:
+  selector:
+    app: admin-prod
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+# 운영 이미지 안에는 운영 DB·config-server·Slack·메일 주소가 들어 있다. 덮어쓰기에서 하나라도 빠지면
+# 실험 admin_be가 운영에 닿을 수 있으므로, 같은 네임스페이스와 DNS 외의 모든 나가는 연결을 막는다.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-prod-egress
+  namespace: __NS__
+spec:
+  podSelector:
+    matchLabels:
+      app: admin-prod
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

@@ -1,0 +1,90 @@
+# 스택 전용 MySQL 한 대. config-server의 pod_port_db·operation_state_db와 admin_be의 web_admin을
+# 한 인스턴스의 서로 다른 DB로 둔다. 운영처럼 인스턴스를 나눌 이유가 실험 스택에는 없다.
+# 서비스 이름은 코드와 차트의 기본값(infra-mysql, log-mysql)을 그대로 쓰도록 세 개를 둔다.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: __NS__
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stack-mysql
+  template:
+    metadata:
+      labels:
+        app: stack-mysql
+    spec:
+      # log-mysql과 같은 방식으로 farm2의 로컬 디스크에 고정한다.
+      nodeSelector:
+        kubernetes.io/hostname: farm2
+      containers:
+        - name: mysql
+          image: mysql:8.0.36
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: stack-db
+                  key: root
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: local-path
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-mysql
+  namespace: __NS__
+spec:
+  selector:
+    app: stack-mysql
+  ports:
+    - port: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: log-mysql
+  namespace: __NS__
+spec:
+  selector:
+    app: stack-mysql
+  ports:
+    - port: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-mysql
+  namespace: __NS__
+spec:
+  selector:
+    app: stack-mysql
+  ports:
+    - port: 3306

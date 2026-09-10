@@ -1,3 +1,13 @@
+# admin_infra-proposed
+
+제안 시스템(`Proposed-NoProbe`, `Proposed-Full`) 개발용 레포다. CSID-DGU/admin_infra develop(`9e49096`)에서 복사했다.
+
+* 실험 스택 배포: CSID-DGU/admin_infra → Actions → **Deploy Proposed Stack** (`ops/proposed-stack/README.md`)
+* 이 레포는 Actions가 꺼져 있고 운영 배포 워크플로도 지웠다. 이 레포에서 운영(`ailab-infra`)으로 가는 배포 경로는 없다
+* 운영 레포의 수정 사항은 `git pull https://github.com/CSID-DGU/admin_infra.git develop`으로 받아온다
+
+---
+
 # 🚀 GPU 서버 관리 자동화 시스템 Infra Server 배포 및 운영 가이드
 
 이 문서는 `config-server`의 Git 브랜치 전략, CI/CD 파이프라인 구조, 그리고 배포 절차를 정의합니다.

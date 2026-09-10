@@ -62,6 +62,8 @@ spec:
               value: "{{ .Values.nodeport.min }}"
             - name: NODEPORT_MAX
               value: "{{ .Values.nodeport.max }}"
+            - name: VERIFY_MODE
+              value: "{{ .Values.verifyMode }}"
             - name: DB_HOST
               value: "{{ .Values.db.host }}"
             - name: DB_NAME

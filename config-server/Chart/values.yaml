@@ -64,6 +64,10 @@ nodeport:
   min: 30000
   max: 32767
 
+# 제안 시스템 조건. noprobe는 자원 재조회까지, full은 실제 접근 시험(probe)까지 수행한다.
+# 두 실험 스택의 차이는 이 값 하나여야 한다.
+verifyMode: noprobe
+
 config:
   namespace: ailab-infra
 
