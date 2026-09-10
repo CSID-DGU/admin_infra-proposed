@@ -20,7 +20,7 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | --- | --- | --- |
 | config-server 릴리스 | `config-server-noprobe` | `config-server-full` |
 | config-server nodePort | 30182 | 30282 |
-| 프론트엔드 nodePort | 30183 | 30283 |
+| 화면 주소 | `http://noprobe.210.94.179.18.nip.io:30081` | `http://full.210.94.179.18.nip.io:30081` |
 | `VERIFY_MODE` | `noprobe` | `full` |
 | UID/GID 대역 | 50000~54999 | 55000~59999 |
 | 사용자 Pod NodePort 대역 | 32000~32249 | 32250~32499 |
@@ -54,3 +54,21 @@ AD·Kerberos, NAS, farm 노드는 운영과 같이 쓴다. 테스트 계정은 �
 ## 로그
 
 admin_infra는 공개 레포라 Actions 로그를 누구나 볼 수 있다. 스크립트를 고칠 때 비밀번호, 운영 설정값, 실사용자 계정 이름을 출력하지 않는다.
+
+## 화면 접속과 관리자 계정
+
+방화벽이 새 포트를 막고 있어, 화면은 운영 프론트엔드가 쓰는 30081에 호스트 이름 규칙으로 연다. 위 표의 주소로 접속한다.
+
+가입은 운영과 같이 메일 인증을 거친다. 스택 admin_be는 운영 메일 설정으로 인증 코드를 보내고, Slack 알림은 보내지 않는다. 가입한 계정을 관리자로 지정하려면 배포 서버에서 실행한다(이메일이 공개 로그에 남지 않도록 워크플로로 돌리지 않는다).
+
+```bash
+bash ops/proposed-stack/make-admin.sh noprobe <가입한 이메일>
+```
+
+## kubectl로 직접 시험
+
+```bash
+kubectl -n ailab-noprobe port-forward svc/containerssh-config-service 8000:80   # config-server
+kubectl -n ailab-noprobe port-forward svc/ailab-frontend 8080:80                # 화면
+kubectl -n ailab-noprobe get pods -o wide
+```

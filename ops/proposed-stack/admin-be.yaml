@@ -31,6 +31,11 @@ spec:
           env:
             - name: SPRING_DATASOURCE_HIKARI_INITIALIZATION_FAIL_TIMEOUT
               value: "-1"
+          # 운영과 같은 설정 파일(admin-prod-config 복사본). Spring Boot는 ./config/를 jar 안 설정보다 우선한다.
+          volumeMounts:
+            - name: app-config
+              mountPath: /app/config
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -41,6 +46,10 @@ spec:
             requests:
               cpu: 250m
               memory: 512Mi
+      volumes:
+        - name: app-config
+          secret:
+            secretName: admin-prod-config
 ---
 apiVersion: v1
 kind: Service
@@ -81,3 +90,9 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # 가입 인증 메일(Gmail SMTP)만 밖으로 허용한다. Slack(443) 등 다른 외부 연결은 막는다.
+    - ports:
+        - protocol: TCP
+          port: 587
+        - protocol: TCP
+          port: 465
