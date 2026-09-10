@@ -1,0 +1,52 @@
+# 스택 전용 프론트엔드. 이미지는 워크플로가 admin_fe 소스의 nginx.conf에서 /api/와 /pod-status/
+# 대상만 이 스택의 admin_be·config-server로 바꿔 빌드한 것이다(운영 프론트엔드와 코드는 같음).
+# 운영 프론트엔드는 ingress(모든 호스트)로 열려 있어 같은 방식으로 겹칠 수 없으므로 nodePort로 연다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ailab-frontend
+  namespace: __NS__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ailab-frontend
+  template:
+    metadata:
+      labels:
+        app: ailab-frontend
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: ailab-frontend
+          image: __FE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ailab-frontend
+  namespace: __NS__
+spec:
+  type: NodePort
+  selector:
+    app: ailab-frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: __FE_NODEPORT__

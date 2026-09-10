@@ -20,6 +20,7 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | --- | --- | --- |
 | config-server 릴리스 | `config-server-noprobe` | `config-server-full` |
 | config-server nodePort | 30182 | 30282 |
+| 프론트엔드 nodePort | 30183 | 30283 |
 | `VERIFY_MODE` | `noprobe` | `full` |
 | UID/GID 대역 | 50000~54999 | 55000~59999 |
 | 사용자 Pod NodePort 대역 | 32000~32249 | 32250~32499 |
@@ -40,7 +41,8 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | 6 | 이미지 저장소는 임시 디스크를 씀(사용자 이미지 커밋·재시작용이라 실험에 필요 없음) |
 | 7 | 계정 대장 경로 생성 |
 | 8 | config-server 설치. NFS·NAS·Kerberos·farm 설정은 운영 릴리스 값을 그대로 쓰고 스택별 값만 덮어씀 |
-| 9 | admin_be 설치. 운영 이미지를 digest로 고정하고 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스와 DNS 외에는 나가는 연결을 네트워크 정책으로 막음 |
+| 9 | 프론트엔드 설치. `nginx.conf`의 `/api/`·`/pod-status/` 대상만 스택으로 바꿔 빌드한 이미지 |
+| 9-1 | admin_be 설치. 운영 이미지를 digest로 고정하고 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스와 DNS 외에는 나가는 연결을 네트워크 정책으로 막음 |
 | 10 | 테스트 계정 `<접두어>000`을 만들고 지워서 UID 대역, 작업 이력, 운영 대장에 흔적이 없는지 확인 |
 
 여러 번 실행해도 결과가 같다. 비밀번호는 처음 만든 값을 유지한다.
