@@ -172,10 +172,10 @@ except Exception as e:
     check("admin_be(WAS) 응답", False, type(e).__name__)
 requests.delete(f"{base}/accounts/users/{name}", timeout=120)  # 이전 실행에서 남은 것이 있으면 정리
 r = requests.put(f"{base}/accounts/users", timeout=120, json={
-    "request_id": f"smoke-{name}", "name": name, "passwd_base64": base64.b64encode(os.urandom(12)).decode(),
+    "request_id": f"smoke-{name}", "name": name, "passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode(),
     "gecos": "stack smoke test", "primary_group_name": name, "enable_sudo": False, "supplementary_groups": []})
 uid = (r.json().get("user") or {}).get("uid") if r.status_code == 201 else None
-check("계정 생성", r.status_code == 201, r.status_code)
+check("계정 생성", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
 check(f"UID가 대역 {lo}~{hi} 안", uid is not None and lo <= int(uid) <= hi, uid)
 r = requests.delete(f"{base}/accounts/users/{name}", timeout=120)
 check("계정 삭제", r.status_code == 200, r.status_code)
