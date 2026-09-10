@@ -151,8 +151,12 @@ spec:
             secretName: farm-ad-ssh-key
             defaultMode: 0400
         - name: image-store
+          {{- if .Values.imageStore.claimName }}
           persistentVolumeClaim:
-            claimName: pvc-image-store
+            claimName: {{ .Values.imageStore.claimName }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         - name: kube-share
           nfs:
             server: "{{ .Values.nfs.server }}"

@@ -68,6 +68,11 @@ nodeport:
 # 두 실험 스택의 차이는 이 값 하나여야 한다.
 verifyMode: noprobe
 
+# 사용자 이미지 커밋·재시작에 쓰는 저장소 PVC. 비우면 임시 디스크(emptyDir)를 쓴다.
+# 실험 스택은 이 기능이 필요 없어 비워 둔다.
+imageStore:
+  claimName: pvc-image-store
+
 config:
   namespace: ailab-infra
 

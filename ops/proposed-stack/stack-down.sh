@@ -22,7 +22,7 @@ if ! kubectl get namespace "$NS" >/dev/null 2>&1; then
 fi
 
 echo "=== 테스트 계정 정리 (${PREFIX}*)"
-CS_POD=$(kubectl -n "$NS" get pod -l app=containerssh-config-server --field-selector=status.phase=Running -o name | head -1)
+CS_POD=$(kubectl -n "$NS" get pod -l "app=containerssh-config-server,!job-name" --field-selector=status.phase=Running -o name | head -1)
 if [ -n "$CS_POD" ]; then
   kubectl -n "$NS" exec -i "$CS_POD" -- env PREFIX="$PREFIX" python - <<'PY'
 import os, requests

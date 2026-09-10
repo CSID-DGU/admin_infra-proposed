@@ -30,7 +30,8 @@ RELEASE=config-server-$STACK
 step() { echo; echo "=== $*"; }
 render() { sed -e "s|__NS__|$NS|g" "$@"; }
 rnd() { head -c "${1:-16}" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-running_pod() { kubectl -n "$1" get pod -l "$2" --field-selector=status.phase=Running -o name | head -1; }
+# 크론잡 Pod도 같은 app 라벨을 쓰므로 job-name 라벨이 붙은 Pod는 뺀다.
+running_pod() { kubectl -n "$1" get pod -l "$2,!job-name" --field-selector=status.phase=Running -o name | head -1; }
 getpw() { kubectl -n "$NS" get secret stack-db -o jsonpath="{.data.$1}" | base64 -d; }
 
 step "사전 확인"
@@ -90,8 +91,15 @@ echo "DB 3개(pod_port_db, operation_state_db, web_admin)와 테이블 준비 �
 step "Redis"
 render "$HERE/redis.yaml" | kubectl apply -f -
 
-step "이미지 저장 PVC"
-helm upgrade --install pvc-image-store "$ROOT/pvc-image-chart" -n "$NS" --set config.namespace="$NS"
+step "이미지 저장소"
+# 사용자 이미지 커밋·재시작용 NAS 볼륨은 논문 실험에 필요 없고, 첫 설치에서 이 노드의 NFS 마운트가
+# 시간 초과로 막혔다. 실험 스택은 임시 디스크를 쓴다(imageStore.claimName 비움). 예전 실행에서 만든
+# PVC 릴리스가 있으면 정리한다.
+if helm -n "$NS" status pvc-image-store >/dev/null 2>&1; then
+  helm -n "$NS" uninstall pvc-image-store --wait >/dev/null && echo "이전 PVC 릴리스 정리 (NAS의 PV는 Retain이라 남음)"
+else
+  echo "임시 디스크 사용"
+fi
 
 step "계정 대장 경로"
 # config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
@@ -104,6 +112,10 @@ step "config-server ($RELEASE, $IMAGE)"
 BASE=$(mktemp); trap 'rm -f "$BASE"' EXIT
 # NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 그대로 쓰고, 스택마다 달라야 하는 값만 덮어쓴다.
 helm -n "$PROD_NS" get values "$PROD_RELEASE" -o yaml > "$BASE"
+# 첫 설치가 실패한 릴리스는 upgrade가 받지 않을 수 있으므로 지우고 다시 설치한다.
+if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
+  helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
+fi
 KUBE_SHARE=$(sed -n 's/^[[:space:]]*kubeSharePath:[[:space:]]*//p' "$BASE" | head -1 | tr -d "\"'")
 [ -n "$KUBE_SHARE" ] || { echo "운영 kubeSharePath를 찾지 못함"; exit 1; }
 helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" \
@@ -117,6 +129,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set verifyMode="$STACK" \
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
   --set db.host=infra-mysql --set logDb.host=log-mysql \
+  --set imageStore.claimName= \
   --wait --timeout 10m
 
 step "admin_be"
