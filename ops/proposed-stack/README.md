@@ -72,3 +72,7 @@ kubectl -n ailab-noprobe port-forward svc/containerssh-config-service 8000:80   
 kubectl -n ailab-noprobe port-forward svc/ailab-frontend 8080:80                # 화면
 kubectl -n ailab-noprobe get pods -o wide
 ```
+
+## 스택 admin DB의 기준 데이터
+
+설치 때마다 운영 admin DB에서 신청 화면에 필요한 기준 데이터만 복사한다: 자원 그룹(`resource_groups`), 노드(`nodes`), GPU(`gpus`), 이미지(`container_image`, `resource_group_images`), 메일 문구(`message_templates`). 사용자·신청·그룹은 복사하지 않는다. 운영 DB는 읽기만 하며, 재실행하면 운영 값으로 갱신된다.
