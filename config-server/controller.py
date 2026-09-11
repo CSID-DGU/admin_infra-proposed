@@ -19,10 +19,10 @@ WORKERS = int(os.getenv("CONTROLLER_WORKERS", "4"))
 _stop = threading.Event()
 
 
-def _run(kind, request_id, username):
+def _run(kind, request_id, username, job_id):
     with app.app_context():
         try:
-            run_job(kind, request_id, username)
+            run_job(kind, request_id, username, job_id)
         except Exception:
             app.logger.exception(f"[CONTROLLER] job crashed {kind} request_id={request_id}")
 
@@ -50,13 +50,13 @@ def main():
             except Exception:
                 app.logger.exception("[CONTROLLER] job lookup failed")
                 jobs = []
-            for kind, request_id, username in jobs:
+            for kind, request_id, username, job_id in jobs:
                 key = (kind, request_id)
                 with lock:
                     if key in running or len(running) >= WORKERS:
                         continue
                     running.add(key)
-                future = pool.submit(_run, kind, request_id, username)
+                future = pool.submit(_run, kind, request_id, username, job_id)
                 future.add_done_callback(lambda _f, k=key: _done(k))
             _stop.wait(POLL_SEC)
     app.logger.info("[CONTROLLER] stopped")

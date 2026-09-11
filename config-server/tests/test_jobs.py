@@ -50,13 +50,17 @@ def test_provision_returns_202_and_stores_only_password_hash(api, logs, store):
         "request_id": 7, "username": "exp-np-001", "account": {"passwd_base64": PW, "gecos": "t"}})
 
     assert r.status_code == 202
-    assert r.get_json() == {"request_id": "7", "status": "accepted"}
+    assert r.get_json()["request_id"] == "7" and r.get_json()["status"] == "accepted"
     job = store[("PROVISION", "7")]["job"]
     assert job["account"]["passwd_hash"].startswith("$6$")
     assert job["account"]["pg_name"] == "exp-np-001"
     assert "s3cret" not in json.dumps(job) and PW not in json.dumps(job)
-    assert logs == [dict(request_id="7", username="exp-np-001", action=Action.PROVISION,
-                         phase=Phase.START, raise_errors=True)]
+    assert len(logs) == 1 and logs[0]["action"] == Action.PROVISION and logs[0]["phase"] == Phase.START
+    assert logs[0]["start_job"] is True and logs[0]["raise_errors"] is True
+    target = json.loads(logs[0]["target_state"])
+    assert target["username"] == "exp-np-001" and target["account"]["pg_name"] == "exp-np-001"
+    assert "passwd_hash" not in json.dumps(target)
+    assert "job_id" in r.get_json()
 
 
 def test_same_job_twice_is_409(api, logs, store):
@@ -171,7 +175,7 @@ def test_run_job_without_input_fails(logs, store):
 
 def test_jobs_interrupted_by_restart_are_failed_not_rerun(logs, store, monkeypatch):
     monkeypatch.setattr(main, "find_unfinished_jobs", lambda limit=100: [
-        ("provision", "1", "u"), ("revoke", "2", "u"), ("provision", "3", "u")])
+        ("provision", "1", "u", 11), ("revoke", "2", "u", 12), ("provision", "3", "u", 13)])
     store[("PROVISION", "1")] = {"state": "running", "job": {"username": "u"}}
     _queued(store, "REVOKE", "2", {"username": "u"})
 
@@ -232,3 +236,52 @@ def test_result_row_failure_keeps_input_done_and_retries_only_the_row(store, mon
 def test_request_id_is_normalized_to_integer_text(api, logs, store):
     assert api.post("/operations/provision", json={"request_id": "007", "username": "exp-np-001"}).status_code == 202
     assert ("PROVISION", "7") in store
+
+
+def test_run_job_tags_every_row_with_job_number(logs, store, monkeypatch):
+    seen = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [lambda ctx: seen.append(main.current_job_id.get())])
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+    main.run_job("provision", "9", "exp-np-001", job_id=77)
+    assert seen == [77]
+    assert main.current_job_id.get() is None                  # 작업이 끝나면 비워진다
+
+
+def test_log_operation_writes_job_number_and_returns_row_id(monkeypatch):
+    import operation_log
+    executed = []
+
+    class Cur:
+        lastrowid = 501
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def execute(self, sql, params):
+            executed.append((sql, params))
+
+    class Conn:
+        def cursor(self):
+            return Cur()
+
+        def commit(self):
+            executed.append(("COMMIT", None))
+
+        def close(self):
+            pass
+    monkeypatch.setattr(operation_log, "get_log_db_connection", lambda: Conn())
+    with main.app.app_context():
+        rid = operation_log.log_operation(request_id=9, username="u", action=Action.PROVISION,
+                                          phase=Phase.START, target_state="{}", start_job=True)
+        token = operation_log.current_job_id.set(501)
+        operation_log.log_operation(request_id=9, username="u", action=Action.CREATE_ACCOUNT, phase=Phase.START)
+        operation_log.current_job_id.reset(token)
+    assert rid == 501
+    insert, update = executed[0], executed[1]
+    assert insert[1][0] is None and insert[1][-1] == "{}"       # 시작 행: job_id는 곧바로 자기 id로 채움
+    assert update == ("UPDATE operation_log SET job_id=%s WHERE id=%s", (501, 501))
+    step_insert = [e for e in executed if e[0].startswith("INSERT")][1]
+    assert step_insert[1][0] == 501                             # 실행 중 작업의 단계 행에 작업 번호

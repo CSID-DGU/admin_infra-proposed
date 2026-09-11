@@ -76,9 +76,9 @@ class Sql:
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     db = sqlite3.connect(":memory:", check_same_thread=False)
-    db.execute("""CREATE TABLE operation_log (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, username TEXT,
-        pod_name TEXT, node_name TEXT, resource_type TEXT, action TEXT, phase TEXT, attempt INT DEFAULT 1,
-        duration_ms INT, error_code TEXT, error_detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    db.execute("""CREATE TABLE operation_log (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INT, request_id TEXT,
+        username TEXT, pod_name TEXT, node_name TEXT, resource_type TEXT, action TEXT, phase TEXT, attempt INT DEFAULT 1,
+        duration_ms INT, error_code TEXT, error_detail TEXT, target_state TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     e = types.SimpleNamespace(db=db, v1=FakeV1(), redis={}, status={}, calls=[], fail_end_log=False, was=None)
 
     def log_operation(**kw):
@@ -87,11 +87,16 @@ def env(monkeypatch, tmp_path):
             if kw.get("raise_errors"):
                 raise RuntimeError("log db down")
             return  # log_operation은 raise_errors가 없으면 실패를 삼킨다
-        db.execute("INSERT INTO operation_log (request_id, username, pod_name, node_name, resource_type, action,"
-                   " phase, error_code, error_detail) VALUES (?,?,?,?,?,?,?,?,?)",
-                   (str(kw["request_id"]), kw["username"], kw.get("pod_name"), kw.get("node_name"),
-                    kw.get("resource_type"), v(kw["action"]), v(kw["phase"]), kw.get("error_code"), kw.get("error_detail")))
+        job_id = kw.get("job_id") or main.current_job_id.get()
+        cur = db.execute("INSERT INTO operation_log (job_id, request_id, username, pod_name, node_name, resource_type,"
+                         " action, phase, error_code, error_detail, target_state) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (job_id, str(kw["request_id"]), kw["username"], kw.get("pod_name"), kw.get("node_name"),
+                          kw.get("resource_type"), v(kw["action"]), v(kw["phase"]), kw.get("error_code"),
+                          kw.get("error_detail"), kw.get("target_state")))
+        if kw.get("start_job"):
+            db.execute("UPDATE operation_log SET job_id=? WHERE id=?", (cur.lastrowid, cur.lastrowid))
         db.commit()
+        return cur.lastrowid
 
     monkeypatch.setattr(main, "log_operation", log_operation)
     monkeypatch.setattr(main, "get_log_db_connection", lambda: Sql(db))
@@ -167,8 +172,8 @@ def env(monkeypatch, tmp_path):
 def tick(e):
     """제어기 한 바퀴: 끝나지 않은 작업을 찾아 실행."""
     with main.app.app_context():
-        for kind, rid, user in main.find_unfinished_jobs():
-            main.run_job(kind, rid, user)
+        for kind, rid, user, job_id in main.find_unfinished_jobs():
+            main.run_job(kind, rid, user, job_id)
 
 
 def rows(e, rid):
@@ -227,6 +232,15 @@ def test_provision_then_revoke_full_flow(env):
     assert "delete_home" not in names                     # 홈 보존
     assert ("krb5_remove", ("exp-np-e2e", "farm2")) in e.calls   # 지운 Pod의 노드에서 keytab 정리
     assert "krb5_principal_delete" in names
+    # 작업 번호: 생성 작업의 모든 행이 같은 번호, 회수 작업은 다른 번호. 목표 상태에 비밀번호 해시 없음
+    jobs = e.db.execute("SELECT action, job_id, target_state FROM operation_log WHERE request_id='101'").fetchall()
+    create_ids = {j for a, j, t in jobs if a not in ("REVOKE", "DELETE_SERVICE", "RELEASE_NODEPORT", "DELETE_POD_K8S",
+                                                     "DELETE_ACCOUNT", "REMOVE_KRB5")}
+    revoke_ids = {j for a, j, t in jobs if a in ("REVOKE", "DELETE_SERVICE", "RELEASE_NODEPORT", "DELETE_POD_K8S",
+                                                 "DELETE_ACCOUNT", "REMOVE_KRB5")}
+    assert len(create_ids) == 1 and len(revoke_ids) == 1 and create_ids != revoke_ids and None not in create_ids
+    start_target = next(t for a, j, t in jobs if a == "PROVISION" and t)
+    assert "exp-np-e2e" in start_target and "$6$" not in start_target and "passwd_hash" not in start_target
     was_urls = [c[1] for c in e.calls if c[0] == "was"]
     assert was_urls == ["http://admin-prod.default/api/requests/config/by-request/101"]   # 제어기는 신청 번호로 조회
 
@@ -249,6 +263,9 @@ def test_duplicate_registration_and_retry_after_finish(env):
     assert e.api.post("/operations/provision", json={"request_id": "102", "username": "exp-np-e2e"}).status_code == 202
     tick(e)
     assert result(e, "provision", "102")["phase"] == "SUCCESS"
+    # 같은 신청을 다시 처리하면 작업 번호로 두 시도가 구분된다
+    starts = e.db.execute("SELECT job_id FROM operation_log WHERE request_id='102' AND action='PROVISION' AND phase='START'").fetchall()
+    assert len({j for (j,) in starts}) == 2
 
 
 def test_farm_timeout_is_unknown_and_ports_are_released(env, monkeypatch):

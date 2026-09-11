@@ -4,11 +4,17 @@ v1.0: operation_log(log-mysql/operation_state_db)에 기록
 main.py의 실제 계정/Pod 생성 로직은 변경되지 않으며,
 그 로직 사이사이에 log_operation() 호출만 끼워 넣는 방식으로 사용해 로그를 기록
 """
+from contextvars import ContextVar
 from enum import Enum
 
 from flask import current_app as app
 
 from utils import get_log_db_connection
+
+
+# 제어기가 지금 실행 중인 작업의 번호(작업 시작 행의 id). 제어기가 작업을 실행하는 동안 여기에 두면
+# 그 사이의 모든 기록에 job_id가 붙어, 단계 함수가 작업 번호를 몰라도 된다. 동기 엔드포인트는 비어 있다.
+current_job_id = ContextVar("current_job_id", default=None)
 
 
 class Action(str, Enum):
@@ -87,6 +93,9 @@ def log_operation(
     error_code=None,
     error_detail=None,
     raise_errors=False,
+    job_id=None,
+    target_state=None,
+    start_job=False,
 ):
     """
     operation_log에 한 줄 기록. 절대 예외를 밖으로 던지지 않음
@@ -94,6 +103,9 @@ def log_operation(
 
     duration_ms를 안 넘기고 phase가 SUCCESS/FAIL이면,
     같은 (request_id, action, attempt)의 START로부터 걸린 시간을 DB 시계로 계산해 채움
+
+    job_id를 안 넘기면 current_job_id(제어기가 실행 중인 작업)를 쓴다. start_job=True면 이 행이 작업의
+    시작 행이라 job_id를 자기 id로 채운다. 기록한 행의 id를 돌려준다(실패하면 None).
 
     raise_errors=True면 기록 실패를 호출자에게 다시 던진다. 작업 등록처럼 이 행 자체가
     이후 처리의 근거인 경우에만 쓴다.
@@ -104,6 +116,8 @@ def log_operation(
     # 컬럼 쪽을 숫자로 변환해 인덱스를 못 타고, 숫자로 시작하는 다른 키와도 같다고 판정할
     # 수 있으므로 기록·조회 모두 문자열로 맞춘다.
     request_id = str(request_id)
+    if job_id is None:
+        job_id = current_job_id.get()
 
     conn = None
     try:
@@ -115,16 +129,20 @@ def log_operation(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO operation_log "
-                "(request_id, username, pod_name, node_name, resource_type, "
-                " action, phase, attempt, duration_ms, error_code, error_detail) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "(job_id, request_id, username, pod_name, node_name, resource_type, "
+                " action, phase, attempt, duration_ms, error_code, error_detail, target_state) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
-                    request_id, username, pod_name, node_name, resource_type,
+                    job_id, request_id, username, pod_name, node_name, resource_type,
                     action_value, phase_value, attempt, duration_ms,
-                    error_code, error_detail,
+                    error_code, error_detail, target_state,
                 ),
             )
+            row_id = cur.lastrowid
+            if start_job:
+                cur.execute("UPDATE operation_log SET job_id=%s WHERE id=%s", (row_id, row_id))
         conn.commit()
+        return row_id
 
     except Exception:
         app.logger.exception(
