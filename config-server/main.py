@@ -26,7 +26,7 @@ from pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
 )
-from operation_log import Action, Phase, log_operation
+from operation_log import Action, Phase, log_operation, current_job_id
 
 from utils import (
     get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
@@ -3657,18 +3657,23 @@ def _register_job(kind, request_id, username, job):
         app.logger.exception("[JOB] job input save failed")
         return jsonify(infra_error("REGISTER_JOB", "JOB_STORE_UNAVAILABLE", str(e))), 503
 
-    # 이 START 행이 제어기가 작업을 찾는 근거라, 기록이 실패하면 등록도 실패로 돌린다.
+    # 이 START 행이 제어기가 작업을 찾는 근거이자 작업 번호(행 id)라, 기록이 실패하면 등록도 실패로 돌린다.
+    # 목표 상태는 이 행에 남긴다(비밀번호 해시 제외).
+    target = {k: v for k, v in job.items() if k != "account"}
+    if job.get("account"):
+        target["account"] = {k: v for k, v in job["account"].items() if k != "passwd_hash"}
     try:
-        log_operation(request_id=request_id, username=username, action=action,
-                      phase=Phase.START, raise_errors=True)
+        job_id = log_operation(request_id=request_id, username=username, action=action,
+                               phase=Phase.START, target_state=json.dumps(target, ensure_ascii=False),
+                               start_job=True, raise_errors=True)
     except Exception as e:
         delete_job_input(action.value, request_id)
         return jsonify(infra_error("REGISTER_JOB", "JOB_LOG_UNAVAILABLE", str(e))), 503
 
     if kind == "provision":
         set_pod_creation_status(request_id, "started", "요청 접수")
-    app.logger.info(f"[JOB] registered {kind} request_id={request_id} username={username}")
-    return jsonify({"request_id": request_id, "status": "accepted"}), 202
+    app.logger.info(f"[JOB] registered {kind} request_id={request_id} job_id={job_id} username={username}")
+    return jsonify({"request_id": request_id, "job_id": job_id, "status": "accepted"}), 202
 
 
 @app.route("/operations/provision", methods=["POST"])
@@ -3801,7 +3806,7 @@ def get_job_result(kind, request_id):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT phase, error_code, created_at FROM operation_log "
+                "SELECT phase, error_code, created_at, job_id FROM operation_log "
                 "WHERE request_id=%s AND action=%s ORDER BY id DESC LIMIT 1",
                 (str(request_id), action.value),
             )
@@ -3810,18 +3815,18 @@ def get_job_result(kind, request_id):
         conn.close()
     if row is None:
         return jsonify({"request_id": request_id, "kind": kind, "phase": "none"}), 200
-    phase, error_code, created_at = row
-    return jsonify({"request_id": request_id, "kind": kind, "phase": phase,
+    phase, error_code, created_at, job_id = row
+    return jsonify({"request_id": request_id, "kind": kind, "job_id": job_id, "phase": phase,
                     "error_code": error_code, "updated_at": str(created_at)}), 200
 
 
 def find_unfinished_jobs(limit=100):
-    """operation_log에서 작업 START만 있고 끝이 없는 작업을 오래된 순으로. (kind, request_id, username)"""
+    """operation_log에서 작업 START만 있고 끝이 없는 작업을 오래된 순으로. (kind, request_id, username, job_id)"""
     conn = get_log_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.action, s.request_id, s.username FROM operation_log s "
+                "SELECT s.action, s.request_id, s.username, s.id FROM operation_log s "
                 "WHERE s.action IN (%s, %s) AND s.phase = %s AND NOT EXISTS ("
                 " SELECT 1 FROM operation_log e WHERE e.request_id = s.request_id"
                 " AND e.action = s.action AND e.id > s.id AND e.phase IN (%s, %s, %s)) "
@@ -3829,7 +3834,7 @@ def find_unfinished_jobs(limit=100):
                 (Action.PROVISION.value, Action.REVOKE.value, Phase.START.value,
                  Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value, limit),
             )
-            return [(_JOB_KIND[a], r, u) for a, r, u in cur.fetchall()]
+            return [(_JOB_KIND[a], r, u, j) for a, r, u, j in cur.fetchall()]
     finally:
         conn.close()
 
@@ -3894,8 +3899,17 @@ def _compensate_provision(kind, job, ctx, done):
     return "account_removed"
 
 
-def run_job(kind, request_id, username):
-    """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다."""
+def run_job(kind, request_id, username, job_id=None):
+    """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다. 실행하는 동안의 모든
+    기록에는 작업 번호(job_id)가 붙는다."""
+    token = current_job_id.set(job_id)
+    try:
+        _run_job(kind, request_id, username)
+    finally:
+        current_job_id.reset(token)
+
+
+def _run_job(kind, request_id, username):
     action = JOB_ACTIONS[kind]
     stored = load_job_input(action.value, request_id)
     if stored is None:
@@ -3937,16 +3951,24 @@ def mark_interrupted_jobs():
     """제어기 시작 시, 이전 제어기가 실행하던 중에 끊긴 작업을 실패로 기록한다. 중단된 단계부터
     이어서 하는 것은 v4.0(재시작 복구)의 몫이다. 그 전에 처음부터 다시 실행하면 Pod가 두 개
     생기는 식의 중복이 날 수 있어 다시 실행하지 않는다. 아직 시작 전(queued)인 작업은 그대로 둔다."""
-    for kind, request_id, username in find_unfinished_jobs(limit=1000):
-        stored = load_job_input(JOB_ACTIONS[kind].value, request_id)
-        if stored is None:
-            _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
-                        "job input not found in Redis")
-        elif stored.get("state") == "done":
-            _record_job_result(kind, request_id, username, stored["result"])
-        elif stored.get("state") == "running":
-            _finish_job(kind, request_id, username, Phase.FAIL, "CONTROLLER_RESTARTED",
-                        "controller restarted while the job was running")
+    for kind, request_id, username, job_id in find_unfinished_jobs(limit=1000):
+        token = current_job_id.set(job_id)
+        try:
+            _mark_interrupted(kind, request_id, username)
+        finally:
+            current_job_id.reset(token)
+
+
+def _mark_interrupted(kind, request_id, username):
+    stored = load_job_input(JOB_ACTIONS[kind].value, request_id)
+    if stored is None:
+        _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
+                    "job input not found in Redis")
+    elif stored.get("state") == "done":
+        _record_job_result(kind, request_id, username, stored["result"])
+    elif stored.get("state") == "running":
+        _finish_job(kind, request_id, username, Phase.FAIL, "CONTROLLER_RESTARTED",
+                    "controller restarted while the job was running")
 
 
 if __name__ == "__main__":

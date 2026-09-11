@@ -13,6 +13,7 @@
 
 CREATE TABLE IF NOT EXISTS operation_log (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+  job_id        BIGINT,                 -- 작업 번호(v2.0): 작업 시작 행의 id. 제어기가 실행한 작업의 모든 행에 붙음. 동기 경로는 NULL
   request_id    VARCHAR(64) NOT NULL,   -- 승인 번호. admin_be가 보내는 신청 PK를 그대로 사용
   username      VARCHAR(64) NOT NULL,
   pod_name      VARCHAR(255),           -- 알기 전엔 NULL, Pod 이름이 정해지면 채움
@@ -24,7 +25,20 @@ CREATE TABLE IF NOT EXISTS operation_log (
   duration_ms   INT,                    -- SUCCESS/FAIL 행에만 채움: 같은 (request_id, action, attempt)의 START로부터 걸린 시간
   error_code    VARCHAR(64),
   error_detail  TEXT,
+  target_state  JSON,                   -- 목표 상태(v2.0): 작업 시작 행에만. 비밀번호 해시는 넣지 않음
   created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
   INDEX idx_req (request_id, created_at),
-  INDEX idx_action_phase (action, phase)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;  -- 운영 log-mysql(SHOW CREATE TABLE)과 동일
+  INDEX idx_action_phase (action, phase),
+  INDEX idx_job (job_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;  -- 운영 log-mysql과 같고 job_id·target_state만 추가
+
+-- v2.0 이전에 만든 표에는 job_id·target_state가 없다. 설치 스크립트가 배포 때마다 이 파일을 다시
+-- 적용하므로, 열이 없을 때만 추가한다(MySQL 8.0은 ADD COLUMN IF NOT EXISTS가 없다).
+SET @has := (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'operation_log' AND COLUMN_NAME = 'job_id');
+SET @ddl := IF(@has = 0, 'ALTER TABLE operation_log ADD COLUMN job_id BIGINT AFTER id, ADD INDEX idx_job (job_id)', 'SELECT 1');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @has := (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'operation_log' AND COLUMN_NAME = 'target_state');
+SET @ddl := IF(@has = 0, 'ALTER TABLE operation_log ADD COLUMN target_state JSON AFTER error_detail', 'SELECT 1');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
