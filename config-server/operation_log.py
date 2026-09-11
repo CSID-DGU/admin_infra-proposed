@@ -44,6 +44,8 @@ class Phase(str, Enum):
     SUCCESS = "SUCCESS"
     FAIL = "FAIL"
     RETRY = "RETRY"
+    # 요청은 나갔으나 응답을 못 받아 실제로 실행됐는지 알 수 없음(timeout). FAIL과 구분한다 (v2.0)
+    UNKNOWN = "UNKNOWN"
 
 
 def _lookup_elapsed_ms(conn, request_id, action, attempt):
@@ -99,7 +101,7 @@ def log_operation(
     try:
         conn = get_log_db_connection()
 
-        if duration_ms is None and phase_value in (Phase.SUCCESS.value, Phase.FAIL.value):
+        if duration_ms is None and phase_value in (Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value):
             duration_ms = _lookup_elapsed_ms(conn, request_id, action_value, attempt)
 
         with conn.cursor() as cur:

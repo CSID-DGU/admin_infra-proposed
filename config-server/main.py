@@ -7,6 +7,7 @@ from kubernetes import client, config as k8s_config, watch
 import pymysql
 import os
 import requests
+import urllib3
 import logging, sys
 
 from flasgger import Swagger
@@ -218,6 +219,40 @@ class PodSpecBuildError(Exception):
     def __init__(self, message, progress=None):
         super().__init__(message)
         self.progress = progress or {}
+
+# ////////////////////// 단계 실행 (v2.0) //////////////////////
+# 생성·회수 흐름을 단계 함수로 나눈다. 동기 엔드포인트(/create-pod, /delete-pod, PUT·DELETE
+# /accounts/users)와 제어기(controller.py)가 같은 단계 함수를 차례로 부르므로, 두 경로의 차이는
+# 실행 구조(요청 안에서 끝까지 실행하는지, 작업만 등록하고 제어기가 실행하는지)뿐이다.
+
+class StepFailed(Exception):
+    """단계가 실패로 끝남. body·status는 동기 엔드포인트가 그대로 돌려주는 응답이다."""
+
+    def __init__(self, body, status, cause=None):
+        super().__init__(body.get("error") if isinstance(body, dict) else str(body))
+        self.body = body
+        self.status = status
+        # 요청은 나갔지만 응답을 못 받아 실제로 실행됐는지 알 수 없는 실패인지(UNKNOWN)
+        self.unknown = _is_unknown_result(cause)
+
+
+def _is_unknown_result(e) -> bool:
+    """요청은 나갔는데 응답을 못 받은 경우(read timeout, 원격 명령 timeout). 실제로 실행됐는지
+    알 수 없으므로 FAIL과 구분해 UNKNOWN으로 기록한다. 연결 자체가 안 된 경우(connect timeout,
+    연결 거부)는 요청이 나가지 않았으므로 FAIL이다. 감싼 예외는 __cause__를 따라가 확인한다."""
+    depth = 0
+    while e is not None and depth < 10:
+        if isinstance(e, (requests.exceptions.ReadTimeout, subprocess.TimeoutExpired,
+                          urllib3.exceptions.ReadTimeoutError)):
+            return True
+        e = e.reason if isinstance(e, urllib3.exceptions.MaxRetryError) else e.__cause__
+        depth += 1
+    return False
+
+
+def _fail_phase(e):
+    return Phase.UNKNOWN if _is_unknown_result(e) else Phase.FAIL
+
 
 # ////////////////////// 포트 할당 //////////////////////
 
@@ -453,6 +488,522 @@ def release_nodeports(pod_name):
         conn.close()
 
 
+# ---------- Pod 생성 단계 (v2.0) ----------
+# 순서: 사용자 설정 조회 → Pod 이름·후보 노드 → 노드 선택 → Pod spec(NodePort 할당·keytab 배포)
+#       → k8s Pod 생성 → Ready 대기 → Service 생성
+
+def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
+    ns = app.config["NAMESPACE"]
+    rollback = {
+        "nodeportsReleased": False,
+        "podDeleted": False,
+        "servicesDeleted": False,
+    }
+
+    if delete_services:
+        try:
+            delete_nodeport_services(pod_name, ns)
+            rollback["servicesDeleted"] = True
+        except Exception:
+            app.logger.warning("[CREATE POD] cleanup service deletion failed", exc_info=True)
+
+    try:
+        release_nodeports(pod_name)
+        rollback["nodeportsReleased"] = True
+    except Exception:
+        app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
+
+    if v1 is not None:
+        try:
+            v1.delete_namespaced_pod(pod_name, ns)
+            rollback["podDeleted"] = True
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                rollback["podDeleted"] = True
+            else:
+                app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+        except Exception:
+            app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+
+    return rollback
+
+
+def step_fetch_user_config(ctx):
+    request_id, username = ctx["request_id"], ctx["username"]
+    was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+    app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
+    log_operation(request_id=request_id, username=username,
+                  action=Action.FETCH_USER_CONFIG, phase=Phase.START)
+
+    resp = None
+    try:
+        resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+        user_info = resp.json()
+    except requests.RequestException as e:
+        app.logger.exception("[CREATE POD] WAS request failed")
+        log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=_fail_phase(e),
+                      error_code="USER_CONFIG_FETCH_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_FETCH_FAILED",
+            str(e),
+        ), 502, cause=e)
+    except ValueError as e:
+        app.logger.exception("[CREATE POD] invalid WAS response")
+        log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_INVALID_RESPONSE", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_INVALID_RESPONSE",
+            str(e),
+            was_status=resp.status_code if resp is not None else None,
+        ), 502)
+
+    # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
+    if user_info.get("status") == 404 or resp.status_code == 404:
+        app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
+        log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_NOT_FOUND", error_detail=f"user {username!r} not found in WAS")
+        raise StepFailed(infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_NOT_FOUND",
+            f"user {username!r} not found in WAS",
+            was_status=resp.status_code,
+        ), 404)
+    if resp.status_code >= 400:
+        app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
+        log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_FETCH_FAILED",
+                      error_detail=f"WAS returned {resp.status_code} for user {username!r}")
+        raise StepFailed(infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_FETCH_FAILED",
+            f"WAS returned {resp.status_code} for user {username!r}",
+            was_status=resp.status_code,
+        ), 502)
+
+    log_operation(request_id=request_id, username=username,
+                  action=Action.FETCH_USER_CONFIG, phase=Phase.SUCCESS)
+    app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
+    ctx["user_info"] = user_info
+
+
+def step_prepare_pod(ctx):
+    """Pod 이름을 정하고 같은 이름의 Pod가 없는지 확인한 뒤 후보 노드 목록을 만든다."""
+    username, user_info = ctx["username"], ctx["user_info"]
+    ns = app.config["NAMESPACE"]
+
+    pod_name = generate_pod_name(username)
+    app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
+    ctx["pod_name"] = pod_name
+
+    # pod_name 중복 확인
+    try:
+        load_k8s()
+        v1 = client.CoreV1Api()
+    except Exception as e:
+        app.logger.exception("[CREATE POD] k8s client setup failed")
+        raise StepFailed(infra_error(
+            "CHECK_EXISTING_POD",
+            "K8S_CLIENT_SETUP_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500)
+
+    try:
+        v1.read_namespaced_pod(pod_name, ns)
+        app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
+        raise StepFailed(infra_error(
+            "CHECK_EXISTING_POD",
+            "POD_ALREADY_EXISTS",
+            "pod already exists",
+            pod_name=pod_name,
+        ), 409)
+    except StepFailed:
+        raise
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            app.logger.exception("[CREATE POD] pod existence check failed")
+            raise StepFailed(infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_CHECK_FAILED",
+                e.body,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            ), 500)
+        app.logger.debug("[CREATE POD] pod does not exist yet")
+    except Exception as e:
+        app.logger.exception("[CREATE POD] pod existence check failed")
+        raise StepFailed(infra_error(
+            "CHECK_EXISTING_POD",
+            "POD_CHECK_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    # Prometheus 기반 노드 선택
+    gpu_nodes = user_info.get("gpu_nodes", [])
+    node_list = [
+        str(n["node_name"]).strip().lower()
+        for n in gpu_nodes
+        if n.get("node_name")
+    ]
+
+    # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
+    if not node_list:
+        app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
+        try:
+            load_k8s()
+            _all_nodes = client.CoreV1Api().list_node().items
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] fallback node list failed")
+            raise StepFailed(infra_error(
+                "LIST_NODES",
+                "NODE_LIST_FAILED",
+                e.body,
+                **k8s_error_fields(e),
+            ), 500)
+        except Exception as e:
+            app.logger.exception("[CREATE POD] fallback node list failed")
+            raise StepFailed(infra_error(
+                "LIST_NODES",
+                "NODE_LIST_FAILED",
+                str(e),
+            ), 500, cause=e)
+        node_list = [
+            n.metadata.name
+            for n in _all_nodes
+            if all(c.status == "True" for c in n.status.conditions if c.type == "Ready")
+            and not any(
+                "control-plane" in (t.key or "") and t.effect == "NoSchedule"
+                for t in (n.spec.taints or [])
+            )
+        ]
+
+    app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
+    ctx["node_list"] = node_list
+
+
+def step_select_node(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    set_pod_creation_status(request_id, "selecting_node", "GPU 노드 선택 중")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  action=Action.SELECT_NODE, phase=Phase.START)
+
+    try:
+        best_node = select_best_node_from_prometheus(
+            ctx["node_list"],
+            app.config["PROM_URL"],
+            app.config["HTTP_TIMEOUT_SEC"]
+        )
+    except Exception as e:
+        app.logger.exception("[CREATE POD] node selection failed")
+        set_pod_creation_status(request_id, "failed", "노드 선택 실패")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      action=Action.SELECT_NODE, phase=_fail_phase(e),
+                      error_code="NODE_SELECTION_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "SELECT_NODE",
+            "NODE_SELECTION_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500, cause=e)
+    app.logger.info(f"[CREATE POD] selected best node: {best_node}")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, action=Action.SELECT_NODE, phase=Phase.SUCCESS)
+    ctx["node"] = best_node
+
+
+def step_build_pod_spec(ctx):
+    """NodePort 할당과 farm 노드 keytab 배포가 build_pod_spec 안에서 함께 일어난다."""
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node = ctx["node"]
+    app.logger.info("[CREATE POD] building pod spec")
+    set_pod_creation_status(request_id, "building_pod_spec", f"pod spec 생성 중 (node={best_node})")
+
+    try:
+        if not best_node:
+            raise ValueError(
+                "no suitable node selected (check gpu_nodes and Prometheus metrics)"
+            )
+        spec_wrapper, allocated_ports = build_pod_spec(
+            username,
+            ctx["user_info"],
+            best_node,
+            pod_name,
+            request_id=request_id,
+        )
+    except PodSpecBuildError as e:
+        set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise StepFailed(infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            progress=e.progress,
+            pod_name=pod_name,
+            # 호출자(admin_be)가 계정 삭제 보상 트랜잭션을 실행할 때 이 노드만 정리하도록
+            # 넘겨주기 위함 — 없으면 대상 노드를 몰라서 전체 farm을 무차별로 훑게 된다.
+            node=best_node,
+        ), 500, cause=e)
+    except ValueError as e:
+        set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise StepFailed(infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            rollback={"nodeportsReleased": False},
+            pod_name=pod_name,
+        ), 400)
+    except Exception as e:
+        app.logger.exception("[CREATE POD] pod spec build failed")
+        set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise StepFailed(infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            rollback={"nodeportsReleased": False},
+            pod_name=pod_name,
+            node=best_node,
+        ), 500, cause=e)
+    app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
+
+    ctx["pod_spec"] = spec_wrapper["config"]["kubernetes"]["pod"]
+    ctx["allocated_ports"] = allocated_ports
+    app.logger.info("[CREATE POD] pod spec built")
+
+
+def step_create_pod_k8s(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node = ctx["node"]
+    ns = app.config["NAMESPACE"]
+
+    try:
+        load_k8s()
+        v1 = client.CoreV1Api()
+    except Exception as e:
+        app.logger.exception("[CREATE POD] k8s client setup failed")
+        rollback = _cleanup_create_failure(pod_name)
+        raise StepFailed(infra_error(
+            "CREATE_POD",
+            "K8S_CLIENT_SETUP_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500)
+    ctx["v1"] = v1
+
+    app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+    set_pod_creation_status(request_id, "creating_pod", f"k8s pod 생성 중 (node={best_node})")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.CREATE_POD_K8S, phase=Phase.START)
+    try:
+        v1.create_namespaced_pod(
+            namespace=ns,
+            body=ctx["pod_spec"]
+        )
+    except client.exceptions.ApiException as e:
+        app.logger.exception("[CREATE POD] pod creation failed")
+        set_pod_creation_status(request_id, "failed", "pod 생성 실패")
+        rollback = _cleanup_create_failure(pod_name, v1)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
+                      error_code="POD_CREATE_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "CREATE_POD",
+            "POD_CREATE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[CREATE POD] pod creation failed")
+        set_pod_creation_status(request_id, "failed", "pod 생성 실패")
+        rollback = _cleanup_create_failure(pod_name, v1)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.CREATE_POD_K8S, phase=_fail_phase(e),
+                      error_code="POD_CREATE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "CREATE_POD",
+            "POD_CREATE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.CREATE_POD_K8S, phase=Phase.SUCCESS)
+    app.logger.info("[CREATE POD] pod creation request sent")
+
+
+def step_wait_ready(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node, v1 = ctx["node"], ctx["v1"]
+    ns = app.config["NAMESPACE"]
+
+    app.logger.info("[CREATE POD] waiting for pod to become Ready")
+    # "이미지 pull / 컨테이너 기동 대기 중"처럼 두 단계를 합친 문구를 초기값으로도
+    # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
+    # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
+    set_pod_creation_status(request_id, "pulling_image", "이미지 다운로드 중")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.WAIT_READY, phase=Phase.START)
+    app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage=pulling_image 이미지 다운로드 중")
+    try:
+        failure_reason = None
+        max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+        last_progress_stage = "pulling_image"
+        for i in range(max_wait):
+            pod = v1.read_namespaced_pod(pod_name, ns)
+            if is_pod_ready(pod):
+                app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
+                break
+            failure_reason = get_pod_failure_reason(pod)
+            if failure_reason:
+                app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
+                break
+
+            # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
+            # Redis에 다시 쓴다. stage 필드 자체를 이미지 pull 중/컨테이너 기동 중으로
+            # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
+            if i % 5 == 0:
+                progress = get_pod_progress_stage(v1, ns, pod_name)
+                if progress and progress[0] != last_progress_stage:
+                    last_progress_stage, progress_message = progress
+                    set_pod_creation_status(request_id, last_progress_stage, progress_message)
+                    app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage={last_progress_stage} {progress_message}")
+
+            time.sleep(1)
+        else:
+            failure_reason = failure_reason or f"pod not ready within {max_wait}s"
+
+        if failure_reason:
+            app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
+            set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
+            rollback = _cleanup_create_failure(pod_name, v1)
+            log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                          node_name=best_node, resource_type="pod",
+                          action=Action.WAIT_READY, phase=Phase.FAIL,
+                          error_code="POD_READY_TIMEOUT", error_detail=failure_reason)
+            raise StepFailed(infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_TIMEOUT",
+                failure_reason,
+                rollback=rollback,
+                pod_name=pod_name,
+            ), 500)
+    except StepFailed:
+        raise
+    except client.exceptions.ApiException as e:
+        app.logger.exception("[CREATE POD] pod ready check failed")
+        set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
+        rollback = _cleanup_create_failure(pod_name, v1)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.WAIT_READY, phase=Phase.FAIL,
+                      error_code="POD_READY_CHECK_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "WAIT_POD_READY",
+            "POD_READY_CHECK_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[CREATE POD] pod ready check failed")
+        set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
+        rollback = _cleanup_create_failure(pod_name, v1)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.WAIT_READY, phase=_fail_phase(e),
+                      error_code="POD_READY_CHECK_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "WAIT_POD_READY",
+            "POD_READY_CHECK_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.WAIT_READY, phase=Phase.SUCCESS)
+
+
+def step_create_services(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node, v1 = ctx["node"], ctx["v1"]
+    ns = app.config["NAMESPACE"]
+
+    app.logger.info("[CREATE POD] creating NodePort services")
+    set_pod_creation_status(request_id, "creating_services", "NodePort 서비스 생성 중")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="service",
+                  action=Action.CREATE_SERVICE, phase=Phase.START)
+    try:
+        create_nodeport_services(username, ns, pod_name, ctx["allocated_ports"])
+    except client.exceptions.ApiException as e:
+        app.logger.exception("[CREATE POD] service creation failed")
+        set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
+        rollback = _cleanup_create_failure(pod_name, v1, delete_services=True)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="service",
+                      action=Action.CREATE_SERVICE, phase=Phase.FAIL,
+                      error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "CREATE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_CREATE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[CREATE POD] service creation failed")
+        set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
+        rollback = _cleanup_create_failure(pod_name, v1, delete_services=True)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="service",
+                      action=Action.CREATE_SERVICE, phase=_fail_phase(e),
+                      error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "CREATE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_CREATE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="service",
+                  action=Action.CREATE_SERVICE, phase=Phase.SUCCESS)
+    app.logger.info("[CREATE POD] services created successfully")
+
+    app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
+    set_pod_creation_status(request_id, "ready", f"컨테이너 생성 완료 (node={best_node})")
+
+
+POD_CREATE_STEPS = [
+    step_fetch_user_config,
+    step_prepare_pod,
+    step_select_node,
+    step_build_pod_spec,
+    step_create_pod_k8s,
+    step_wait_ready,
+    step_create_services,
+]
+
+
 @app.route("/create-pod", methods=["POST"])
 def create_pod():
     """
@@ -537,478 +1088,27 @@ def create_pod():
             "request_id required",
         )), 400
 
-    ns = app.config["NAMESPACE"]
-
-    def cleanup_create_failure(pod_name, v1=None, delete_services=False):
-        rollback = {
-            "nodeportsReleased": False,
-            "podDeleted": False,
-            "servicesDeleted": False,
-        }
-
-        if delete_services:
-            try:
-                delete_nodeport_services(pod_name, ns)
-                rollback["servicesDeleted"] = True
-            except Exception:
-                app.logger.warning("[CREATE POD] cleanup service deletion failed", exc_info=True)
-
-        try:
-            release_nodeports(pod_name)
-            rollback["nodeportsReleased"] = True
-        except Exception:
-            app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
-
-        if v1 is not None:
-            try:
-                v1.delete_namespaced_pod(pod_name, ns)
-                rollback["podDeleted"] = True
-            except client.exceptions.ApiException as e:
-                if e.status == 404:
-                    rollback["podDeleted"] = True
-                else:
-                    app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
-            except Exception:
-                app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
-
-        return rollback
-
+    ctx = {"request_id": request_id, "username": username}
     try:
-        # WAS 조회
-        was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-        app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
-        log_operation(request_id=request_id, username=username,
-                      action=Action.FETCH_USER_CONFIG, phase=Phase.START)
-
-        try:
-            resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-            user_info = resp.json()
-        except requests.RequestException as e:
-            app.logger.exception("[CREATE POD] WAS request failed")
-            log_operation(request_id=request_id, username=username,
-                          action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
-                          error_code="USER_CONFIG_FETCH_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "FETCH_USER_CONFIG",
-                "USER_CONFIG_FETCH_FAILED",
-                str(e),
-            )), 502
-        except ValueError as e:
-            app.logger.exception("[CREATE POD] invalid WAS response")
-            log_operation(request_id=request_id, username=username,
-                          action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
-                          error_code="USER_CONFIG_INVALID_RESPONSE", error_detail=str(e))
-            return jsonify(infra_error(
-                "FETCH_USER_CONFIG",
-                "USER_CONFIG_INVALID_RESPONSE",
-                str(e),
-                was_status=resp.status_code if "resp" in locals() else None,
-            )), 502
-
-        # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
-        if user_info.get("status") == 404 or resp.status_code == 404:
-            app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
-            log_operation(request_id=request_id, username=username,
-                          action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
-                          error_code="USER_CONFIG_NOT_FOUND", error_detail=f"user {username!r} not found in WAS")
-            return jsonify(infra_error(
-                "FETCH_USER_CONFIG",
-                "USER_CONFIG_NOT_FOUND",
-                f"user {username!r} not found in WAS",
-                was_status=resp.status_code,
-            )), 404
-        if resp.status_code >= 400:
-            app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
-            log_operation(request_id=request_id, username=username,
-                          action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
-                          error_code="USER_CONFIG_FETCH_FAILED",
-                          error_detail=f"WAS returned {resp.status_code} for user {username!r}")
-            return jsonify(infra_error(
-                "FETCH_USER_CONFIG",
-                "USER_CONFIG_FETCH_FAILED",
-                f"WAS returned {resp.status_code} for user {username!r}",
-                was_status=resp.status_code,
-            )), 502
-
-        log_operation(request_id=request_id, username=username,
-                      action=Action.FETCH_USER_CONFIG, phase=Phase.SUCCESS)
-        app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
-
-        pod_name = generate_pod_name(username)
-        app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
-
-        # pod_name 중복 확인
-        try:
-            load_k8s()
-            v1 = client.CoreV1Api()
-        except Exception as e:
-            app.logger.exception("[CREATE POD] k8s client setup failed")
-            return jsonify(infra_error(
-                "CHECK_EXISTING_POD",
-                "K8S_CLIENT_SETUP_FAILED",
-                str(e),
-                pod_name=pod_name,
-            )), 500
-
-        try:
-            v1.read_namespaced_pod(pod_name, ns)
-            app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
-            return jsonify(infra_error(
-                "CHECK_EXISTING_POD",
-                "POD_ALREADY_EXISTS",
-                "pod already exists",
-                pod_name=pod_name,
-            )), 409
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                app.logger.exception("[CREATE POD] pod existence check failed")
-                return jsonify(infra_error(
-                    "CHECK_EXISTING_POD",
-                    "POD_CHECK_FAILED",
-                    e.body,
-                    pod_name=pod_name,
-                    **k8s_error_fields(e),
-                )), 500
-            app.logger.debug("[CREATE POD] pod does not exist yet")
-        except Exception as e:
-            app.logger.exception("[CREATE POD] pod existence check failed")
-            return jsonify(infra_error(
-                "CHECK_EXISTING_POD",
-                "POD_CHECK_FAILED",
-                str(e),
-                pod_name=pod_name,
-            )), 500
-
-        # Prometheus 기반 노드 선택
-        gpu_nodes = user_info.get("gpu_nodes", [])
-        node_list = [
-            str(n["node_name"]).strip().lower()
-            for n in gpu_nodes
-            if n.get("node_name")
-        ]
-
-        # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
-        if not node_list:
-            app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
-            try:
-                load_k8s()
-                _all_nodes = client.CoreV1Api().list_node().items
-            except client.exceptions.ApiException as e:
-                app.logger.exception("[CREATE POD] fallback node list failed")
-                return jsonify(infra_error(
-                    "LIST_NODES",
-                    "NODE_LIST_FAILED",
-                    e.body,
-                    **k8s_error_fields(e),
-                )), 500
-            except Exception as e:
-                app.logger.exception("[CREATE POD] fallback node list failed")
-                return jsonify(infra_error(
-                    "LIST_NODES",
-                    "NODE_LIST_FAILED",
-                    str(e),
-                )), 500
-            node_list = [
-                n.metadata.name
-                for n in _all_nodes
-                if all(c.status == "True" for c in n.status.conditions if c.type == "Ready")
-                and not any(
-                    "control-plane" in (t.key or "") and t.effect == "NoSchedule"
-                    for t in (n.spec.taints or [])
-                )
-            ]
-
-        app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
-        set_pod_creation_status(request_id, "selecting_node", "GPU 노드 선택 중")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      action=Action.SELECT_NODE, phase=Phase.START)
-
-        try:
-            best_node = select_best_node_from_prometheus(
-                node_list,
-                app.config["PROM_URL"],
-                app.config["HTTP_TIMEOUT_SEC"]
-            )
-        except Exception as e:
-            app.logger.exception("[CREATE POD] node selection failed")
-            set_pod_creation_status(request_id, "failed", "노드 선택 실패")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          action=Action.SELECT_NODE, phase=Phase.FAIL,
-                          error_code="NODE_SELECTION_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "SELECT_NODE",
-                "NODE_SELECTION_FAILED",
-                str(e),
-                pod_name=pod_name,
-            )), 500
-        app.logger.info(f"[CREATE POD] selected best node: {best_node}")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, action=Action.SELECT_NODE, phase=Phase.SUCCESS)
-
-        # Pod spec 생성
-        app.logger.info("[CREATE POD] building pod spec")
-        set_pod_creation_status(request_id, "building_pod_spec", f"pod spec 생성 중 (node={best_node})")
-
-        try:
-            if not best_node:
-                raise ValueError(
-                    "no suitable node selected (check gpu_nodes and Prometheus metrics)"
-                )
-            spec_wrapper, allocated_ports = build_pod_spec(
-                username,
-                user_info,
-                best_node,
-                pod_name,
-                request_id=request_id,
-            )
-        except PodSpecBuildError as e:
-            set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
-            return jsonify(infra_error(
-                "BUILD_POD_SPEC",
-                "POD_SPEC_BUILD_FAILED",
-                str(e),
-                progress=e.progress,
-                pod_name=pod_name,
-                # 호출자(admin_be)가 계정 삭제 보상 트랜잭션을 실행할 때 이 노드만 정리하도록
-                # 넘겨주기 위함 — 없으면 대상 노드를 몰라서 전체 farm을 무차별로 훑게 된다.
-                node=best_node,
-            )), 500
-        except ValueError as e:
-            set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
-            return jsonify(infra_error(
-                "BUILD_POD_SPEC",
-                "POD_SPEC_BUILD_FAILED",
-                str(e),
-                rollback={"nodeportsReleased": False},
-                pod_name=pod_name,
-            )), 400
-        except Exception as e:
-            app.logger.exception("[CREATE POD] pod spec build failed")
-            set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
-            return jsonify(infra_error(
-                "BUILD_POD_SPEC",
-                "POD_SPEC_BUILD_FAILED",
-                str(e),
-                rollback={"nodeportsReleased": False},
-                pod_name=pod_name,
-                node=best_node,
-            )), 500
-        app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
-
-        pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
-        app.logger.info("[CREATE POD] pod spec built")
-
-        try:
-            load_k8s()
-            v1 = client.CoreV1Api()
-        except Exception as e:
-            app.logger.exception("[CREATE POD] k8s client setup failed")
-            rollback = cleanup_create_failure(pod_name)
-            return jsonify(infra_error(
-                "CREATE_POD",
-                "K8S_CLIENT_SETUP_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
-        set_pod_creation_status(request_id, "creating_pod", f"k8s pod 생성 중 (node={best_node})")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="pod",
-                      action=Action.CREATE_POD_K8S, phase=Phase.START)
-        try:
-            v1.create_namespaced_pod(
-                namespace=ns,
-                body=pod_spec
-            )
-        except client.exceptions.ApiException as e:
-            app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(request_id, "failed", "pod 생성 실패")
-            rollback = cleanup_create_failure(pod_name, v1)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="pod",
-                          action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_CREATE_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "CREATE_POD",
-                "POD_CREATE_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(request_id, "failed", "pod 생성 실패")
-            rollback = cleanup_create_failure(pod_name, v1)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="pod",
-                          action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_CREATE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "CREATE_POD",
-                "POD_CREATE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="pod",
-                      action=Action.CREATE_POD_K8S, phase=Phase.SUCCESS)
-        app.logger.info("[CREATE POD] pod creation request sent")
-
-        app.logger.info("[CREATE POD] waiting for pod to become Ready")
-        # "이미지 pull / 컨테이너 기동 대기 중"처럼 두 단계를 합친 문구를 초기값으로도
-        # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
-        # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
-        set_pod_creation_status(request_id, "pulling_image", "이미지 다운로드 중")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="pod",
-                      action=Action.WAIT_READY, phase=Phase.START)
-        app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage=pulling_image 이미지 다운로드 중")
-        try:
-            failure_reason = None
-            max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
-            last_progress_stage = "pulling_image"
-            for i in range(max_wait):
-                pod = v1.read_namespaced_pod(pod_name, ns)
-                if is_pod_ready(pod):
-                    app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
-                    break
-                failure_reason = get_pod_failure_reason(pod)
-                if failure_reason:
-                    app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
-                    break
-
-                # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
-                # Redis에 다시 쓴다. stage 필드 자체를 이미지 pull 중/컨테이너 기동 중으로
-                # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
-                if i % 5 == 0:
-                    progress = get_pod_progress_stage(v1, ns, pod_name)
-                    if progress and progress[0] != last_progress_stage:
-                        last_progress_stage, progress_message = progress
-                        set_pod_creation_status(request_id, last_progress_stage, progress_message)
-                        app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage={last_progress_stage} {progress_message}")
-
-                time.sleep(1)
-            else:
-                failure_reason = failure_reason or f"pod not ready within {max_wait}s"
-
-            if failure_reason:
-                app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
-                set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
-                rollback = cleanup_create_failure(pod_name, v1)
-                log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                              node_name=best_node, resource_type="pod",
-                              action=Action.WAIT_READY, phase=Phase.FAIL,
-                              error_code="POD_READY_TIMEOUT", error_detail=failure_reason)
-                return jsonify(infra_error(
-                    "WAIT_POD_READY",
-                    "POD_READY_TIMEOUT",
-                    failure_reason,
-                    rollback=rollback,
-                    pod_name=pod_name,
-                )), 500
-        except client.exceptions.ApiException as e:
-            app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
-            rollback = cleanup_create_failure(pod_name, v1)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="pod",
-                          action=Action.WAIT_READY, phase=Phase.FAIL,
-                          error_code="POD_READY_CHECK_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "WAIT_POD_READY",
-                "POD_READY_CHECK_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
-            rollback = cleanup_create_failure(pod_name, v1)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="pod",
-                          action=Action.WAIT_READY, phase=Phase.FAIL,
-                          error_code="POD_READY_CHECK_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "WAIT_POD_READY",
-                "POD_READY_CHECK_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="pod",
-                      action=Action.WAIT_READY, phase=Phase.SUCCESS)
-        app.logger.info("[CREATE POD] creating NodePort services")
-        set_pod_creation_status(request_id, "creating_services", "NodePort 서비스 생성 중")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="service",
-                      action=Action.CREATE_SERVICE, phase=Phase.START)
-        try:
-            create_nodeport_services(username, ns, pod_name, allocated_ports)
-        except client.exceptions.ApiException as e:
-            app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
-            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="service",
-                          action=Action.CREATE_SERVICE, phase=Phase.FAIL,
-                          error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "CREATE_NODEPORT_SERVICE",
-                "NODEPORT_SERVICE_CREATE_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
-            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=best_node, resource_type="service",
-                          action=Action.CREATE_SERVICE, phase=Phase.FAIL,
-                          error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "CREATE_NODEPORT_SERVICE",
-                "NODEPORT_SERVICE_CREATE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=best_node, resource_type="service",
-                      action=Action.CREATE_SERVICE, phase=Phase.SUCCESS)
-        app.logger.info("[CREATE POD] services created successfully")
-
-        app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
-        set_pod_creation_status(request_id, "ready", f"컨테이너 생성 완료 (node={best_node})")
-
-        return jsonify({
-            "status": "created",
-            "node": best_node,
-            "pod_name": pod_name,
-            "ports": allocated_ports
-        }), 201
-
+        for step in POD_CREATE_STEPS:
+            step(ctx)
+    except StepFailed as e:
+        return jsonify(e.body), e.status
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
-        if username:
-            set_pod_creation_status(request_id, "failed", "예기치 않은 오류")
+        set_pod_creation_status(request_id, "failed", "예기치 않은 오류")
         return jsonify(infra_error(
             "CREATE_POD",
             "CREATE_POD_FAILED",
             str(e),
         )), 500
+
+    return jsonify({
+        "status": "created",
+        "node": ctx["node"],
+        "pod_name": ctx["pod_name"],
+        "ports": ctx["allocated_ports"]
+    }), 201
 
 
 @app.route("/requests/<request_id>/status", methods=["GET"])
@@ -1283,7 +1383,7 @@ def build_pod_spec(
     except Exception as e:
         log_operation(request_id=status_key, username=username, pod_name=pod_name,
                       node_name=target_node, resource_type="nodeport",
-                      action=Action.ALLOCATE_NODEPORT, phase=Phase.FAIL,
+                      action=Action.ALLOCATE_NODEPORT, phase=_fail_phase(e),
                       error_detail=str(e))
         raise
     log_operation(request_id=status_key, username=username, pod_name=pod_name,
@@ -1344,7 +1444,7 @@ def build_pod_spec(
             except Exception as e:
                 log_operation(request_id=status_key, username=username, pod_name=pod_name,
                               node_name=target_node, resource_type="kerberos",
-                              action=Action.DEPLOY_KRB5, phase=Phase.FAIL,
+                              action=Action.DEPLOY_KRB5, phase=_fail_phase(e),
                               error_detail=str(e))
                 raise
             log_operation(request_id=status_key, username=username, pod_name=pod_name,
@@ -1486,6 +1586,227 @@ def build_pod_spec(
 
 # //////////////////////// Pod 삭제 //////////////////////
 
+# ---------- Pod 회수 단계 (v2.0) ----------
+# 순서: NodePort Service 삭제 → NodePort 반환 → k8s Pod 삭제 → 그 노드의 keytab 정리
+
+def step_delete_services(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    rollback = ctx["rollback"]
+    ns = app.config["NAMESPACE"]
+
+    app.logger.info("[DELETE POD] deleting NodePort services")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.START)
+    try:
+        delete_nodeport_services(pod_name, ns)
+        rollback["servicesDeleted"] = True
+    except client.exceptions.ApiException as e:
+        app.logger.exception("[DELETE POD] service deletion failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.FAIL,
+                      error_code="NODEPORT_SERVICE_DELETE_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "DELETE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_DELETE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[DELETE POD] service deletion failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      resource_type="service", action=Action.DELETE_SERVICE, phase=_fail_phase(e),
+                      error_code="NODEPORT_SERVICE_DELETE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "DELETE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_DELETE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.SUCCESS)
+
+
+def step_release_nodeports(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    rollback = ctx["rollback"]
+
+    app.logger.info("[DELETE POD] releasing NodePort allocations")
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=Phase.START)
+    try:
+        release_nodeports(pod_name)
+        rollback["nodeportsReleased"] = True
+    except Exception as e:
+        app.logger.exception("[DELETE POD] nodeport release failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=_fail_phase(e),
+                      error_code="NODEPORT_RELEASE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "RELEASE_NODEPORT",
+            "NODEPORT_RELEASE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=Phase.SUCCESS)
+
+
+def step_delete_pod_k8s(ctx):
+    """Pod가 이미 없으면 ctx["already_absent"]를 세우고 성공으로 끝낸다(뒤의 keytab 정리는 건너뜀)."""
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    rollback = ctx["rollback"]
+    ns = app.config["NAMESPACE"]
+
+    app.logger.info(f"[DELETE POD] deleting pod from namespace={ns}")
+    try:
+        load_k8s()
+        v1 = client.CoreV1Api()
+    except Exception as e:
+        app.logger.exception("[DELETE POD] k8s client setup failed")
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "K8S_CLIENT_SETUP_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500)
+
+    pod_node_name = None
+    if app.config.get("KRB5_REALM"):
+        try:
+            pod_node_name = v1.read_namespaced_pod(pod_name, ns).spec.node_name
+        except Exception:
+            app.logger.warning("[DELETE POD] pod node lookup failed, farm 정리 건너뜀: %s", pod_name, exc_info=True)
+    ctx["pod_node_name"] = pod_node_name
+
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=pod_node_name, resource_type="pod",
+                  action=Action.DELETE_POD_K8S, phase=Phase.START)
+    try:
+        v1.delete_namespaced_pod(pod_name, ns)
+        rollback["podDeleteRequested"] = True
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            rollback["podDeleted"] = True
+            app.logger.info("[DELETE POD] pod already absent: %s", pod_name)
+            log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                          node_name=pod_node_name, resource_type="pod",
+                          action=Action.DELETE_POD_K8S, phase=Phase.SUCCESS,
+                          error_detail="pod already absent")
+            ctx["already_absent"] = True
+            return
+        app.logger.exception("[DELETE POD] pod deletion failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=pod_node_name, resource_type="pod",
+                      action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
+                      error_code="POD_DELETE_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "POD_DELETE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[DELETE POD] pod deletion failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=pod_node_name, resource_type="pod",
+                      action=Action.DELETE_POD_K8S, phase=_fail_phase(e),
+                      error_code="POD_DELETE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "POD_DELETE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    app.logger.info("[DELETE POD] waiting for pod deletion to complete")
+    try:
+        deleted = wait_for_pod_deleted(v1, pod_name, ns, timeout_sec=60)
+    except client.exceptions.ApiException as e:
+        app.logger.exception("[DELETE POD] deletion polling failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=pod_node_name, resource_type="pod",
+                      action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
+                      error_code="POD_DELETE_FAILED", error_detail=str(e.body))
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "POD_DELETE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        app.logger.exception("[DELETE POD] deletion polling failed")
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=pod_node_name, resource_type="pod",
+                      action=Action.DELETE_POD_K8S, phase=_fail_phase(e),
+                      error_code="POD_DELETE_FAILED", error_detail=str(e))
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "POD_DELETE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    if not deleted:
+        app.logger.warning("[DELETE POD] pod deletion timed out: %s", pod_name)
+        log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=pod_node_name, resource_type="pod",
+                      action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
+                      error_code="POD_DELETE_TIMEOUT", error_detail="pod deletion did not complete within timeout")
+        raise StepFailed(infra_error(
+            "DELETE_POD",
+            "POD_DELETE_TIMEOUT",
+            "pod deletion did not complete within timeout",
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500)
+
+    rollback["podDeleted"] = True
+    log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=pod_node_name, resource_type="pod",
+                  action=Action.DELETE_POD_K8S, phase=Phase.SUCCESS)
+    app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
+
+
+def step_cleanup_pod_node_krb5(ctx):
+    if ctx.get("already_absent"):
+        return
+    username, pod_node_name = ctx["username"], ctx.get("pod_node_name")
+    if app.config.get("KRB5_REALM") and pod_node_name:
+        try:
+            _remove_krb5_from_farm(username, pod_node_name)
+        except Exception as e:
+            app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
+            _record_krb5_cleanup_pending(username, pod_node_name)
+
+
+POD_DELETE_STEPS = [
+    step_delete_services,
+    step_release_nodeports,
+    step_delete_pod_k8s,
+    step_cleanup_pod_node_krb5,
+]
+
+
+def _new_delete_rollback():
+    return {
+        "servicesDeleted": False,
+        "nodeportsReleased": False,
+        "podDeleteRequested": False,
+        "podDeleted": False,
+    }
+
+
 @app.route("/delete-pod", methods=["POST"])
 def delete_pod():
     """
@@ -1533,7 +1854,6 @@ def delete_pod():
         schema:
           $ref: '#/definitions/ErrorResponse'
     """
-
     data = request.get_json(force=True)
     pod_name = data.get("pod_name")
 
@@ -1547,13 +1867,7 @@ def delete_pod():
             "pod_name required",
         )), 400
 
-    ns = app.config["NAMESPACE"]
-    rollback = {
-        "servicesDeleted": False,
-        "nodeportsReleased": False,
-        "podDeleteRequested": False,
-        "podDeleted": False,
-    }
+    rollback = _new_delete_rollback()
 
     try:
         if not pod_name.startswith("ailab-"):
@@ -1566,193 +1880,26 @@ def delete_pod():
                 pod_name=pod_name,
             )), 400
 
-        rest = pod_name[len("ailab-"):]
-        username = rest.rsplit("-", 1)[0]
+        username = _pod_username(pod_name)
         # admin_be는 이 Pod를 만든 신청 PK를 request_id로 보낸다. 대응하는 신청이 없는
         # 고아 Pod 정리처럼 값이 없는 호출은 이 삭제 호출 하나만을 묶는 임시 키로 기록한다.
         request_id = data.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
-        app.logger.info("[DELETE POD] deleting NodePort services")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.START)
+        ctx = {"request_id": request_id, "username": username, "pod_name": pod_name, "rollback": rollback}
         try:
-            delete_nodeport_services(pod_name, ns)
-            rollback["servicesDeleted"] = True
-        except client.exceptions.ApiException as e:
-            app.logger.exception("[DELETE POD] service deletion failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.FAIL,
-                          error_code="NODEPORT_SERVICE_DELETE_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "DELETE_NODEPORT_SERVICE",
-                "NODEPORT_SERVICE_DELETE_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[DELETE POD] service deletion failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.FAIL,
-                          error_code="NODEPORT_SERVICE_DELETE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "DELETE_NODEPORT_SERVICE",
-                "NODEPORT_SERVICE_DELETE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      resource_type="service", action=Action.DELETE_SERVICE, phase=Phase.SUCCESS)
+            for step in POD_DELETE_STEPS:
+                step(ctx)
+        except StepFailed as e:
+            return jsonify(e.body), e.status
 
-        app.logger.info("[DELETE POD] releasing NodePort allocations")
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=Phase.START)
-        try:
-            release_nodeports(pod_name)
-            rollback["nodeportsReleased"] = True
-        except Exception as e:
-            app.logger.exception("[DELETE POD] nodeport release failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=Phase.FAIL,
-                          error_code="NODEPORT_RELEASE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "RELEASE_NODEPORT",
-                "NODEPORT_RELEASE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      resource_type="nodeport", action=Action.RELEASE_NODEPORT, phase=Phase.SUCCESS)
-
-        app.logger.info(f"[DELETE POD] deleting pod from namespace={ns}")
-        try:
-            load_k8s()
-            v1 = client.CoreV1Api()
-        except Exception as e:
-            app.logger.exception("[DELETE POD] k8s client setup failed")
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "K8S_CLIENT_SETUP_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        pod_node_name = None
-        if app.config.get("KRB5_REALM"):
-            try:
-                pod_node_name = v1.read_namespaced_pod(pod_name, ns).spec.node_name
-            except Exception:
-                app.logger.warning("[DELETE POD] pod node lookup failed, farm 정리 건너뜀: %s", pod_name, exc_info=True)
-
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=pod_node_name, resource_type="pod",
-                      action=Action.DELETE_POD_K8S, phase=Phase.START)
-        try:
-            v1.delete_namespaced_pod(pod_name, ns)
-            rollback["podDeleteRequested"] = True
-        except client.exceptions.ApiException as e:
-            if e.status == 404:
-                rollback["podDeleted"] = True
-                app.logger.info("[DELETE POD] pod already absent: %s", pod_name)
-                log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                              node_name=pod_node_name, resource_type="pod",
-                              action=Action.DELETE_POD_K8S, phase=Phase.SUCCESS,
-                              error_detail="pod already absent")
-                return jsonify({
-                    "status": "deleted",
-                    "pod_name": pod_name,
-                    "already_absent": True,
-                    "progress": rollback,
-                }), 200
-            app.logger.exception("[DELETE POD] pod deletion failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=pod_node_name, resource_type="pod",
-                          action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_DELETE_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "POD_DELETE_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[DELETE POD] pod deletion failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=pod_node_name, resource_type="pod",
-                          action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_DELETE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "POD_DELETE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        app.logger.info("[DELETE POD] waiting for pod deletion to complete")
-        try:
-            deleted = wait_for_pod_deleted(v1, pod_name, ns, timeout_sec=60)
-        except client.exceptions.ApiException as e:
-            app.logger.exception("[DELETE POD] deletion polling failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=pod_node_name, resource_type="pod",
-                          action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_DELETE_FAILED", error_detail=str(e.body))
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "POD_DELETE_FAILED",
-                e.body,
-                rollback=rollback,
-                pod_name=pod_name,
-                **k8s_error_fields(e),
-            )), 500
-        except Exception as e:
-            app.logger.exception("[DELETE POD] deletion polling failed")
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=pod_node_name, resource_type="pod",
-                          action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_DELETE_FAILED", error_detail=str(e))
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "POD_DELETE_FAILED",
-                str(e),
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        if not deleted:
-            app.logger.warning("[DELETE POD] pod deletion timed out: %s", pod_name)
-            log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                          node_name=pod_node_name, resource_type="pod",
-                          action=Action.DELETE_POD_K8S, phase=Phase.FAIL,
-                          error_code="POD_DELETE_TIMEOUT", error_detail="pod deletion did not complete within timeout")
-            return jsonify(infra_error(
-                "DELETE_POD",
-                "POD_DELETE_TIMEOUT",
-                "pod deletion did not complete within timeout",
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 500
-
-        rollback["podDeleted"] = True
-        log_operation(request_id=request_id, username=username, pod_name=pod_name,
-                      node_name=pod_node_name, resource_type="pod",
-                      action=Action.DELETE_POD_K8S, phase=Phase.SUCCESS)
-        app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
-
-        if app.config.get("KRB5_REALM") and pod_node_name:
-            try:
-                _remove_krb5_from_farm(username, pod_node_name)
-            except Exception as e:
-                app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
-                _record_krb5_cleanup_pending(username, pod_node_name)
+        if ctx.get("already_absent"):
+            return jsonify({
+                "status": "deleted",
+                "pod_name": pod_name,
+                "already_absent": True,
+                "progress": rollback,
+            }), 200
 
         return jsonify({
             "status": "deleted",
@@ -1769,6 +1916,12 @@ def delete_pod():
             rollback=rollback,
             pod_name=pod_name,
         )), 500
+
+
+def _pod_username(pod_name: str) -> str:
+    """ailab-<username>-<suffix> 형식의 Pod 이름에서 username을 꺼낸다."""
+    return pod_name[len("ailab-"):].rsplit("-", 1)[0]
+
 
 def _migrate_internal(data):
 
@@ -2453,6 +2606,233 @@ def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
     return candidate
 
 
+# ---------- 계정 생성 단계 (v2.0) ----------
+# 순서: 계정(passwd·group·shadow·sudoers) → NAS 홈 → Kerberos principal
+
+def step_create_account(ctx):
+    """passwd/group/shadow/sudoers까지가 계정 단계다. 비밀번호는 동기 호출이면 평문(plaintext_pw)을
+    받아 여기서 해시하고, 제어기가 실행하는 작업이면 등록 때 만든 해시(passwd_hash)를 그대로 쓴다."""
+    request_id, name = ctx["request_id"], ctx["name"]
+    pg_name, supp_groups = ctx["pg_name"], ctx["supp_groups"]
+
+    ensure_etc_layout()
+
+    # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
+    uid = gid = None
+    entry = None
+    log_operation(request_id=request_id, username=name, resource_type="account",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.START)
+    try:
+        with LockedFile(app.config["PASSWD_PATH"], "r+") as f:
+            content = f.read()
+            lines = content.splitlines()
+
+            if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
+                log_operation(request_id=request_id, username=name, resource_type="account",
+                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="USER_ALREADY_EXISTS", error_detail="user already exists")
+                raise StepFailed({"error": "user already exists"}, 409)
+
+            uid = _allocate_next_uid(lines, min_uid=UID_MIN)
+            if UID_MAX is not None and uid > UID_MAX:
+                log_operation(request_id=request_id, username=name, resource_type="account",
+                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="UID_RANGE_EXHAUSTED",
+                              error_detail=f"next uid {uid} exceeds UID_MAX {UID_MAX}")
+                raise StepFailed(infra_error(
+                    "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
+                    f"uid range {UID_MIN}~{UID_MAX} exhausted",
+                ), 500)
+            gid = uid
+            app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
+
+            entry = {
+                "name": name,
+                "passwd": "x",
+                "uid": uid,
+                "gid": gid,
+                "gecos": ctx["gecos"],
+                "home": f"/home/{name}",
+                "shell": "/bin/bash",
+            }
+            lines.append(format_passwd_entry(entry))
+            new_content = "\n".join(lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+    except StepFailed:
+        raise
+    except Exception as e:
+        log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="PASSWD_WRITE_FAILED", error_detail=str(e))
+        raise
+
+    # 2) group — primary 생성 + supplementary 멤버 추가
+    added_supp = []
+    try:
+        with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+            content = f.read()
+            g_lines = content.splitlines()
+
+            # primary group
+            primary_exists = any(
+                (parse_group_line(gl) or {}).get("gid") == gid or
+                (parse_group_line(gl) or {}).get("name") == pg_name
+                for gl in g_lines
+            )
+            if not primary_exists:
+                g_lines.append(format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
+
+            # supplementary groups
+            for sg in supp_groups:
+                sg_gid = int(sg["gid"])
+                sg_name = sg["name"]
+                found = False
+                updated = []
+                for gl in g_lines:
+                    rec = parse_group_line(gl)
+                    if rec and rec["gid"] == sg_gid:
+                        if name not in rec["members"]:
+                            rec["members"].append(name)
+                        updated.append(format_group_entry(rec))
+                        found = True
+                    else:
+                        updated.append(gl)
+                g_lines = updated
+                if not found:
+                    g_lines.append(format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
+                added_supp.append({"name": sg_name, "gid": sg_gid})
+
+            new_content = "\n".join(g_lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+    except Exception as e:
+        app.logger.exception("[ACCOUNTS] group write failed for user=%s, rolling back", name)
+        log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="GROUP_WRITE_FAILED", error_detail=str(e))
+        _rollback_user(name)
+        raise StepFailed({"error": "failed to write group"}, 500)
+
+    # 3) shadow
+    try:
+        passwd_sha512 = ctx.get("passwd_hash") or crypt.crypt(ctx["plaintext_pw"], crypt.mksalt(crypt.METHOD_SHA512))
+
+        today_days = int(time.time() // 86400)
+        sh_lines = read_shadow_lines()
+        shadow_entry = {
+            "name": name,
+            "passwd": passwd_sha512,
+            "lastchg": today_days,
+            "min": 0,
+            "max": 99999,
+            "warn": 7,
+            "inactive": "",
+            "expire": "",
+            "flag": "",
+        }
+        sh_lines.append(format_shadow_entry(shadow_entry))
+        write_shadow_lines(sh_lines)
+    except Exception as e:
+        app.logger.exception("[ACCOUNTS] shadow write failed for user=%s, rolling back", name)
+        log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="SHADOW_WRITE_FAILED", error_detail=str(e))
+        _rollback_user(name)
+        raise StepFailed({"error": "failed to write shadow"}, 500)
+
+    # 4) sudoers (로컬 호스트 관리, password-protected whitelist)
+    s_path = None
+    sudoers_policy = _build_sudoers_policy(name)
+    if sudoers_policy:
+        try:
+            s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
+        except Exception as e:
+            app.logger.exception("[ACCOUNTS] sudoers failed for user=%s, rolling back", name)
+            log_operation(request_id=request_id, username=name, resource_type="account",
+                          action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                          error_code="SUDOERS_CREATE_FAILED", error_detail=str(e))
+            _rollback_user(name)
+            raise StepFailed({"error": "failed to create sudoers file"}, 500)
+
+    # passwd/group/shadow/sudoers까지가 계정 단계다. 홈과 Kerberos는 별도 단계로 기록해야
+    # 단계별 소요시간이 나뉘고 어느 단계에서 실패했는지가 action으로 드러난다. 뒤 단계가
+    # 실패하면 _rollback_user가 계정을 되돌리므로, 여기서 SUCCESS가 찍힌 계정이 이후
+    # 롤백됐는지는 같은 request_id의 뒤 단계 FAIL 행으로 판별한다.
+    log_operation(request_id=request_id, username=name, resource_type="account",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
+    ctx.update(uid=uid, gid=gid, entry=entry, added_supp=added_supp, s_path=s_path)
+
+
+def step_create_home(ctx):
+    request_id, name = ctx["request_id"], ctx["name"]
+
+    # 5) NAS SSH로 홈 디렉터리 생성
+    log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.START)
+    try:
+        create_user_home_directory(name, ctx["uid"], ctx["gid"])
+    except Exception as e:
+        app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        log_operation(request_id=request_id, username=name, resource_type="storage",
+                      action=Action.CREATE_HOME, phase=_fail_phase(e),
+                      error_code="NAS_SSH_FAILED", error_detail=str(e))
+        _rollback_user(name)
+        raise StepFailed(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}"), 500, cause=e)
+    log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.SUCCESS)
+
+
+def step_create_krb5_principal(ctx):
+    request_id, name = ctx["request_id"], ctx["name"]
+
+    # 6) Kerberos principal 생성 + keytab k8s Secret 저장
+    if not app.config.get("KRB5_REALM"):
+        return
+    log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.START)
+    try:
+        _create_krb5_principal_and_secret(name, ctx["uid"], ctx["gid"])
+    except Exception as e:
+        app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
+        log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                      action=Action.CREATE_KRB5_PRINCIPAL, phase=_fail_phase(e),
+                      error_code="KDC_FAILED", error_detail=str(e))
+        try:
+            delete_user_home_directory(name)
+        except Exception:
+            pass
+        # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
+        # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
+        # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이
+        # 그대로 남는다. 존재 여부와 무관하게 항상 삭제를 시도해 정리한다.
+        try:
+            _farm_ad_ssh(f"delete {name}")
+        except Exception:
+            app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
+        _rollback_user(name)
+        raise StepFailed(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}"), 500, cause=e)
+
+    # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
+    # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을
+    # 특정할 수 없다. krb5_cleanup_pending은 (username, node_name) 단위 예약이라
+    # node_name 없이 이 시점에 username만으로 지우면, 이번에 전혀 안 건드린 다른
+    # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
+    # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
+    # 몫만 정리한다.
+    log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
+
+
+ACCOUNT_CREATE_STEPS = [
+    step_create_account,
+    step_create_home,
+    step_create_krb5_principal,
+]
+
+
 @accounts_bp.route("/users", methods=["PUT"])
 def create_user():
     """
@@ -2543,216 +2923,176 @@ def create_user():
     except Exception:
         return jsonify({"error": "invalid passwd_base64"}), 400
 
-    ensure_etc_layout()
-
     # admin_be는 /create-pod와 같은 신청 PK를 request_id로 보낸다. 그래야 한 승인의 계정
     # 생성 이력과 Pod 생성 이력이 하나의 request_id로 묶인다. 값이 없는 호출(직접 호출 등)은
     # 이 계정생성 호출 하나만을 묶는 임시 키로 기록한다.
     request_id = data.get("request_id") or f"{name}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
-    # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
-    uid = gid = None
-    entry = None
-    log_operation(request_id=request_id, username=name, resource_type="account",
-                  action=Action.CREATE_ACCOUNT, phase=Phase.START)
+    ctx = {
+        "request_id": request_id,
+        "name": name,
+        "pg_name": pg_name,
+        "supp_groups": supp_groups,
+        "gecos": data.get("gecos", ""),
+        "plaintext_pw": plaintext_pw,
+    }
     try:
-        with LockedFile(app.config["PASSWD_PATH"], "r+") as f:
-            content = f.read()
-            lines = content.splitlines()
-
-            if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
-                log_operation(request_id=request_id, username=name, resource_type="account",
-                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                              error_code="USER_ALREADY_EXISTS", error_detail="user already exists")
-                return jsonify({"error": "user already exists"}), 409
-
-            uid = _allocate_next_uid(lines, min_uid=UID_MIN)
-            if UID_MAX is not None and uid > UID_MAX:
-                log_operation(request_id=request_id, username=name, resource_type="account",
-                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                              error_code="UID_RANGE_EXHAUSTED",
-                              error_detail=f"next uid {uid} exceeds UID_MAX {UID_MAX}")
-                return jsonify(infra_error(
-                    "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
-                    f"uid range {UID_MIN}~{UID_MAX} exhausted",
-                )), 500
-            gid = uid
-            app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
-
-            entry = {
-                "name": name,
-                "passwd": "x",
-                "uid": uid,
-                "gid": gid,
-                "gecos": data.get("gecos", ""),
-                "home": f"/home/{name}",
-                "shell": "/bin/bash",
-            }
-            lines.append(format_passwd_entry(entry))
-            new_content = "\n".join(lines) + "\n"
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
-    except Exception as e:
-        log_operation(request_id=request_id, username=name, resource_type="account",
-                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="PASSWD_WRITE_FAILED", error_detail=str(e))
-        raise
-
-    # 2) group — primary 생성 + supplementary 멤버 추가
-    added_supp = []
-    try:
-        with LockedFile(app.config["GROUP_PATH"], "r+") as f:
-            content = f.read()
-            g_lines = content.splitlines()
-
-            # primary group
-            primary_exists = any(
-                (parse_group_line(gl) or {}).get("gid") == gid or
-                (parse_group_line(gl) or {}).get("name") == pg_name
-                for gl in g_lines
-            )
-            if not primary_exists:
-                g_lines.append(format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
-
-            # supplementary groups
-            for sg in supp_groups:
-                sg_gid = int(sg["gid"])
-                sg_name = sg["name"]
-                found = False
-                updated = []
-                for gl in g_lines:
-                    rec = parse_group_line(gl)
-                    if rec and rec["gid"] == sg_gid:
-                        if name not in rec["members"]:
-                            rec["members"].append(name)
-                        updated.append(format_group_entry(rec))
-                        found = True
-                    else:
-                        updated.append(gl)
-                g_lines = updated
-                if not found:
-                    g_lines.append(format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
-                added_supp.append({"name": sg_name, "gid": sg_gid})
-
-            new_content = "\n".join(g_lines) + "\n"
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
-    except Exception as e:
-        app.logger.exception("[ACCOUNTS] group write failed for user=%s, rolling back", name)
-        log_operation(request_id=request_id, username=name, resource_type="account",
-                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="GROUP_WRITE_FAILED", error_detail=str(e))
-        _rollback_user(name)
-        return jsonify({"error": "failed to write group"}), 500
-
-    # 3) shadow
-    try:
-        passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
-
-        today_days = int(time.time() // 86400)
-        sh_lines = read_shadow_lines()
-        shadow_entry = {
-            "name": name,
-            "passwd": passwd_sha512,
-            "lastchg": today_days,
-            "min": 0,
-            "max": 99999,
-            "warn": 7,
-            "inactive": "",
-            "expire": "",
-            "flag": "",
-        }
-        sh_lines.append(format_shadow_entry(shadow_entry))
-        write_shadow_lines(sh_lines)
-    except Exception as e:
-        app.logger.exception("[ACCOUNTS] shadow write failed for user=%s, rolling back", name)
-        log_operation(request_id=request_id, username=name, resource_type="account",
-                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="SHADOW_WRITE_FAILED", error_detail=str(e))
-        _rollback_user(name)
-        return jsonify({"error": "failed to write shadow"}), 500
-
-    # 4) sudoers (로컬 호스트 관리, password-protected whitelist)
-    s_path = None
-    sudoers_policy = _build_sudoers_policy(name)
-    if sudoers_policy:
-        try:
-            s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
-        except Exception as e:
-            app.logger.exception("[ACCOUNTS] sudoers failed for user=%s, rolling back", name)
-            log_operation(request_id=request_id, username=name, resource_type="account",
-                          action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                          error_code="SUDOERS_CREATE_FAILED", error_detail=str(e))
-            _rollback_user(name)
-            return jsonify({"error": "failed to create sudoers file"}), 500
-
-    # passwd/group/shadow/sudoers까지가 계정 단계다. 홈과 Kerberos는 별도 단계로 기록해야
-    # 단계별 소요시간이 나뉘고 어느 단계에서 실패했는지가 action으로 드러난다. 뒤 단계가
-    # 실패하면 _rollback_user가 계정을 되돌리므로, 여기서 SUCCESS가 찍힌 계정이 이후
-    # 롤백됐는지는 같은 request_id의 뒤 단계 FAIL 행으로 판별한다.
-    log_operation(request_id=request_id, username=name, resource_type="account",
-                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
-
-    # 5) NAS SSH로 홈 디렉터리 생성
-    log_operation(request_id=request_id, username=name, resource_type="storage",
-                  action=Action.CREATE_HOME, phase=Phase.START)
-    try:
-        create_user_home_directory(name, uid, gid)
-    except Exception as e:
-        app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
-        log_operation(request_id=request_id, username=name, resource_type="storage",
-                      action=Action.CREATE_HOME, phase=Phase.FAIL,
-                      error_code="NAS_SSH_FAILED", error_detail=str(e))
-        _rollback_user(name)
-        return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
-    log_operation(request_id=request_id, username=name, resource_type="storage",
-                  action=Action.CREATE_HOME, phase=Phase.SUCCESS)
-
-    # 6) Kerberos principal 생성 + keytab k8s Secret 저장
-    if app.config.get("KRB5_REALM"):
-        log_operation(request_id=request_id, username=name, resource_type="kerberos",
-                      action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.START)
-        try:
-            _create_krb5_principal_and_secret(name, uid, gid)
-        except Exception as e:
-            app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
-            log_operation(request_id=request_id, username=name, resource_type="kerberos",
-                          action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.FAIL,
-                          error_code="KDC_FAILED", error_detail=str(e))
-            try:
-                delete_user_home_directory(name)
-            except Exception:
-                pass
-            # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
-            # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
-            # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이
-            # 그대로 남는다. 존재 여부와 무관하게 항상 삭제를 시도해 정리한다.
-            try:
-                _farm_ad_ssh(f"delete {name}")
-            except Exception:
-                app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
-            _rollback_user(name)
-            return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
-
-        # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
-        # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을
-        # 특정할 수 없다. krb5_cleanup_pending은 (username, node_name) 단위 예약이라
-        # node_name 없이 이 시점에 username만으로 지우면, 이번에 전혀 안 건드린 다른
-        # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
-        # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
-        # 몫만 정리한다.
-        log_operation(request_id=request_id, username=name, resource_type="kerberos",
-                      action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
+        for step in ACCOUNT_CREATE_STEPS:
+            step(ctx)
+    except StepFailed as e:
+        return jsonify(e.body), e.status
 
     return jsonify({
         "status": "created",
-        "user": entry,
-        "group": {"name": pg_name, "gid": gid},
-        "supplementary_groups": added_supp,
-        "sudoers": s_path,
+        "user": ctx["entry"],
+        "group": {"name": pg_name, "gid": ctx["gid"]},
+        "supplementary_groups": ctx["added_supp"],
+        "sudoers": ctx["s_path"],
     }), 201
+
+
+# ---------- 계정 회수 단계 (v2.0) ----------
+# 순서: 계정(passwd·shadow·group) → NAS 홈 → Kerberos principal·keytab
+# 동기 계정 삭제(DELETE /accounts/users)는 세 단계를 모두 거친다. 제어기의 회수 작업은 보존 대상인
+# 홈을 지우지 않으므로 홈 단계를 빼고 실행한다(논문 REVOKED 정의, 계획서 v2.0).
+
+def step_delete_account(ctx):
+    request_id, username, node_name = ctx["request_id"], ctx["username"], ctx.get("node_name")
+
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.START)
+
+    # Remove from /etc/passwd
+    lines = read_passwd_lines()
+    new_lines = []
+    removed_user = None
+    for line in lines:
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            removed_user = rec
+            continue
+        new_lines.append(line)
+    if removed_user is None:
+        # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
+        # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
+        # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
+        # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="USER_NOT_FOUND",
+                      error_detail=f"user {username!r} not present in passwd")
+        raise StepFailed({"error": "user not found"}, 404)
+    # passwd/shadow/group 세 파일을 지워야 계정 제거가 끝난다. 중간에 실패하면 계정이
+    # 반만 지워진 채 남으므로, 그 사실이 이력에 남도록 묶어서 감싼다.
+    try:
+        write_passwd_lines(new_lines)
+
+        # Remove from /shadow
+        sh_lines = read_shadow_lines()
+        sh_new = []
+        for sl in sh_lines:
+            srec = parse_shadow_line(sl)
+            if srec and srec["name"] == username:
+                continue
+            sh_new.append(sl)
+        write_shadow_lines(sh_new)
+
+        # Clean /etc/group: remove user from all member lists; delete any group that had this user
+        # (either explicitly in members or implicitly as the primary GID group) if now empty.
+        g_lines = read_group_lines()
+        g_new = []
+        for gl in g_lines:
+            grec = parse_group_line(gl)
+            if not grec:
+                g_new.append(gl)
+                continue
+
+            had_user_member = username in grec.get("members", [])
+            is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
+
+            # Remove from explicit members list
+            if had_user_member:
+                grec["members"] = [m for m in grec["members"] if m != username]
+
+            # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
+            if (had_user_member or is_primary_group) and not grec.get("members"):
+                continue
+
+            g_new.append(format_group_entry(grec))
+
+        write_group_lines(g_new)
+    except Exception as e:
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
+        raise
+
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
+
+
+def step_delete_home(ctx):
+    request_id, username, node_name = ctx["request_id"], ctx["username"], ctx.get("node_name")
+
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="storage", action=Action.DELETE_HOME, phase=Phase.START)
+    try:
+        delete_user_home_directory(username)
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.SUCCESS)
+    except Exception as e:
+        app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="storage", action=Action.DELETE_HOME, phase=_fail_phase(e),
+                      error_code="HOME_DELETE_FAILED", error_detail=str(e))
+
+
+def step_remove_krb5(ctx):
+    """keytab을 지울 노드: 호출자가 준 node_name, 없으면 같은 작업에서 지운 Pod가 떠 있던 노드."""
+    request_id, username = ctx["request_id"], ctx["username"]
+    node_name = ctx.get("node_name") or ctx.get("pod_node_name")
+
+    if not app.config.get("KRB5_REALM"):
+        return
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.START)
+    try:
+        _delete_krb5_principal_and_secret(username)
+    except Exception as e:
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="kerberos", action=Action.REMOVE_KRB5, phase=_fail_phase(e),
+                      error_code="KRB5_PRINCIPAL_DELETE_FAILED", error_detail=str(e))
+        raise
+    if node_name:
+        try:
+            _remove_krb5_from_farm(username, node_name)
+            log_operation(request_id=request_id, username=username, node_name=node_name,
+                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
+        except Exception as e:
+            app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node_name} — {e}")
+            # principal은 지웠지만 노드의 keytab이 남았다. 재조정 잡이 나중에 치우므로
+            # 응답은 성공이지만, 이 시점의 접근 경로는 아직 살아있다 — 회수 완료로
+            # 기록됐는데 접근이 남는 경우가 정확히 여기서 나온다.
+            log_operation(request_id=request_id, username=username, node_name=node_name,
+                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=_fail_phase(e),
+                          error_code="KRB5_FARM_CLEANUP_FAILED", error_detail=str(e))
+            _record_krb5_cleanup_pending(username, node_name)
+    else:
+        app.logger.warning(
+            f"[ACCOUNTS] node_name 없이 사용자 삭제 요청됨 — 설정된 모든 farm 노드를 훑음: {username} "
+            "(무관한 farm의 동일 이름 레거시 계정을 건드릴 수 있음, 호출자가 node_name을 넘기도록 수정 필요)"
+        )
+        _remove_krb5_from_all_farms(username)
+        log_operation(request_id=request_id, username=username,
+                      resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
+
+
+ACCOUNT_DELETE_STEPS = [
+    step_delete_account,
+    step_delete_home,
+    step_remove_krb5,
+]
+
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
 def delete_user(username: str):
@@ -2821,123 +3161,15 @@ def delete_user(username: str):
     # 경우가 있는데, 그때는 생성 이력과 조인되지 않는 임시 키로 떨어진다.
     request_id = request.args.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
-    log_operation(request_id=request_id, username=username, node_name=node_name,
-                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.START)
-
-    # Remove from /etc/passwd
-    lines = read_passwd_lines()
-    new_lines = []
-    removed_user = None
-    for line in lines:
-        rec = parse_passwd_line(line)
-        if rec and rec["name"] == username:
-            removed_user = rec
-            continue
-        new_lines.append(line)
-    if removed_user is None:
-        # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
-        # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
-        # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
-        # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
-        log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="USER_NOT_FOUND",
-                      error_detail=f"user {username!r} not present in passwd")
-        return jsonify({"error": "user not found"}), 404
-    # passwd/shadow/group 세 파일을 지워야 계정 제거가 끝난다. 중간에 실패하면 계정이
-    # 반만 지워진 채 남으므로, 그 사실이 이력에 남도록 묶어서 감싼다.
+    ctx = {"request_id": request_id, "username": username, "node_name": node_name}
     try:
-        write_passwd_lines(new_lines)
-
-        # Remove from /shadow
-        sh_lines = read_shadow_lines()
-        sh_new = []
-        for sl in sh_lines:
-            srec = parse_shadow_line(sl)
-            if srec and srec["name"] == username:
-                continue
-            sh_new.append(sl)
-        write_shadow_lines(sh_new)
-
-        # Clean /etc/group: remove user from all member lists; delete any group that had this user
-        # (either explicitly in members or implicitly as the primary GID group) if now empty.
-        g_lines = read_group_lines()
-        g_new = []
-        for gl in g_lines:
-            grec = parse_group_line(gl)
-            if not grec:
-                g_new.append(gl)
-                continue
-
-            had_user_member = username in grec.get("members", [])
-            is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
-
-            # Remove from explicit members list
-            if had_user_member:
-                grec["members"] = [m for m in grec["members"] if m != username]
-
-            # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
-            if (had_user_member or is_primary_group) and not grec.get("members"):
-                continue
-
-            g_new.append(format_group_entry(grec))
-
-        write_group_lines(g_new)
-    except Exception as e:
-        log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
-        raise
-
-    log_operation(request_id=request_id, username=username, node_name=node_name,
-                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
-
-    log_operation(request_id=request_id, username=username, node_name=node_name,
-                  resource_type="storage", action=Action.DELETE_HOME, phase=Phase.START)
-    try:
-        delete_user_home_directory(username)
-        log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.SUCCESS)
-    except Exception as e:
-        app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
-        log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.FAIL,
-                      error_code="HOME_DELETE_FAILED", error_detail=str(e))
-
-    if app.config.get("KRB5_REALM"):
-        log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.START)
-        try:
-            _delete_krb5_principal_and_secret(username)
-        except Exception as e:
-            log_operation(request_id=request_id, username=username, node_name=node_name,
-                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.FAIL,
-                          error_code="KRB5_PRINCIPAL_DELETE_FAILED", error_detail=str(e))
-            raise
-        if node_name:
-            try:
-                _remove_krb5_from_farm(username, node_name)
-                log_operation(request_id=request_id, username=username, node_name=node_name,
-                              resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
-            except Exception as e:
-                app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node_name} — {e}")
-                # principal은 지웠지만 노드의 keytab이 남았다. 재조정 잡이 나중에 치우므로
-                # 응답은 성공이지만, 이 시점의 접근 경로는 아직 살아있다 — 회수 완료로
-                # 기록됐는데 접근이 남는 경우가 정확히 여기서 나온다.
-                log_operation(request_id=request_id, username=username, node_name=node_name,
-                              resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.FAIL,
-                              error_code="KRB5_FARM_CLEANUP_FAILED", error_detail=str(e))
-                _record_krb5_cleanup_pending(username, node_name)
-        else:
-            app.logger.warning(
-                f"[ACCOUNTS] node_name 없이 사용자 삭제 요청됨 — 설정된 모든 farm 노드를 훑음: {username} "
-                "(무관한 farm의 동일 이름 레거시 계정을 건드릴 수 있음, 호출자가 node_name을 넘기도록 수정 필요)"
-            )
-            _remove_krb5_from_all_farms(username)
-            log_operation(request_id=request_id, username=username,
-                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
+        for step in ACCOUNT_DELETE_STEPS:
+            step(ctx)
+    except StepFailed as e:
+        return jsonify(e.body), e.status
 
     return jsonify({"status": "deleted", "user": username})
+
 
 @accounts_bp.route("/groups/<groupname>", methods=["DELETE"])
 def delete_group(groupname: str):
