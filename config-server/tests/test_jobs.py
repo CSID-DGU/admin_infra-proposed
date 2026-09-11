@@ -75,6 +75,9 @@ def test_same_job_twice_is_409(api, logs, store):
     ("/operations/provision", {"request_id": "1", "username": "exp-np-001", "account": {"passwd_base64": "%%"}}),
     ("/operations/revoke", {"request_id": "1", "username": "exp-np-001"}),
     ("/operations/revoke", {"request_id": "1", "pod_name": "other-pod"}),
+    ("/operations/provision", {"request_id": "smoke-1", "username": "exp-np-001"}),
+    ("/operations/provision", {"request_id": 0, "username": "exp-np-001"}),
+    ("/operations/revoke", {"request_id": "-3", "username": "exp-np-001", "delete_account": True}),
 ])
 def test_invalid_registration_is_400_and_not_stored(api, logs, store, path, body):
     assert api.post(path, json=body).status_code == 400
@@ -189,7 +192,8 @@ def test_provision_steps():
 
 def test_revoke_keeps_home_but_sync_account_delete_still_removes_it():
     steps = main._job_steps("revoke", {"pod_name": "ailab-u-x", "delete_account": True})
-    assert steps == main.POD_DELETE_STEPS + [main.step_delete_account, main.step_remove_krb5]
+    assert steps == main.POD_DELETE_STEPS + [main.step_check_account_unused, main.step_delete_account,
+                                             main.step_remove_krb5]
     assert main.step_delete_home not in steps
     assert main._job_steps("revoke", {"pod_name": "ailab-u-x"}) == main.POD_DELETE_STEPS
     assert main.step_delete_home in main.ACCOUNT_DELETE_STEPS
@@ -199,3 +203,32 @@ def test_account_ctx_uses_stored_hash():
     ctx = main._job_ctx("provision", "1", {"username": "u", "account": {
         "pg_name": "u", "supp_groups": [], "gecos": "", "passwd_hash": "$6$x"}})
     assert ctx["name"] == "u" and ctx["passwd_hash"] == "$6$x" and "plaintext_pw" not in ctx
+    assert ctx["config_by_request"] is True
+
+
+def test_result_row_failure_keeps_input_done_and_retries_only_the_row(store, monkeypatch):
+    rows, fail = [], {"on": True}
+
+    def log(**kw):
+        if fail["on"] and kw.get("raise_errors") and kw["phase"] != Phase.START:
+            raise RuntimeError("log db down")
+        rows.append(kw)
+    monkeypatch.setattr(main, "log_operation", log)
+    monkeypatch.setattr(main, "mark_job_done",
+                        lambda a, r, result: store[(a, r)].update(state="done", result=result))
+    calls = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [lambda ctx: calls.append("step")])
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+
+    main.run_job("provision", "9", "exp-np-001")
+    assert store[("PROVISION", "9")]["state"] == "done" and rows == []
+
+    fail["on"] = False
+    main.run_job("provision", "9", "exp-np-001")
+    assert calls == ["step"]                      # 단계는 다시 돌리지 않는다
+    assert rows[-1]["phase"] == Phase.SUCCESS and ("PROVISION", "9") not in store
+
+
+def test_request_id_is_normalized_to_integer_text(api, logs, store):
+    assert api.post("/operations/provision", json={"request_id": "007", "username": "exp-np-001"}).status_code == 202
+    assert ("PROVISION", "7") in store

@@ -24,7 +24,7 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from pod_status import (
     set_pod_creation_status, get_pod_creation_status,
-    save_job_input, load_job_input, mark_job_running, delete_job_input,
+    save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
 )
 from operation_log import Action, Phase, log_operation
 
@@ -535,7 +535,12 @@ def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
 
 def step_fetch_user_config(ctx):
     request_id, username = ctx["request_id"], ctx["username"]
-    was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+    if ctx.get("config_by_request"):
+        # 제어기 경로: 처리 중인 그 신청 하나의 설정을 신청 번호로 조회한다. 사용자명 조회는 열린 신청이
+        # 여럿이면 가장 최근 것을 골라 다른 신청의 설정을 가져올 수 있다. 동기 경로(baseline)는 그대로 둔다.
+        was_url = f"{ADMIN_BE_INTERNAL_URL}/api/requests/config/by-request/{request_id}"
+    else:
+        was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
     app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
     log_operation(request_id=request_id, username=username,
                   action=Action.FETCH_USER_CONFIG, phase=Phase.START)
@@ -3092,6 +3097,23 @@ def step_remove_krb5(ctx):
                       resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
 
 
+def step_check_account_unused(ctx):
+    """계정 회수 전, 같은 사용자의 컨테이너가 아직 남아 있으면 계정을 지우지 않는다. baseline(admin_be)도
+    다른 신청이 쓰는 계정은 삭제를 보류한다. 같은 작업에서 지운 Pod는 앞 단계가 삭제 완료까지
+    기다렸으므로 여기서 보이지 않는다."""
+    username = ctx["username"]
+    load_k8s()
+    pods = client.CoreV1Api().list_namespaced_pod(
+        app.config["NAMESPACE"], label_selector=f"username={username}").items
+    remaining = [p.metadata.name for p in pods if p.metadata.name != ctx.get("pod_name")]
+    if remaining:
+        app.logger.warning(f"[ACCOUNTS] {username}의 컨테이너 {len(remaining)}개가 남아 있어 계정 회수를 보류")
+        raise StepFailed(infra_error(
+            "DELETE_ACCOUNT", "ACCOUNT_IN_USE",
+            f"{len(remaining)} other pod(s) of {username!r} still use this account",
+        ), 409)
+
+
 ACCOUNT_DELETE_STEPS = [
     step_delete_account,
     step_delete_home,
@@ -3594,18 +3616,26 @@ def _job_steps(kind, job):
     steps = list(POD_DELETE_STEPS) if job.get("pod_name") else []
     if job.get("delete_account"):
         # 보존 대상인 홈은 지우지 않는다 — step_delete_home을 넣지 않는다.
-        steps += [step_delete_account, step_remove_krb5]
+        steps += [step_check_account_unused, step_delete_account, step_remove_krb5]
     return steps
 
 
 def _job_ctx(kind, request_id, job):
     ctx = {"request_id": request_id, "username": job["username"]}
-    if kind == "provision" and job.get("account"):
-        ctx.update(name=job["username"], **job["account"])
+    if kind == "provision":
+        ctx["config_by_request"] = True
+        if job.get("account"):
+            ctx.update(name=job["username"], **job["account"])
     if kind == "revoke":
         ctx.update(pod_name=job.get("pod_name"), node_name=job.get("node_name"),
                    rollback=_new_delete_rollback())
     return ctx
+
+
+def _job_request_id(value):
+    """작업 이력을 admin_be 신청 기록과 조인하는 키이자 사용자 설정 조회 키라 신청 PK(양의 정수)만 받는다."""
+    text = str(value).strip() if value is not None and not isinstance(value, bool) else ""
+    return str(int(text)) if text.isdigit() and int(text) > 0 else None
 
 
 def _register_job(kind, request_id, username, job):
@@ -3653,7 +3683,7 @@ def register_provision():
           type: object
           required: [request_id, username]
           properties:
-            request_id: {type: string, example: "4821"}
+            request_id: {type: integer, example: 4821, description: admin_be 신청 번호}
             username: {type: string, example: exp-np-001}
             account:
               type: object
@@ -3669,10 +3699,10 @@ def register_provision():
       409: {description: 같은 신청의 생성 작업이 아직 끝나지 않음}
     """
     data = request.get_json(force=True) or {}
-    request_id, username = data.get("request_id"), data.get("username")
+    request_id, username = _job_request_id(data.get("request_id")), data.get("username")
     if not request_id or not username:
         return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_PROVISION_REQUEST",
-                                   "request_id and username required")), 400
+                                   "request_id(admin_be 신청 번호, 양의 정수) and username required")), 400
 
     job = {"username": username}
     account = data.get("account")
@@ -3714,7 +3744,7 @@ def register_revoke():
           type: object
           required: [request_id]
           properties:
-            request_id: {type: string, example: "4821"}
+            request_id: {type: integer, example: 4821, description: admin_be 신청 번호}
             pod_name: {type: string, example: ailab-exp-np-001-7f3a9c21}
             username: {type: string, description: pod_name이 없을 때 필요}
             node_name: {type: string, description: keytab을 지울 노드. 없으면 지운 Pod의 노드}
@@ -3725,7 +3755,7 @@ def register_revoke():
       409: {description: 같은 신청의 회수 작업이 아직 끝나지 않음}
     """
     data = request.get_json(force=True) or {}
-    request_id = data.get("request_id")
+    request_id = _job_request_id(data.get("request_id"))
     pod_name = data.get("pod_name")
     delete_account = bool(data.get("delete_account"))
     if pod_name and not str(pod_name).startswith("ailab-"):
@@ -3733,7 +3763,8 @@ def register_revoke():
     username = data.get("username") or (_pod_username(pod_name) if pod_name else None)
     if not request_id or not username or not (pod_name or delete_account):
         return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REVOKE_REQUEST",
-                                   "request_id and pod_name, or username with delete_account, required")), 400
+                                   "request_id(admin_be 신청 번호, 양의 정수) and pod_name, "
+                                   "or username with delete_account, required")), 400
 
     job = {"username": username, "pod_name": pod_name, "node_name": data.get("node_name"),
            "delete_account": delete_account}
@@ -3798,9 +3829,6 @@ def find_unfinished_jobs(limit=100):
 
 def _finish_job(kind, request_id, username, phase, error_code=None, error_detail=None, ctx=None):
     ctx = ctx or {}
-    log_operation(request_id=request_id, username=username, action=JOB_ACTIONS[kind],
-                  pod_name=ctx.get("pod_name"), node_name=ctx.get("node") or ctx.get("pod_node_name"),
-                  phase=phase, error_code=error_code, error_detail=error_detail)
     if kind == "provision" and phase != Phase.SUCCESS:
         # Pod 단계까지 가지 못한 실패(계정 단계 등)는 진행 상황이 "started"에 멈춰 있으므로 닫아 준다.
         try:
@@ -3808,8 +3836,31 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
                 set_pod_creation_status(request_id, "failed", error_code or "작업 실패")
         except Exception:
             app.logger.warning("[JOB] pod status update failed", exc_info=True)
+    _record_job_result(kind, request_id, username, {
+        "phase": phase.value, "error_code": error_code, "error_detail": error_detail,
+        "pod_name": ctx.get("pod_name"), "node_name": ctx.get("node") or ctx.get("pod_node_name"),
+    })
+
+
+def _record_job_result(kind, request_id, username, result):
+    """작업 결과 행을 남긴 뒤에만 입력을 지운다. 결과 행 기록이 실패하면 입력을 결과와 함께 "done"으로
+    남겨 다음 바퀴에 결과 행만 다시 기록한다. 입력부터 지우면 제어기가 그 작업을 입력 없는 작업으로 보고
+    실패로 기록해, 실제로 성공한 작업이 실패로 남는다."""
+    action = JOB_ACTIONS[kind]
     try:
-        delete_job_input(JOB_ACTIONS[kind].value, request_id)
+        log_operation(request_id=request_id, username=username, action=action,
+                      pod_name=result.get("pod_name"), node_name=result.get("node_name"),
+                      phase=Phase(result["phase"]), error_code=result.get("error_code"),
+                      error_detail=result.get("error_detail"), raise_errors=True)
+    except Exception:
+        app.logger.exception(f"[JOB] result row write failed, will retry: {kind} request_id={request_id}")
+        try:
+            mark_job_done(action.value, request_id, result)
+        except Exception:
+            app.logger.exception("[JOB] job result save failed")
+        return
+    try:
+        delete_job_input(action.value, request_id)
     except Exception:
         app.logger.warning("[JOB] job input delete failed", exc_info=True)
 
@@ -3821,6 +3872,10 @@ def run_job(kind, request_id, username):
     if stored is None:
         _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
                     "job input not found in Redis")
+        return
+    if stored.get("state") == "done":
+        # 지난번에 끝났지만 결과 행 기록이 실패한 작업 — 단계는 다시 돌리지 않고 결과 행만 기록한다.
+        _record_job_result(kind, request_id, username, stored["result"])
         return
     mark_job_running(action.value, request_id)
 
@@ -3853,6 +3908,8 @@ def mark_interrupted_jobs():
         if stored is None:
             _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
                         "job input not found in Redis")
+        elif stored.get("state") == "done":
+            _record_job_result(kind, request_id, username, stored["result"])
         elif stored.get("state") == "running":
             _finish_job(kind, request_id, username, Phase.FAIL, "CONTROLLER_RESTARTED",
                         "controller restarted while the job was running")
