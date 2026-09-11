@@ -22,11 +22,14 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
-from pod_status import set_pod_creation_status, get_pod_creation_status
+from pod_status import (
+    set_pod_creation_status, get_pod_creation_status,
+    save_job_input, load_job_input, mark_job_running, delete_job_input,
+)
 from operation_log import Action, Phase, log_operation
 
 from utils import (
-    get_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
+    get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
     get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
@@ -88,8 +91,10 @@ def _enforce_account_prefix():
         names.append(request.view_args["username"])
     body = request.get_json(silent=True)
     if isinstance(body, dict):
-        if request.path in ("/create-pod", "/migrate"):
+        if request.path in ("/create-pod", "/migrate", "/operations/provision", "/operations/revoke"):
             names.append(body.get("username"))
+        if request.path == "/operations/revoke" and str(body.get("pod_name") or "").startswith("ailab-"):
+            names.append(_pod_username(body["pod_name"]))
         elif request.path == "/accounts/users" and request.method == "PUT":
             names.append(body.get("name"))
     bad = [n for n in names if n is not None and not str(n).startswith(ACCOUNT_PREFIX)]
@@ -3572,6 +3577,286 @@ app.config['SWAGGER'] = {
 
 # config와 template를 모두 넣어준다.
 swagger = Swagger(app, config=swagger_config, template=swagger_template)
+
+# ////////////////////// 작업 등록과 제어기 (v2.0) //////////////////////
+# 승인 API는 작업만 등록하고 바로 응답한다. 실행은 별도 제어기(controller.py)가 위의 단계 함수로 한다.
+# 작업 목록은 따로 두지 않고 operation_log의 작업 단위 행(PROVISION/REVOKE)으로 판단한다: START만
+# 있고 끝(SUCCESS/FAIL/UNKNOWN)이 없는 것이 아직 끝나지 않은 작업이다. 실행에 필요한 입력은
+# Redis(영속화 켬)에 두며, 비밀번호는 평문이 아니라 shadow에 그대로 쓸 해시만 저장한다.
+
+JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE}
+_JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
+
+
+def _job_steps(kind, job):
+    if kind == "provision":
+        return (ACCOUNT_CREATE_STEPS if job.get("account") else []) + POD_CREATE_STEPS
+    steps = list(POD_DELETE_STEPS) if job.get("pod_name") else []
+    if job.get("delete_account"):
+        # 보존 대상인 홈은 지우지 않는다 — step_delete_home을 넣지 않는다.
+        steps += [step_delete_account, step_remove_krb5]
+    return steps
+
+
+def _job_ctx(kind, request_id, job):
+    ctx = {"request_id": request_id, "username": job["username"]}
+    if kind == "provision" and job.get("account"):
+        ctx.update(name=job["username"], **job["account"])
+    if kind == "revoke":
+        ctx.update(pod_name=job.get("pod_name"), node_name=job.get("node_name"),
+                   rollback=_new_delete_rollback())
+    return ctx
+
+
+def _register_job(kind, request_id, username, job):
+    action = JOB_ACTIONS[kind]
+    try:
+        if not save_job_input(action.value, request_id, job):
+            return jsonify(infra_error(
+                "REGISTER_JOB", "JOB_ALREADY_REGISTERED",
+                f"{kind} job for request {request_id} is already registered and not finished",
+            )), 409
+    except Exception as e:
+        app.logger.exception("[JOB] job input save failed")
+        return jsonify(infra_error("REGISTER_JOB", "JOB_STORE_UNAVAILABLE", str(e))), 503
+
+    # 이 START 행이 제어기가 작업을 찾는 근거라, 기록이 실패하면 등록도 실패로 돌린다.
+    try:
+        log_operation(request_id=request_id, username=username, action=action,
+                      phase=Phase.START, raise_errors=True)
+    except Exception as e:
+        delete_job_input(action.value, request_id)
+        return jsonify(infra_error("REGISTER_JOB", "JOB_LOG_UNAVAILABLE", str(e))), 503
+
+    if kind == "provision":
+        set_pod_creation_status(request_id, "started", "요청 접수")
+    app.logger.info(f"[JOB] registered {kind} request_id={request_id} username={username}")
+    return jsonify({"request_id": request_id, "status": "accepted"}), 202
+
+
+@app.route("/operations/provision", methods=["POST"])
+def register_provision():
+    """
+    생성 작업 등록 (v2.0)
+
+    계정(선택)과 Pod 생성을 작업으로 등록하고 바로 202를 돌려준다. 실행은 제어기가 한다.
+    계정이 이미 있으면 account를 빼고 보낸다. 진행 상황은 GET /requests/<request_id>/status,
+    작업 결과는 GET /operations/provision/<request_id>로 조회한다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [request_id, username]
+          properties:
+            request_id: {type: string, example: "4821"}
+            username: {type: string, example: exp-np-001}
+            account:
+              type: object
+              description: PUT /accounts/users와 같은 필드(name 제외)
+              properties:
+                passwd_base64: {type: string}
+                gecos: {type: string}
+                primary_group_name: {type: string}
+                supplementary_groups: {type: array, items: {type: object}}
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 신청의 생성 작업이 아직 끝나지 않음}
+    """
+    data = request.get_json(force=True) or {}
+    request_id, username = data.get("request_id"), data.get("username")
+    if not request_id or not username:
+        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_PROVISION_REQUEST",
+                                   "request_id and username required")), 400
+
+    job = {"username": username}
+    account = data.get("account")
+    if account is not None:
+        if not isinstance(account, dict) or "passwd_base64" not in account:
+            return jsonify({"error": "missing fields: account.passwd_base64"}), 400
+        supp_groups = account.get("supplementary_groups", [])
+        for sg in supp_groups:
+            if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
+                return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
+        try:
+            plaintext_pw = base64.b64decode(account["passwd_base64"], validate=True).decode("utf-8")
+        except Exception:
+            return jsonify({"error": "invalid passwd_base64"}), 400
+        job["account"] = {
+            "pg_name": account.get("primary_group_name", username),
+            "supp_groups": supp_groups,
+            "gecos": account.get("gecos", ""),
+            "passwd_hash": crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512)),
+        }
+    return _register_job("provision", str(request_id), username, job)
+
+
+@app.route("/operations/revoke", methods=["POST"])
+def register_revoke():
+    """
+    회수 작업 등록 (v2.0)
+
+    Pod 회수(Service·NodePort·Pod·그 노드 keytab)와, delete_account가 참이면 계정·Kerberos 회수까지
+    작업으로 등록하고 바로 202를 돌려준다. 홈 디렉터리는 보존한다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [request_id]
+          properties:
+            request_id: {type: string, example: "4821"}
+            pod_name: {type: string, example: ailab-exp-np-001-7f3a9c21}
+            username: {type: string, description: pod_name이 없을 때 필요}
+            node_name: {type: string, description: keytab을 지울 노드. 없으면 지운 Pod의 노드}
+            delete_account: {type: boolean, default: false}
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 신청의 회수 작업이 아직 끝나지 않음}
+    """
+    data = request.get_json(force=True) or {}
+    request_id = data.get("request_id")
+    pod_name = data.get("pod_name")
+    delete_account = bool(data.get("delete_account"))
+    if pod_name and not str(pod_name).startswith("ailab-"):
+        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_POD_NAME", "invalid pod_name")), 400
+    username = data.get("username") or (_pod_username(pod_name) if pod_name else None)
+    if not request_id or not username or not (pod_name or delete_account):
+        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REVOKE_REQUEST",
+                                   "request_id and pod_name, or username with delete_account, required")), 400
+
+    job = {"username": username, "pod_name": pod_name, "node_name": data.get("node_name"),
+           "delete_account": delete_account}
+    return _register_job("revoke", str(request_id), username, job)
+
+
+@app.route("/operations/<kind>/<request_id>", methods=["GET"])
+def get_job_result(kind, request_id):
+    """
+    작업 결과 조회 (v2.0)
+
+    phase: none(등록 이력 없음) / START(대기·실행 중) / SUCCESS / FAIL / UNKNOWN
+    ---
+    tags:
+    - Operations
+    parameters:
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke]}
+      - {in: path, name: request_id, required: true, type: string}
+    responses:
+      200: {description: 조회 성공}
+      404: {description: 알 수 없는 작업 종류}
+    """
+    action = JOB_ACTIONS.get(kind)
+    if action is None:
+        return jsonify({"error": f"unknown job kind {kind!r}"}), 404
+    conn = get_log_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT phase, error_code, created_at FROM operation_log "
+                "WHERE request_id=%s AND action=%s ORDER BY id DESC LIMIT 1",
+                (str(request_id), action.value),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return jsonify({"request_id": request_id, "kind": kind, "phase": "none"}), 200
+    phase, error_code, created_at = row
+    return jsonify({"request_id": request_id, "kind": kind, "phase": phase,
+                    "error_code": error_code, "updated_at": str(created_at)}), 200
+
+
+def find_unfinished_jobs(limit=100):
+    """operation_log에서 작업 START만 있고 끝이 없는 작업을 오래된 순으로. (kind, request_id, username)"""
+    conn = get_log_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT s.action, s.request_id, s.username FROM operation_log s "
+                "WHERE s.action IN (%s, %s) AND s.phase = %s AND NOT EXISTS ("
+                " SELECT 1 FROM operation_log e WHERE e.request_id = s.request_id"
+                " AND e.action = s.action AND e.id > s.id AND e.phase IN (%s, %s, %s)) "
+                "ORDER BY s.id LIMIT %s",
+                (Action.PROVISION.value, Action.REVOKE.value, Phase.START.value,
+                 Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value, limit),
+            )
+            return [(_JOB_KIND[a], r, u) for a, r, u in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _finish_job(kind, request_id, username, phase, error_code=None, error_detail=None, ctx=None):
+    ctx = ctx or {}
+    log_operation(request_id=request_id, username=username, action=JOB_ACTIONS[kind],
+                  pod_name=ctx.get("pod_name"), node_name=ctx.get("node") or ctx.get("pod_node_name"),
+                  phase=phase, error_code=error_code, error_detail=error_detail)
+    if kind == "provision" and phase != Phase.SUCCESS:
+        # Pod 단계까지 가지 못한 실패(계정 단계 등)는 진행 상황이 "started"에 멈춰 있으므로 닫아 준다.
+        try:
+            if (get_pod_creation_status(request_id) or {}).get("stage") != "failed":
+                set_pod_creation_status(request_id, "failed", error_code or "작업 실패")
+        except Exception:
+            app.logger.warning("[JOB] pod status update failed", exc_info=True)
+    try:
+        delete_job_input(JOB_ACTIONS[kind].value, request_id)
+    except Exception:
+        app.logger.warning("[JOB] job input delete failed", exc_info=True)
+
+
+def run_job(kind, request_id, username):
+    """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다."""
+    action = JOB_ACTIONS[kind]
+    stored = load_job_input(action.value, request_id)
+    if stored is None:
+        _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
+                    "job input not found in Redis")
+        return
+    mark_job_running(action.value, request_id)
+
+    job = stored["job"]
+    ctx = _job_ctx(kind, request_id, job)
+    app.logger.info(f"[JOB] start {kind} request_id={request_id}")
+    try:
+        for step in _job_steps(kind, job):
+            step(ctx)
+    except StepFailed as e:
+        code = e.body.get("error") if isinstance(e.body, dict) else None
+        _finish_job(kind, request_id, username, Phase.UNKNOWN if e.unknown else Phase.FAIL,
+                    str(code)[:64] if code else "STEP_FAILED",
+                    json.dumps(e.body, ensure_ascii=False, default=str), ctx)
+        return
+    except Exception as e:
+        app.logger.exception(f"[JOB] {kind} request_id={request_id} unexpected error")
+        _finish_job(kind, request_id, username, _fail_phase(e), "UNEXPECTED_ERROR", str(e), ctx)
+        return
+    app.logger.info(f"[JOB] done {kind} request_id={request_id}")
+    _finish_job(kind, request_id, username, Phase.SUCCESS, ctx=ctx)
+
+
+def mark_interrupted_jobs():
+    """제어기 시작 시, 이전 제어기가 실행하던 중에 끊긴 작업을 실패로 기록한다. 중단된 단계부터
+    이어서 하는 것은 v4.0(재시작 복구)의 몫이다. 그 전에 처음부터 다시 실행하면 Pod가 두 개
+    생기는 식의 중복이 날 수 있어 다시 실행하지 않는다. 아직 시작 전(queued)인 작업은 그대로 둔다."""
+    for kind, request_id, username in find_unfinished_jobs(limit=1000):
+        stored = load_job_input(JOB_ACTIONS[kind].value, request_id)
+        if stored is None:
+            _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
+                        "job input not found in Redis")
+        elif stored.get("state") == "running":
+            _finish_job(kind, request_id, username, Phase.FAIL, "CONTROLLER_RESTARTED",
+                        "controller restarted while the job was running")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

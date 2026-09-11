@@ -34,3 +34,35 @@ def get_pod_creation_status(key_value):
     if raw is None:
         return None
     return json.loads(raw)
+
+
+# ---------- v2.0 작업 입력 ----------
+# 작업 등록 API가 저장하고 제어기가 꺼내 쓴다. 진행 상황과 달리 만료시키지 않고 작업이 끝나면
+# 제어기가 지운다(실험 스택은 이 Redis에 영속화를 켜 두어 Redis가 재시작돼도 남는다).
+# 진행 상황 저장과 달리 실패를 삼키지 않는다 — 저장이 안 되면 작업 등록 자체가 실패해야 한다.
+
+def _job_key(action, request_id):
+    return f"op_job:{action}:{request_id}"
+
+
+def save_job_input(action, request_id, job) -> bool:
+    """같은 작업이 이미 등록돼 있으면 덮어쓰지 않고 False."""
+    return bool(r.set(_job_key(action, request_id), json.dumps({"state": "queued", "job": job}), nx=True))
+
+
+def load_job_input(action, request_id):
+    raw = r.get(_job_key(action, request_id))
+    return json.loads(raw) if raw else None
+
+
+def mark_job_running(action, request_id):
+    key = _job_key(action, request_id)
+    raw = r.get(key)
+    if raw:
+        stored = json.loads(raw)
+        stored["state"] = "running"
+        r.set(key, json.dumps(stored))
+
+
+def delete_job_input(action, request_id):
+    r.delete(_job_key(action, request_id))
