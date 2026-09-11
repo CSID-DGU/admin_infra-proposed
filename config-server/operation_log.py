@@ -37,6 +37,10 @@ class Action(str, Enum):
     DELETE_ACCOUNT = "DELETE_ACCOUNT"
     DELETE_HOME = "DELETE_HOME"
     REMOVE_KRB5 = "REMOVE_KRB5"
+    # v2.0 작업 단위 행. 작업 등록 시 START, 제어기가 작업을 끝내면 SUCCESS/FAIL/UNKNOWN.
+    # 제어기는 START만 있고 끝이 없는 행으로 아직 끝나지 않은 작업을 찾는다.
+    PROVISION = "PROVISION"
+    REVOKE = "REVOKE"
 
 
 class Phase(str, Enum):
@@ -82,6 +86,7 @@ def log_operation(
     duration_ms=None,
     error_code=None,
     error_detail=None,
+    raise_errors=False,
 ):
     """
     operation_log에 한 줄 기록. 절대 예외를 밖으로 던지지 않음
@@ -89,6 +94,9 @@ def log_operation(
 
     duration_ms를 안 넘기고 phase가 SUCCESS/FAIL이면,
     같은 (request_id, action, attempt)의 START로부터 걸린 시간을 DB 시계로 계산해 채움
+
+    raise_errors=True면 기록 실패를 호출자에게 다시 던진다. 작업 등록처럼 이 행 자체가
+    이후 처리의 근거인 경우에만 쓴다.
     """
     action_value = action.value if isinstance(action, Action) else action
     phase_value = phase.value if isinstance(phase, Phase) else phase
@@ -123,6 +131,8 @@ def log_operation(
             f"[OPERATION LOG] insert failed request_id={request_id} "
             f"action={action_value} phase={phase_value}"
         )
+        if raise_errors:
+            raise
     finally:
         if conn is not None:
             conn.close()
