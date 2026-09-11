@@ -183,7 +183,7 @@ smy()  { kubectl -n "$NS" exec mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD
 smyi() { kubectl -n "$NS" exec -i mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot "$@"' _ "$@"; }
 smy -e "DROP DATABASE IF EXISTS refdata_src; CREATE DATABASE refdata_src"
 kubectl -n "$PROD_DB_NS" exec "$PROD_DB_POD" -- sh -c \
-  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction --no-tablespaces --skip-triggers "$MYSQL_DATABASE" "$@"' _ $REF_TABLES \
+  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction --no-tablespaces --skip-triggers --set-gtid-purged=OFF "$MYSQL_DATABASE" "$@"' _ $REF_TABLES \
   | smyi refdata_src
 for T in $REF_TABLES; do
   COLS=$(smy -e "SELECT GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.ORDINAL_POSITION) FROM information_schema.COLUMNS s
@@ -247,15 +247,26 @@ if fe:
         check("30081 호스트 규칙으로 스택 화면", r.status_code == 200, r.status_code)
     except Exception as e:
         check("프론트엔드 응답", False, type(e).__name__)
-requests.delete(f"{base}/accounts/users/{name}", timeout=120)  # 이전 실행에서 남은 것이 있으면 정리
+# 계정 삭제는 계정·홈을 먼저 지우고, 노드를 지정하지 않으면 모든 farm 노드를 차례로 돌며 Kerberos 키를 지운다.
+# 느린 노드가 있으면 이 뒷부분이 수 분 걸리므로 응답은 30초만 기다리고, 계정 대장에서 사라졌는지로 판정한다.
+# 이 테스트 계정은 Pod를 만들지 않아 farm 노드에 키가 배포되지 않는다.
+def delete_account():
+    try:
+        return requests.delete(f"{base}/accounts/users/{name}", timeout=30).status_code
+    except requests.exceptions.ReadTimeout:
+        return "응답 대기 30초 초과(Kerberos 정리 진행 중)"
+delete_account()  # 이전 실행에서 남은 것이 있으면 정리
 r = requests.put(f"{base}/accounts/users", timeout=120, json={
     "request_id": f"smoke-{name}", "name": name, "passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode(),
     "gecos": "stack smoke test", "primary_group_name": name, "enable_sudo": False, "supplementary_groups": []})
 uid = (r.json().get("user") or {}).get("uid") if r.status_code == 201 else None
 check("계정 생성", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
 check(f"UID가 대역 {lo}~{hi} 안", uid is not None and lo <= int(uid) <= hi, uid)
-r = requests.delete(f"{base}/accounts/users/{name}", timeout=120)
-check("계정 삭제", r.status_code == 200, r.status_code)
+res = delete_account()
+gone = requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 404
+check("계정 삭제 (계정 대장에서 사라짐)", gone, res)
+if gone and res != 200:
+    print(f"    참고: 삭제 응답 {res}")
 sys.exit(0 if ok else 1)
 PY
 echo "--- admin_be 나가는 연결 (메일만 허용)"
