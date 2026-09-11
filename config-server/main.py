@@ -3097,11 +3097,18 @@ def step_remove_krb5(ctx):
                       resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
 
 
-def step_check_account_unused(ctx):
-    """계정 회수 전, 같은 사용자의 컨테이너가 아직 남아 있으면 계정을 지우지 않는다. baseline(admin_be)도
-    다른 신청이 쓰는 계정은 삭제를 보류한다. 같은 작업에서 지운 Pod는 앞 단계가 삭제 완료까지
-    기다렸으므로 여기서 보이지 않는다."""
+def step_check_account_revocable(ctx):
+    """계정 회수 전 확인. baseline admin_be가 계정 삭제를 보류하는 두 조건과 같다.
+    ① keytab을 지울 farm 노드를 모르면 보류한다. 모르는 채로 지우면 모든 farm 노드를 훑어 같은 이름의
+       무관한 계정까지 건드릴 수 있다.
+    ② 같은 사용자의 컨테이너가 남아 있으면 보류한다. 같은 작업에서 지운 Pod는 제외한다."""
     username = ctx["username"]
+    if app.config.get("KRB5_REALM") and not (ctx.get("node_name") or ctx.get("pod_node_name")):
+        app.logger.warning(f"[ACCOUNTS] {username}의 farm 노드를 알 수 없어 계정 회수를 보류")
+        raise StepFailed(infra_error(
+            "DELETE_ACCOUNT", "ACCOUNT_NODE_UNKNOWN",
+            f"farm node of {username!r} is unknown; pass node_name",
+        ), 409)
     load_k8s()
     pods = client.CoreV1Api().list_namespaced_pod(
         app.config["NAMESPACE"], label_selector=f"username={username}").items
@@ -3616,7 +3623,7 @@ def _job_steps(kind, job):
     steps = list(POD_DELETE_STEPS) if job.get("pod_name") else []
     if job.get("delete_account"):
         # 보존 대상인 홈은 지우지 않는다 — step_delete_home을 넣지 않는다.
-        steps += [step_check_account_unused, step_delete_account, step_remove_krb5]
+        steps += [step_check_account_revocable, step_delete_account, step_remove_krb5]
     return steps
 
 
@@ -3865,6 +3872,28 @@ def _record_job_result(kind, request_id, username, result):
         app.logger.warning("[JOB] job input delete failed", exc_info=True)
 
 
+def _compensate_provision(kind, job, ctx, done):
+    """생성 작업이 계정을 새로 만든 뒤 그다음 단계에서 실패하면 그 계정을 되돌린다. baseline에서는 admin_be가
+    같은 보상을 하며, 같은 조건(노드를 모르거나 같은 사용자의 컨테이너가 남아 있으면 보류)을 따른다.
+    계정 단계 안에서 실패한 경우는 그 단계가 이미 되돌렸다. 제안 시스템은 회수 때 홈을 보존하므로 여기서도
+    홈은 지우지 않는다(이전 회수에서 보존된 같은 이름의 홈일 수 있다). 결과는 작업 결과 행에 함께 남긴다."""
+    if kind != "provision" or step_create_krb5_principal not in done:
+        return None
+    comp = {"request_id": ctx["request_id"], "username": job["username"],
+            "node_name": ctx.get("node"), "pod_name": ctx.get("pod_name")}
+    try:
+        for step in (step_check_account_revocable, step_delete_account, step_remove_krb5):
+            step(comp)
+    except StepFailed as e:
+        code = e.body.get("error") if isinstance(e.body, dict) else "STEP_FAILED"
+        app.logger.warning(f"[JOB] 계정 되돌리기 {code}: request_id={ctx['request_id']}")
+        return f"held:{code}" if code in ("ACCOUNT_NODE_UNKNOWN", "ACCOUNT_IN_USE") else f"failed:{code}"
+    except Exception as e:
+        app.logger.exception(f"[JOB] 계정 되돌리기 실패: request_id={ctx['request_id']}")
+        return f"failed:{type(e).__name__}"
+    return "account_removed"
+
+
 def run_job(kind, request_id, username):
     """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다."""
     action = JOB_ACTIONS[kind]
@@ -3882,18 +3911,23 @@ def run_job(kind, request_id, username):
     job = stored["job"]
     ctx = _job_ctx(kind, request_id, job)
     app.logger.info(f"[JOB] start {kind} request_id={request_id}")
+    done = []
     try:
         for step in _job_steps(kind, job):
             step(ctx)
+            done.append(step)
     except StepFailed as e:
         code = e.body.get("error") if isinstance(e.body, dict) else None
+        detail = {"error": e.body, "compensation": _compensate_provision(kind, job, ctx, done)}
         _finish_job(kind, request_id, username, Phase.UNKNOWN if e.unknown else Phase.FAIL,
                     str(code)[:64] if code else "STEP_FAILED",
-                    json.dumps(e.body, ensure_ascii=False, default=str), ctx)
+                    json.dumps(detail, ensure_ascii=False, default=str), ctx)
         return
     except Exception as e:
         app.logger.exception(f"[JOB] {kind} request_id={request_id} unexpected error")
-        _finish_job(kind, request_id, username, _fail_phase(e), "UNEXPECTED_ERROR", str(e), ctx)
+        detail = {"error": str(e), "compensation": _compensate_provision(kind, job, ctx, done)}
+        _finish_job(kind, request_id, username, _fail_phase(e), "UNEXPECTED_ERROR",
+                    json.dumps(detail, ensure_ascii=False, default=str), ctx)
         return
     app.logger.info(f"[JOB] done {kind} request_id={request_id}")
     _finish_job(kind, request_id, username, Phase.SUCCESS, ctx=ctx)
