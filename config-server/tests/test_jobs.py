@@ -192,7 +192,7 @@ def test_provision_steps():
 
 def test_revoke_keeps_home_but_sync_account_delete_still_removes_it():
     steps = main._job_steps("revoke", {"pod_name": "ailab-u-x", "delete_account": True})
-    assert steps == main.POD_DELETE_STEPS + [main.step_check_account_unused, main.step_delete_account,
+    assert steps == main.POD_DELETE_STEPS + [main.step_check_account_revocable, main.step_delete_account,
                                              main.step_remove_krb5]
     assert main.step_delete_home not in steps
     assert main._job_steps("revoke", {"pod_name": "ailab-u-x"}) == main.POD_DELETE_STEPS

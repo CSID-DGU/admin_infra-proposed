@@ -240,8 +240,10 @@ def test_duplicate_registration_and_retry_after_finish(env):
     tick(e)
     assert result(e, "provision", "102")["error_code"] == "USER_CONFIG_NOT_FOUND"
     assert e.status["102"] == "failed"
-    # v2.0에는 앞선 작업 취소가 없어 계정이 남는다(v4.0 오류 처리 규칙의 몫)
+    # 노드 선택 전에 실패해 keytab 노드를 모르므로 baseline처럼 계정 되돌리기를 보류한다
     assert "exp-np-e2e" in passwd_names()
+    assert "held:ACCOUNT_NODE_UNKNOWN" in e.db.execute(
+        "SELECT error_detail FROM operation_log WHERE request_id='102' AND action='PROVISION' AND phase='FAIL'").fetchone()[0]
     # 끝난 뒤에는 다시 등록할 수 있다(계정이 남아 있으니 account 없이)
     e.was = None
     assert e.api.post("/operations/provision", json={"request_id": "102", "username": "exp-np-e2e"}).status_code == 202
@@ -327,3 +329,57 @@ def test_account_in_use_by_another_pod_is_not_revoked(env):
 def test_non_numeric_request_id_is_rejected(env):
     r = env.api.post("/operations/provision", json={"request_id": "smoke-1", "username": "exp-np-e2e"})
     assert r.status_code == 400 and env.redis == {}
+
+
+# ---------- baseline 보상 조건 ----------
+
+def test_pod_failure_after_node_selection_rolls_back_account_but_keeps_home(env, monkeypatch):
+    e = env
+    def broken(namespace, body):
+        raise ApiException(status=500, reason="quota exceeded")
+    monkeypatch.setattr(e.v1, "create_namespaced_pod", broken)
+    e.api.post("/operations/provision", json={"request_id": "500", "username": "exp-np-e2e",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    res = result(e, "provision", "500")
+    assert res["phase"] == "FAIL" and res["error_code"] == "POD_CREATE_FAILED"
+    assert "exp-np-e2e" not in passwd_names()                       # 계정 되돌림
+    names = [c[0] for c in e.calls]
+    assert "delete_home" not in names                                # 홈은 보존
+    assert ("krb5_remove", ("exp-np-e2e", "farm2")) in e.calls and "krb5_remove_all" not in names
+    assert ("DELETE_ACCOUNT", "SUCCESS") in rows(e, "500")
+
+
+def test_rollback_held_when_user_has_another_pod(env):
+    """계정을 만든 뒤 Pod 단계가 실패했는데 같은 사용자의 다른 컨테이너가 이미 떠 있으면 되돌리지 않는다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "600", "username": "exp-np-e2e",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    assert len(e.v1.pods) == 1
+    ctx = {"request_id": "601", "node": "farm2", "pod_name": "ailab-exp-np-e2e-failed"}
+    with main.app.app_context():
+        outcome = main._compensate_provision("provision", {"username": "exp-np-e2e"}, ctx,
+                                             done=list(main.ACCOUNT_CREATE_STEPS))
+    assert outcome == "held:ACCOUNT_IN_USE"
+    assert "exp-np-e2e" in passwd_names() and len(e.v1.pods) == 1
+
+
+def test_revoke_of_absent_pod_without_node_is_held_not_scanning_all_farms(env):
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "700", "username": "exp-np-e2e",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    e.v1.pods.clear()                                                # Pod가 이미 사라진 상황
+    e.api.post("/operations/revoke", json={"request_id": "700", "pod_name": "ailab-exp-np-e2e-gone",
+                                           "delete_account": True})
+    tick(e)
+    res = result(e, "revoke", "700")
+    assert res["phase"] == "FAIL" and res["error_code"] == "ACCOUNT_NODE_UNKNOWN"
+    assert "exp-np-e2e" in passwd_names()
+    assert "krb5_remove_all" not in [c[0] for c in e.calls]
+    # 노드를 알려 주면 회수된다
+    e.api.post("/operations/revoke", json={"request_id": "700", "username": "exp-np-e2e", "node_name": "farm2",
+                                           "delete_account": True})
+    tick(e)
+    assert result(e, "revoke", "700")["phase"] == "SUCCESS" and "exp-np-e2e" not in passwd_names()
