@@ -38,7 +38,12 @@ step() { echo; echo "=== $*"; }
 render() { sed -e "s|__NS__|$NS|g" "$@"; }
 rnd() { head -c "${1:-16}" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 # 크론잡 Pod도 같은 app 라벨을 쓰므로 job-name 라벨이 붙은 Pod는 뺀다.
-running_pod() { kubectl -n "$1" get pod -l "$2,!job-name" --field-selector=status.phase=Running -o name | head -1; }
+# 배포 직후 이전 Pod는 진행 중인 요청을 마칠 때까지(최대 10분) 종료 중이면서도 Running으로 남는다.
+# 그런 Pod는 새 요청에 응답하지 않으므로 고르지 않는다.
+running_pod() {
+  kubectl -n "$1" get pod -l "$2,!job-name" --field-selector=status.phase=Running \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}pod/{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | head -1
+}
 getpw() { kubectl -n "$NS" get secret stack-db -o jsonpath="{.data.$1}" | base64 -d; }
 
 step "사전 확인"
@@ -211,7 +216,7 @@ fi
 step "검증 (테스트 계정 ${PREFIX}000 생성 후 삭제)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
 kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" PREFIX="$PREFIX" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" FE_HOST="$FE_HOST" python - <<'PY'
-import base64, os, sys, time, requests
+import base64, json, os, sys, time, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
 ok = True
@@ -251,9 +256,13 @@ if fe:
 # 계정 삭제는 계정·홈을 먼저 지우고, 노드를 지정하지 않으면 모든 farm 노드를 차례로 돌며 Kerberos 키를 지운다.
 # 느린 노드가 있으면 이 뒷부분이 수 분 걸리므로 응답은 30초만 기다리고, 계정 대장에서 사라졌는지로 판정한다.
 # 이 테스트 계정은 Pod를 만들지 않아 farm 노드에 키가 배포되지 않는다.
+# 이 테스트 계정은 어느 farm 노드에도 keytab을 배포하지 않는다. 노드를 안 주면 모든 farm 노드를 차례로
+# 도는 Kerberos 정리(수 분)가 돌고, 그 요청이 다음 배포 때 이전 Pod의 종료를 붙잡는다. 노드 하나만 준다.
+farm_nodes = json.loads(os.environ.get("FARM_NODES_JSON") or "[]")
+cleanup = {"node_name": farm_nodes[0]["name"]} if farm_nodes else {}
 def delete_account():
     try:
-        return requests.delete(f"{base}/accounts/users/{name}", timeout=30).status_code
+        return requests.delete(f"{base}/accounts/users/{name}", params=cleanup, timeout=30).status_code
     except requests.exceptions.ReadTimeout:
         return "응답 대기 30초 초과(Kerberos 정리 진행 중)"
 delete_account()  # 이전 실행에서 남은 것이 있으면 정리

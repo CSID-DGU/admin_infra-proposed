@@ -64,5 +64,14 @@ def mark_job_running(action, request_id):
         r.set(key, json.dumps(stored))
 
 
+def mark_job_done(action, request_id, result):
+    """작업은 끝났지만 결과 행 기록에 실패했을 때, 결과를 들고 "done"으로 남긴다(다음 바퀴에 기록만 재시도)."""
+    key = _job_key(action, request_id)
+    raw = r.get(key)
+    stored = json.loads(raw) if raw else {}
+    stored.update(state="done", result=result)
+    r.set(key, json.dumps(stored))
+
+
 def delete_job_input(action, request_id):
     r.delete(_job_key(action, request_id))
