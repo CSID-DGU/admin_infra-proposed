@@ -1,0 +1,57 @@
+{{- if .Values.controller.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "containerssh-config-server.fullname" . }}-controller
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh-config-controller
+spec:
+  replicas: 1
+  # 제어기 두 벌이 동시에 뜨면 같은 작업을 두 번 실행한다. RollingUpdate 금지 — 이전 Pod가 완전히
+  # 내려간 뒤에야 새 Pod를 띄운다.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: containerssh-config-controller
+  template:
+    metadata:
+      labels:
+        app: containerssh-config-controller
+    spec:
+      # 제어기는 SIGTERM을 받으면 새 작업을 더 받지 않고, 실행 중인 작업(Pod 생성은 최대
+      # POD_READY_MAX_WAIT_SEC=500초)이 끝날 때까지 기다린다.
+      terminationGracePeriodSeconds: 630
+      serviceAccountName: config-server
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "controller.py"]
+          env:
+            {{- include "containerssh-config-server.env" . | nindent 12 }}
+            - name: CONTROLLER_POLL_SEC
+              value: "{{ .Values.controller.pollSec }}"
+            - name: CONTROLLER_WORKERS
+              value: "{{ .Values.controller.workers }}"
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+          volumeMounts:
+            {{- include "containerssh-config-server.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "containerssh-config-server.volumes" . | nindent 8 }}
+{{- end }}
