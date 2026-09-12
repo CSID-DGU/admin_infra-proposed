@@ -1,5 +1,7 @@
 # config-server용(인증 없음, 운영 redis-bg와 같은 이름)과 admin_be용(비밀번호 있음, 운영 my-redis와 같은 방식)
-# 두 대. 실험 스택은 영속화가 필요 없어 디스크를 쓰지 않는다.
+# 두 대. config-server 작업 대기열(redis-bg-master)은 제어기(controller.py)가 처리하기 전에 Redis가
+# 재시작돼도 남아야 해서 AOF+RDB로 영속화한다. admin-redis는 세션 등 재시작에도 남을 필요가 없는
+# 데이터라 그대로 디스크를 쓰지 않는다.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,6 +9,9 @@ metadata:
   namespace: __NS__
 spec:
   replicas: 1
+  # RWO PVC는 한 Pod만 마운트할 수 있어, 새 Pod가 뜨기 전에 옛 Pod가 완전히 내려가야 한다.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis-bg
@@ -18,9 +23,28 @@ spec:
       containers:
         - name: redis
           image: redis:7.4-alpine
-          args: ["--save", "", "--appendonly", "no"]
+          args: ["--appendonly", "yes", "--aof-use-rdb-preamble", "yes", "--appendfsync", "everysec"]
           ports:
             - containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-bg-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-bg-data
+  namespace: __NS__
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
