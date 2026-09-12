@@ -114,3 +114,9 @@ tolerations:
     operator: "Exists"
     effect: "NoSchedule"
 
+# v2.0 제어기(controller.py). 실험 스택에서만 켠다. 운영(baseline)은 동기 API만 쓴다.
+controller:
+  enabled: false
+  pollSec: 2
+  workers: 4
+
