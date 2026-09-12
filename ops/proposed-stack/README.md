@@ -37,13 +37,14 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | 2 | 네임스페이스 생성, 운영의 SSH 키 시크릿 3개 복사 |
 | 3 | DB 비밀번호를 무작위로 만들어 `stack-db` 시크릿에 저장(한 번만) |
 | 4 | MySQL 한 대에 `pod_port_db`, `operation_state_db`, `web_admin`을 만들고 `infra-sql`의 테이블 정의 적용 |
-| 5 | Redis 두 대(config-server용 인증 없음, admin_be용 비밀번호) |
+| 5 | Redis 두 대(config-server용 인증 없음, admin_be용 비밀번호). config-server용(`redis-bg-master`)은 제어기(v2.0)가 처리 전 대기열을 잃지 않도록 AOF+RDB로 영속화하고 PVC 1Gi를 씀 |
 | 6 | 이미지 저장소는 임시 디스크를 씀(사용자 이미지 커밋·재시작용이라 실험에 필요 없음) |
 | 7 | 계정 대장 경로 생성 |
-| 8 | config-server 설치. NFS·NAS·Kerberos·farm 설정은 운영 릴리스 값을 그대로 쓰고 스택별 값만 덮어씀 |
+| 8 | config-server 설치(`controller.enabled=true`로 v2.0 제어기도 같이 설치). NFS·NAS·Kerberos·farm 설정은 운영 릴리스 값을 그대로 쓰고 스택별 값만 덮어씀 |
 | 9 | 프론트엔드 설치. `nginx.conf`의 `/api/`·`/pod-status/` 대상만 스택으로 바꿔 빌드한 이미지 |
 | 9-1 | admin_be 설치. 운영 이미지를 digest로 고정하고 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스와 DNS 외에는 나가는 연결을 네트워크 정책으로 막음 |
-| 10 | 테스트 계정 `<접두어>000`을 만들고 지워서 UID 대역, 작업 이력, 운영 대장에 흔적이 없는지 확인 |
+| 10 | 테스트 계정 `<접두어>000`을 만들고 지워서 UID 대역, 작업 이력, 운영 대장에 흔적이 없는지 확인(동기 API) |
+| 11 | 테스트 계정 `<접두어>001`로 v2.0 비동기 작업(`/operations/provision`·`/operations/revoke`)을 등록하고, 제어기가 실제로 처리해 계정을 만들고 지우는지 확인 |
 
 여러 번 실행해도 결과가 같다. 비밀번호는 처음 만든 값을 유지한다.
 

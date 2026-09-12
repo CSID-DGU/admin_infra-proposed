@@ -142,6 +142,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
   --set db.host=infra-mysql --set logDb.host=log-mysql \
   --set imageStore.claimName= \
+  --set controller.enabled=true \
   --wait --timeout 10m
 
 step "admin_be"
@@ -269,6 +270,64 @@ if gone and res != 200:
     print(f"    참고: 삭제 응답 {res}")
 sys.exit(0 if ok else 1)
 PY
+
+step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 ${PREFIX}001)"
+# 위 검증은 동기 API(/accounts/users)를 확인했고, 여기서는 v2.0 비동기 흐름
+# (POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로 도는지 확인한다.
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" python - <<'PY'
+import base64, os, sys, time, requests
+base, name = "http://127.0.0.1:8000", os.environ["NAME"]
+ok = True
+def check(label, cond, detail=""):
+    global ok
+    print(("OK  " if cond else "NG  ") + label + ("" if cond else f"  ({detail})"))
+    ok = ok and cond
+
+def delete_account():
+    try:
+        return requests.delete(f"{base}/accounts/users/{name}", timeout=30).status_code
+    except requests.exceptions.ReadTimeout:
+        return "응답 대기 30초 초과(Kerberos 정리 진행 중)"
+
+delete_account()  # 이전 실행에서 남은 것이 있으면 정리
+request_id = f"smoke-job-{int(time.time())}"
+
+r = requests.post(f"{base}/operations/provision", timeout=30, json={
+    "request_id": request_id, "username": name,
+    "account": {"passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode()}})
+check("작업 등록 (provision) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
+
+# 제어기가 대기열을 폴링해 실제로 실행할 때까지 최대 2분 대기.
+phase, error_code = "none", None
+for _ in range(24):
+    r = requests.get(f"{base}/operations/provision/{request_id}", timeout=10)
+    body = r.json()
+    phase, error_code = body.get("phase"), body.get("error_code")
+    if phase in ("SUCCESS", "FAIL"):
+        break
+    time.sleep(5)
+# 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal 단계까지는 성공하고
+# 그다음 사용자 설정을 못 찾아 실패로 끝나는 게 정상이다.
+check("제어기가 작업을 실행함 (SUCCESS/FAIL로 종료)", phase in ("SUCCESS", "FAIL"), phase)
+check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
+      phase == "FAIL" and error_code == "USER_CONFIG_NOT_FOUND", f"{phase}/{error_code}")
+check("계정은 만들어짐", requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 200, "")
+
+r = requests.post(f"{base}/operations/revoke", timeout=30,
+                   json={"request_id": request_id, "username": name, "delete_account": True})
+check("작업 등록 (revoke) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
+
+# 비동기라 등록 직후엔 아직 안 지워졌을 수 있어, 계정 대장에서 사라질 때까지 최대 1분 대기.
+gone = False
+for _ in range(12):
+    if requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 404:
+        gone = True
+        break
+    time.sleep(5)
+check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)", gone, "")
+sys.exit(0 if ok else 1)
+PY
+
 echo "--- admin_be 나가는 연결 (메일만 허용)"
 BE_POD=$(running_pod "$NS" app=admin-prod)
 NET=$(kubectl -n "$NS" exec "$BE_POD" -- bash -c '
