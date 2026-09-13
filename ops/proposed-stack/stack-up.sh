@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
 #
-#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지]
+#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지] [admin_be 이미지]
 #
 # admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
 # 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
@@ -10,6 +10,9 @@ set -euo pipefail
 STACK=${1:?"스택 이름(noprobe|full)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
 FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
+# 비우면 운영 admin_be 이미지를 그대로 쓴다. 값을 주면 그 이미지로 올린다 — admin_be 브랜치에서
+# 빌드한 스택 전용 이미지를 올릴 때 쓴다(운영 admin_be 배포는 main push에만 걸려 있어 그대로 남는다).
+BE_IMAGE=${4:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 [ -r /etc/kubernetes/ci-deployer.conf ] && export KUBECONFIG=/etc/kubernetes/ci-deployer.conf
@@ -151,10 +154,15 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --wait --timeout 10m
 
 step "admin_be"
-ADMIN_IMAGE=$(kubectl -n "$PROD_BE_NS" get pod -l app=admin-prod --field-selector=status.phase=Running \
-  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
-ADMIN_IMAGE=${ADMIN_IMAGE#docker-pullable://}
-[ -n "$ADMIN_IMAGE" ] || { echo "운영 admin_be 이미지를 찾지 못함"; exit 1; }
+if [ -n "$BE_IMAGE" ]; then
+  ADMIN_IMAGE=$BE_IMAGE
+else
+  # 운영과 같은 것을 돌린다는 근거가 태그가 아니라 digest여야 해서, 돌고 있는 운영 Pod에서 읽는다.
+  ADMIN_IMAGE=$(kubectl -n "$PROD_BE_NS" get pod -l app=admin-prod --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+  ADMIN_IMAGE=${ADMIN_IMAGE#docker-pullable://}
+  [ -n "$ADMIN_IMAGE" ] || { echo "운영 admin_be 이미지를 찾지 못함"; exit 1; }
+fi
 # 운영 admin_be는 설정 파일을 이미지가 아니라 admin-prod-config Secret으로 받는다. 같은 파일을 복사해
 # 같은 위치에 넣고, 운영 자원을 가리키는 값만 아래 SPRING_APPLICATION_JSON으로 덮어쓴다.
 kubectl -n "$PROD_BE_NS" get secret admin-prod-config >/dev/null 2>&1 || { echo "운영 admin-prod-config Secret이 없음"; exit 1; }
@@ -178,7 +186,7 @@ render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__
 kubectl -n "$NS" rollout status deployment/admin-prod --timeout=10m
 kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
 kubectl -n "$NS" rollout status deployment/admin-redis --timeout=5m
-echo "admin_be 이미지: ${ADMIN_IMAGE##*@}"
+echo "admin_be 이미지: ${ADMIN_IMAGE##*[@:]}"
 
 step "기준 데이터 복사 (운영 admin DB → 스택)"
 # 신청 화면에 필요한 서버·자원 그룹·노드·GPU·이미지와 메일 문구만 복사한다. 사용자·신청은 운영 개인정보이고,
