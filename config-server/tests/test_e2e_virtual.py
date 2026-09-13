@@ -112,6 +112,9 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "mark_job_running", lambda a, r: e.redis[(a, r)].update(state="running"))
     monkeypatch.setattr(main, "delete_job_input", lambda a, r: e.redis.pop((a, r), None))
     monkeypatch.setattr(main, "mark_job_done", lambda a, r, res: e.redis.setdefault((a, r), {}).update(state="done", result=res))
+    e.job_results = {}
+    monkeypatch.setattr(main, "save_job_result", lambda a, r, d: e.job_results.__setitem__((a, r), d))
+    monkeypatch.setattr(main, "load_job_result", lambda a, r: e.job_results.get((a, r)))
     monkeypatch.setattr(main, "set_pod_creation_status", lambda k, st, m="": e.status.__setitem__(str(k), st))
     monkeypatch.setattr(main, "get_pod_creation_status", lambda k: {"stage": e.status.get(str(k))})
 
@@ -400,3 +403,34 @@ def test_revoke_of_absent_pod_without_node_is_held_not_scanning_all_farms(env):
                                            "delete_account": True})
     tick(e)
     assert result(e, "revoke", "700")["phase"] == "SUCCESS" and "exp-np-e2e" not in passwd_names()
+
+
+def test_provision_result_carries_created_resources(env):
+    """작업 결과 조회가 admin_be가 신청 기록에 반영할 값을 함께 돌려준다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "111", "username": "exp-np-res",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    res = result(e, "provision", "111")
+    assert res["phase"] == "SUCCESS", rows(e, "111")
+    made = res["result"]
+    uid = int(passwd_line("exp-np-res").split(":")[2])
+    gid = int(passwd_line("exp-np-res").split(":")[3])
+    assert (made["uid"], made["gid"]) == (uid, gid)
+    assert made["pod_name"] == next(iter(e.v1.pods)) and made["node"] == "farm2"
+    # 포트는 /create-pod 응답과 같은 형식이라 admin_be가 그대로 저장할 수 있다.
+    assert sorted(p["usage_purpose"] for p in made["ports"]) == ["jupyter", "ssh"]
+    assert all(p["external_port"] and p["internal_port"] for p in made["ports"])
+
+
+def test_failed_provision_has_no_result(env):
+    """실패한 작업은 만든 자원이 없으므로 result가 비어 있다."""
+    e = env
+    e.was = lambda url, timeout: e.Resp(404, {"error": "not found"})
+    e.api.post("/operations/provision", json={"request_id": "112", "username": "exp-np-res2",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    res = result(e, "provision", "112")
+    assert res["phase"] in ("FAIL", "UNKNOWN") and res["result"] is None
