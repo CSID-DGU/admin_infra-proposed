@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
 #
-#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지] [admin_be 이미지]
+#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지] [admin_be 이미지] [be_async]
 #
 # admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
 # 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
@@ -13,9 +13,14 @@ FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
 # 비우면 운영 admin_be 이미지를 그대로 쓴다. 값을 주면 그 이미지로 올린다 — admin_be 브랜치에서
 # 빌드한 스택 전용 이미지를 올릴 때 쓴다(운영 admin_be 배포는 main push에만 걸려 있어 그대로 남는다).
 BE_IMAGE=${4:-}
+# "true"면 스택 admin_be의 승인을 제안 시스템 실행 구조(작업 등록 → 제어기)로 돌린다. 기본은 꺼짐이다 —
+# Operational Baseline은 스택 admin_be의 동기 승인 경로로 측정하므로, 켜 두면 그 조건이 깨진다.
+BE_ASYNC=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-[ -r /etc/kubernetes/ci-deployer.conf ] && export KUBECONFIG=/etc/kubernetes/ci-deployer.conf
+if [ -r /etc/kubernetes/ci-deployer.conf ]; then
+  export KUBECONFIG=/etc/kubernetes/ci-deployer.conf
+fi
 
 PROD_NS=ailab-infra
 PROD_RELEASE=containerssh-config-server
@@ -175,10 +180,12 @@ PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpat
 # 메일(가입 인증 코드, 만료 안내)은 운영 설정 그대로 보낸다. 서명키는 새로 줘서 운영에서 발급한 토큰이
 # 여기서 통하지 않게 한다.
 SINK=http://127.0.0.1:9/
-# 스택 전용 admin_be 이미지를 올릴 때만 제안 시스템 실행 구조(승인 API는 작업 등록만 하고 제어기가 실행)로
-# 돌린다. 운영 이미지를 그대로 쓰는 경우에는 그 코드가 없어 켤 것도 없다.
+# 제안 시스템 실행 구조(승인 API는 작업 등록만 하고 제어기가 실행)는 스택 전용 admin_be 이미지를 올리면서
+# be_async를 켰을 때만 쓴다. 기본이 꺼짐이어야 baseline을 이 스택의 admin_be로 측정할 수 있다.
 PROPOSED_JSON=""
-[ -n "$BE_IMAGE" ] && PROPOSED_JSON=',"proposed":{"async-approval":{"enabled":true}}'
+if [ -n "$BE_IMAGE" ] && [ "$BE_ASYNC" = "true" ]; then
+  PROPOSED_JSON=',"proposed":{"async-approval":{"enabled":true}}'
+fi
 
 CONFIG_JSON=$(cat <<EOF
 {"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"jwt":{"secret":"$(getpw jwt_secret)"}$PROPOSED_JSON}
@@ -296,57 +303,69 @@ PY
 step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 ${PREFIX}001)"
 # 위 검증은 동기 API(/accounts/users)를 확인했고, 여기서는 v2.0 비동기 흐름
 # (POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로 도는지 확인한다.
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" python - <<'PY'
+# 작업의 신청 번호는 admin_be 신청 PK와 같은 형식(양의 정수)만 받는다. 실제 신청과 겹치지 않도록
+# 현재 시각(초)을 쓴다 — 스택 admin_be의 신청 번호는 1부터 늘어나므로 닿지 않는다.
+JOB_RID=$(date +%s)
+JOB_RID2=$((JOB_RID + 1))
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" python - <<'PY'
 import base64, os, sys, time, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
+rid, rid2 = os.environ["RID"], os.environ["RID2"]
 ok = True
 def check(label, cond, detail=""):
     global ok
     print(("OK  " if cond else "NG  ") + label + ("" if cond else f"  ({detail})"))
     ok = ok and cond
 
-def delete_account():
-    try:
-        return requests.delete(f"{base}/accounts/users/{name}", timeout=30).status_code
-    except requests.exceptions.ReadTimeout:
-        return "응답 대기 30초 초과(Kerberos 정리 진행 중)"
+def account_status():
+    return requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code
 
-delete_account()  # 이전 실행에서 남은 것이 있으면 정리
-request_id = f"smoke-job-{int(time.time())}"
+def new_password():
+    return base64.b64encode(os.urandom(12).hex().encode()).decode()
 
+def wait(fn, times=24, gap=5):
+    """비동기라 결과가 바로 나오지 않는다. 참이 될 때까지 기다렸다가 돌려준다."""
+    for _ in range(times):
+        value = fn()
+        if value:
+            return value
+        time.sleep(gap)
+    return None
+
+try:  # 이전 실행에서 남은 것이 있으면 정리
+    requests.delete(f"{base}/accounts/users/{name}", timeout=30)
+except requests.exceptions.ReadTimeout:
+    pass
+
+# 1) 생성 작업. 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal까지 만든 뒤 설정
+#    조회에서 실패한다. 거기서 끝나지 않고 이번 작업이 만든 계정을 제어기가 되돌리는 것까지가 정상이다.
 r = requests.post(f"{base}/operations/provision", timeout=30, json={
-    "request_id": request_id, "username": name,
-    "account": {"passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode()}})
+    "request_id": rid, "username": name, "account": {"passwd_base64": new_password()}})
 check("작업 등록 (provision) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
 
-# 제어기가 대기열을 폴링해 실제로 실행할 때까지 최대 2분 대기.
-phase, error_code = "none", None
-for _ in range(24):
-    r = requests.get(f"{base}/operations/provision/{request_id}", timeout=10)
-    body = r.json()
-    phase, error_code = body.get("phase"), body.get("error_code")
-    if phase in ("SUCCESS", "FAIL"):
-        break
-    time.sleep(5)
-# 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal 단계까지는 성공하고
-# 그다음 사용자 설정을 못 찾아 실패로 끝나는 게 정상이다.
-check("제어기가 작업을 실행함 (SUCCESS/FAIL로 종료)", phase in ("SUCCESS", "FAIL"), phase)
+def finished():
+    body = requests.get(f"{base}/operations/provision/{rid}", timeout=10).json()
+    return body if body.get("phase") in ("SUCCESS", "FAIL", "UNKNOWN") else None
+
+body = wait(finished) or {}
+check("제어기가 작업을 실행함 (끝 상태로 종료)", bool(body), body.get("phase", "시간 초과"))
 check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
-      phase == "FAIL" and error_code == "USER_CONFIG_NOT_FOUND", f"{phase}/{error_code}")
-check("계정은 만들어짐", requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 200, "")
+      body.get("phase") == "FAIL" and body.get("error_code") == "USER_CONFIG_NOT_FOUND",
+      f"{body.get('phase')}/{body.get('error_code')}")
+check("실패한 작업이 만든 계정을 되돌림", wait(lambda: account_status() == 404, times=12) is True, account_status())
+
+# 2) 회수 작업. 계정이 되돌아간 뒤라 지울 것이 없으므로, 동기 경로로 하나 만들어 두고 작업으로 지운다.
+r = requests.put(f"{base}/accounts/users", timeout=60, json={
+    "request_id": f"smoke-revoke-{name}", "name": name, "passwd_base64": new_password(),
+    "gecos": "stack smoke test", "primary_group_name": name, "enable_sudo": False,
+    "supplementary_groups": []})
+check("회수 시험용 계정 생성", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
 
 r = requests.post(f"{base}/operations/revoke", timeout=30,
-                   json={"request_id": request_id, "username": name, "delete_account": True})
+                  json={"request_id": rid2, "username": name, "delete_account": True})
 check("작업 등록 (revoke) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
-
-# 비동기라 등록 직후엔 아직 안 지워졌을 수 있어, 계정 대장에서 사라질 때까지 최대 1분 대기.
-gone = False
-for _ in range(12):
-    if requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 404:
-        gone = True
-        break
-    time.sleep(5)
-check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)", gone, "")
+check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)",
+      wait(lambda: account_status() == 404) is True, account_status())
 sys.exit(0 if ok else 1)
 PY
 
@@ -360,14 +379,16 @@ NET=$(kubectl -n "$NS" exec "$BE_POD" -- bash -c '
 echo "$NET"
 echo "$NET" | grep -q "^NG" && exit 1
 echo "--- 스택 DB의 작업 이력"
-kubectl -n "$NS" exec mysql-0 -- sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT action, phase FROM operation_state_db.operation_log WHERE request_id='smoke-${PREFIX}000' ORDER BY id\" 2>/dev/null" | tail -20
+kubectl -n "$NS" exec mysql-0 -- sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT action, phase FROM operation_state_db.operation_log WHERE request_id IN ('smoke-${PREFIX}000','$JOB_RID','$JOB_RID2') ORDER BY id\" 2>/dev/null" | tail -20
 LEAK=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
 [ "$LEAK" = 0 ] && echo "OK  운영 계정 대장에 ${PREFIX} 계정 없음" || { echo "NG  운영 계정 대장에 ${PREFIX} 계정 ${LEAK}개"; exit 1; }
 
 step "완료"
 echo "네임스페이스      $NS"
 echo "config-server     $RELEASE (nodePort $CONFIG_NODEPORT, 이미지 태그 ${IMAGE##*:})"
-[ -n "$FE_IMAGE" ] && echo "화면              http://$FE_HOST:30081"
+if [ -n "$FE_IMAGE" ]; then
+  echo "화면              http://$FE_HOST:30081"
+fi
 echo "UID 대역          $UID_MIN~$UID_MAX"
 echo "NodePort 대역     $NP_MIN~$NP_MAX"
 echo "테스트 계정 접두어 $PREFIX"

@@ -82,6 +82,6 @@ kubectl -n ailab-noprobe get pods -o wide
 
 제안 시스템 v2.0은 admin_be가 작업 등록 경로(`POST /operations/provision`·`revoke`)를 부르도록 바뀌어야 한다. 이 변경을 운영에 넣으면 비교 기준(Operational Baseline)이 깨지므로, admin_be 브랜치를 병합하지 않은 채로 스택에만 올린다.
 
-admin_infra의 "Deploy Proposed Stack" 워크플로에서 `be_ref`에 admin_be의 브랜치·태그·커밋을 주면, 그 코드로 `admin-prod-exp:<sha>` 이미지를 빌드해 스택에 올린다. 비우면 운영 admin_be 이미지를 digest로 고정해 그대로 쓴다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 아무리 올려도 운영에는 닿지 않는다.
+admin_infra의 "Deploy Proposed Stack" 워크플로에서 `be_ref`에 admin_be의 브랜치·태그·커밋을 주면, 그 코드로 `admin-prod-exp:<sha>` 이미지를 빌드해 스택에 올린다. 승인까지 제안 시스템 실행 구조(작업 등록 → 제어기)로 돌리려면 `be_async`도 켠다. 기본은 꺼짐인데, `Operational Baseline`을 이 스택 admin_be의 동기 승인 경로로 측정하기 때문이다. 비우면 운영 admin_be 이미지를 digest로 고정해 그대로 쓴다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 아무리 올려도 운영에는 닿지 않는다.
 
 스택 전용 이미지는 설정 파일을 굽지 않는다. 설정은 운영 `admin-prod-config` Secret 복사본을 `/app/config`에 마운트해서 받고, 스택 자원을 가리키는 값만 `SPRING_APPLICATION_JSON`으로 덮어쓴다.
