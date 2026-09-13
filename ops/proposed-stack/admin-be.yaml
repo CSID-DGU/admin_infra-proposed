@@ -18,7 +18,10 @@ spec:
         # 설정 시크릿이 바뀌면 다시 뜨도록
         ailab.dgu/config-hash: "__CONFIG_HASH__"
     spec:
-      automountServiceAccountToken: false
+      # 관리자 컨테이너 관리 화면이 Pod 상세·로그·이벤트를 쿠버네티스 API로 직접 읽는다. 권한은 아래 Role로
+      # 이 스택 네임스페이스 안 읽기만 준다.
+      serviceAccountName: admin-prod
+      automountServiceAccountToken: true
       containers:
         - name: admin-prod
           image: __ADMIN_IMAGE__
@@ -50,6 +53,44 @@ spec:
         - name: app-config
           secret:
             secretName: admin-prod-config
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-prod
+  namespace: __NS__
+---
+# 운영 admin_be의 admin-prod-pod-reader와 같은 권한이지만 이 스택 네임스페이스에만 준다.
+# 운영 네임스페이스(ailab-infra)의 Pod는 읽을 수 없다.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: admin-prod-pod-reader
+  namespace: __NS__
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: admin-prod-pod-reader
+  namespace: __NS__
+subjects:
+  - kind: ServiceAccount
+    name: admin-prod
+    namespace: __NS__
+roleRef:
+  kind: Role
+  name: admin-prod-pod-reader
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: v1
 kind: Service
@@ -96,3 +137,6 @@ spec:
           port: 587
         - protocol: TCP
           port: 465
+    # 쿠버네티스 API(관리자 화면의 Pod 조회). 주소는 설치 스크립트가 클러스터에서 읽어 넣는다 — 서비스
+    # 주소로 들어간 연결은 실제 API 서버 주소로 바뀐 뒤 정책에 걸리므로 둘 다 넣는다.
+__API_EGRESS__
