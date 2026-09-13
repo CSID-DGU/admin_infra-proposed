@@ -307,10 +307,13 @@ step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 ${PREFIX}001)
 # 현재 시각(초)을 쓴다 — 스택 admin_be의 신청 번호는 1부터 늘어나므로 닿지 않는다.
 JOB_RID=$(date +%s)
 JOB_RID2=$((JOB_RID + 1))
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" python - <<'PY'
+# 계정 회수는 keytab을 지울 farm 노드를 모르면 보류한다(baseline admin_be와 같은 조건). 회수 작업
+# 시험에는 그래서 노드를 하나 실어 보낸다. 공개 로그에 남지 않게 값은 출력하지 않고 넘기기만 한다.
+JOB_NODE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i '^farm' | head -1)
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" python - <<'PY'
 import base64, os, sys, time, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
-rid, rid2 = os.environ["RID"], os.environ["RID2"]
+rid, rid2, node = os.environ["RID"], os.environ["RID2"], os.environ.get("NODE") or None
 ok = True
 def check(label, cond, detail=""):
     global ok
@@ -352,20 +355,24 @@ check("제어기가 작업을 실행함 (끝 상태로 종료)", bool(body), bod
 check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
       body.get("phase") == "FAIL" and body.get("error_code") == "USER_CONFIG_NOT_FOUND",
       f"{body.get('phase')}/{body.get('error_code')}")
-check("실패한 작업이 만든 계정을 되돌림", wait(lambda: account_status() == 404, times=12) is True, account_status())
+# 되돌리기는 노드를 모르면 보류한다(ACCOUNT_NODE_UNKNOWN). 이 시험은 노드가 정해지기 전 단계에서
+# 실패하므로 계정은 보류되어 남는 것이 정상이다 — baseline admin_be도 같은 상황에서 삭제하지 않고 알린다.
+check("되돌리기 보류 규칙대로 계정이 남음", account_status() == 200, account_status())
 
-# 2) 회수 작업. 계정이 되돌아간 뒤라 지울 것이 없으므로, 동기 경로로 하나 만들어 두고 작업으로 지운다.
-r = requests.put(f"{base}/accounts/users", timeout=60, json={
-    "request_id": f"smoke-revoke-{name}", "name": name, "passwd_base64": new_password(),
-    "gecos": "stack smoke test", "primary_group_name": name, "enable_sudo": False,
-    "supplementary_groups": []})
-check("회수 시험용 계정 생성", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
-
+# 2) 회수 작업. 위에서 남은 계정을 회수 작업으로 지운다. 보류 조건에 걸리지 않게 노드를 실어 보낸다.
+check("회수에 쓸 farm 노드를 찾음", node is not None, "노드 목록이 비어 있음")
 r = requests.post(f"{base}/operations/revoke", timeout=30,
-                  json={"request_id": rid2, "username": name, "delete_account": True})
+                  json={"request_id": rid2, "username": name, "node_name": node, "delete_account": True})
 check("작업 등록 (revoke) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
 check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)",
       wait(lambda: account_status() == 404) is True, account_status())
+
+if account_status() != 404:
+    # 시험 계정을 남긴 채 끝내지 않는다. 동기 경로는 노드를 몰라도 모든 farm 노드를 훑어 정리한다.
+    try:
+        requests.delete(f"{base}/accounts/users/{name}", timeout=60)
+    except requests.exceptions.ReadTimeout:
+        pass
 sys.exit(0 if ok else 1)
 PY
 
