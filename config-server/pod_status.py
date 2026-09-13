@@ -75,3 +75,28 @@ def mark_job_done(action, request_id, result):
 
 def delete_job_input(action, request_id):
     r.delete(_job_key(action, request_id))
+
+
+# 작업이 만든 자원. admin_be가 작업 결과를 받아 신청 기록에 반영하는 데 쓴다(계정 uid/gid, Pod 이름·
+# 노드, 외부 포트). 작업 결과 행에는 남지 않는 값이라 따로 둔다. 신청 처리에 쓰고 나면 필요 없어
+# 만료시킨다. 진행 상황과 같이 저장 실패는 삼킨다 — 부가 정보 저장이 작업 결과 기록을 막으면 안 된다.
+JOB_RESULT_TTL_SEC = int(os.getenv("JOB_RESULT_TTL_SEC", str(24 * 3600)))
+
+
+def _job_result_key(action, request_id):
+    return f"op_job_result:{action}:{request_id}"
+
+
+def save_job_result(action, request_id, detail) -> None:
+    try:
+        r.set(_job_result_key(action, request_id), json.dumps(detail), ex=JOB_RESULT_TTL_SEC)
+    except Exception:
+        pass
+
+
+def load_job_result(action, request_id):
+    try:
+        raw = r.get(_job_result_key(action, request_id))
+    except Exception:
+        return None
+    return json.loads(raw) if raw else None

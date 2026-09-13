@@ -25,6 +25,7 @@ from error import infra_error, k8s_error_fields
 from pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
+    save_job_result, load_job_result,
 )
 from operation_log import Action, Phase, log_operation, current_job_id
 
@@ -3789,6 +3790,9 @@ def get_job_result(kind, request_id):
     작업 결과 조회 (v2.0)
 
     phase: none(등록 이력 없음) / START(대기·실행 중) / SUCCESS / FAIL / UNKNOWN
+
+    성공한 작업은 만든 자원을 result로 함께 돌려준다(생성: 계정 uid·gid, Pod 이름·노드, 외부 포트
+    목록 — 포트는 /create-pod 응답과 같은 형식). 하루가 지나면 result는 사라지고 phase만 남는다.
     ---
     tags:
     - Operations
@@ -3817,7 +3821,8 @@ def get_job_result(kind, request_id):
         return jsonify({"request_id": request_id, "kind": kind, "phase": "none"}), 200
     phase, error_code, created_at, job_id = row
     return jsonify({"request_id": request_id, "kind": kind, "job_id": job_id, "phase": phase,
-                    "error_code": error_code, "updated_at": str(created_at)}), 200
+                    "error_code": error_code, "updated_at": str(created_at),
+                    "result": load_job_result(action.value, request_id)}), 200
 
 
 def find_unfinished_jobs(limit=100):
@@ -3848,6 +3853,14 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
                 set_pod_creation_status(request_id, "failed", error_code or "작업 실패")
         except Exception:
             app.logger.warning("[JOB] pod status update failed", exc_info=True)
+    if phase == Phase.SUCCESS:
+        # 작업이 만든 자원을 결과 조회에 실어 준다. 동기 경로는 같은 값을 응답 본문으로 돌려주므로,
+        # 비동기 경로로 승인하는 쪽(admin_be)도 이 값으로 신청 기록을 채운다.
+        save_job_result(JOB_ACTIONS[kind].value, request_id, {
+            "uid": ctx.get("uid"), "gid": ctx.get("gid"),
+            "pod_name": ctx.get("pod_name"), "node": ctx.get("node"),
+            "ports": ctx.get("allocated_ports") or [],
+        })
     _record_job_result(kind, request_id, username, {
         "phase": phase.value, "error_code": error_code, "error_detail": error_detail,
         "pod_name": ctx.get("pod_name"), "node_name": ctx.get("node") or ctx.get("pod_node_name"),
