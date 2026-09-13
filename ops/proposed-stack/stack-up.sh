@@ -188,13 +188,39 @@ if [ -n "$BE_IMAGE" ] && [ "$BE_ASYNC" = "true" ]; then
 fi
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"jwt":{"secret":"$(getpw jwt_secret)"}$PROPOSED_JSON}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}$PROPOSED_JSON}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 CONFIG_HASH=$(printf '%s%s' "$CONFIG_JSON" "$PROD_CFG_HASH" | sha256sum | cut -c1-16)
-render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__CONFIG_HASH__|$CONFIG_HASH|" | kubectl apply -f -
+# 쿠버네티스 API 주소(서비스 주소 + 실제 API 서버 주소). 내부 주소라 공개 로그에 출력하지 않는다.
+API_SVC_IP=$(kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}')
+API_EP=$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes \
+  -o jsonpath='{range .items[*]}{range .endpoints[*]}{.addresses[0]}{" "}{end}{end}')
+API_EP_PORT=$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes \
+  -o jsonpath='{.items[0].ports[0].port}')
+if [ -z "$API_SVC_IP" ] || [ -z "$API_EP" ] || [ -z "$API_EP_PORT" ]; then
+  echo "쿠버네티스 API 주소를 읽지 못함"; exit 1
+fi
+API_EGRESS="    - to:
+        - ipBlock:
+            cidr: $API_SVC_IP/32
+      ports:
+        - protocol: TCP
+          port: 443"
+for ip in $API_EP; do
+  API_EGRESS="$API_EGRESS
+    - to:
+        - ipBlock:
+            cidr: $ip/32
+      ports:
+        - protocol: TCP
+          port: $API_EP_PORT"
+done
+render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__CONFIG_HASH__|$CONFIG_HASH|" \
+  | API_EGRESS="$API_EGRESS" awk '{ if (index($0, "__API_EGRESS__")) print ENVIRON["API_EGRESS"]; else print }' \
+  | kubectl apply -f -
 kubectl -n "$NS" rollout status deployment/admin-prod --timeout=10m
 kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
 kubectl -n "$NS" rollout status deployment/admin-redis --timeout=5m
@@ -382,9 +408,22 @@ NET=$(kubectl -n "$NS" exec "$BE_POD" -- bash -c '
   t() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
   t smtp.gmail.com 587 && echo "OK  메일(SMTP 587) 연결됨" || echo "NG  메일(SMTP 587) 연결 안 됨"
   t hooks.slack.com 443 && echo "NG  Slack(443) 연결이 열려 있음" || echo "OK  Slack(443) 차단"
-  t my-mysql.ailab-be.svc.cluster.local 3306 && echo "NG  운영 DB 연결이 열려 있음" || echo "OK  운영 DB 차단"')
+  t my-mysql.ailab-be.svc.cluster.local 3306 && echo "NG  운영 DB 연결이 열려 있음" || echo "OK  운영 DB 차단"
+  t kubernetes.default.svc.cluster.local 443 && echo "OK  쿠버네티스 API 연결됨(관리자 Pod 조회)" || echo "NG  쿠버네티스 API 연결 안 됨"')
 echo "$NET"
 echo "$NET" | grep -q "^NG" && exit 1
+SA_REF=system:serviceaccount:$NS:admin-prod
+if [ "$(kubectl auth can-i list pods -n "$NS" --as="$SA_REF" 2>/dev/null)" = yes ] \
+   && [ "$(kubectl auth can-i get pods/log -n "$NS" --as="$SA_REF" 2>/dev/null)" = yes ]; then
+  echo "OK  스택 네임스페이스 Pod·로그 조회 권한 있음"
+else
+  echo "NG  스택 네임스페이스 Pod·로그 조회 권한 없음"; exit 1
+fi
+if [ "$(kubectl auth can-i list pods -n "$PROD_NS" --as="$SA_REF" 2>/dev/null)" = yes ]; then
+  echo "NG  운영 네임스페이스 Pod 조회 권한이 열려 있음"; exit 1
+else
+  echo "OK  운영 네임스페이스 Pod 조회 권한 없음"
+fi
 echo "--- 스택 DB의 작업 이력"
 kubectl -n "$NS" exec mysql-0 -- sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT action, phase FROM operation_state_db.operation_log WHERE request_id IN ('smoke-${PREFIX}000','$JOB_RID','$JOB_RID2') ORDER BY id\" 2>/dev/null" | tail -20
 LEAK=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
