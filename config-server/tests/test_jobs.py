@@ -18,6 +18,16 @@ def _raise(exc):
     return step
 
 
+def _named_steps(calls, *names):
+    steps = []
+    for n in names:
+        def step(ctx, n=n):
+            calls.append(n)
+        step.__name__ = n
+        steps.append(step)
+    return steps
+
+
 @pytest.fixture
 def store(monkeypatch, pod_status):
     """Redis 작업 입력 저장소 대역. 키는 (action, request_id)."""
@@ -115,7 +125,7 @@ def test_registration_fails_when_start_row_cannot_be_written(api, store, monkeyp
 
 def test_run_job_runs_steps_in_order_and_records_success(logs, store, monkeypatch):
     calls = []
-    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [lambda ctx, n=n: calls.append(n) for n in "abc"])
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: _named_steps(calls, "a", "b", "c"))
     _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
 
     main.run_job("provision", "9", "exp-np-001")
@@ -125,7 +135,7 @@ def test_run_job_runs_steps_in_order_and_records_success(logs, store, monkeypatc
     assert ("PROVISION", "9") not in store
 
 
-def test_run_job_stops_at_failed_step(logs, store, monkeypatch):
+def test_run_job_retries_5xx_then_degrades(logs, store, monkeypatch):
     calls = []
     failing = _raise(StepFailed(infra_error("CREATE_POD", "POD_CREATE_FAILED", "quota"), 500))
     monkeypatch.setattr(main, "_job_steps", lambda kind, job: [
@@ -134,8 +144,11 @@ def test_run_job_stops_at_failed_step(logs, store, monkeypatch):
 
     main.run_job("provision", "9", "exp-np-001")
 
-    assert calls == ["a"]
-    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "POD_CREATE_FAILED"
+    assert calls == ["a"]                                     # 실패한 단계 뒤로는 가지 않는다
+    retries = [l for l in logs if l["phase"] == Phase.RETRY]
+    assert [r["attempt"] for r in retries] == [2, 3]          # 재시도 기록 + 시도 번호
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "DEGRADED"
+    assert "POD_CREATE_FAILED" in logs[-1]["error_detail"]
     assert ("PROVISION", "9") not in store
 
 
@@ -147,9 +160,11 @@ def test_failed_provision_closes_progress_status(logs, store, pod_status, monkey
     main.run_job("provision", "9", "exp-np-001")
 
     assert pod_status[-1] == ("9", "failed", "user already exists")
+    assert not [l for l in logs if l["phase"] == Phase.RETRY]   # 4xx는 다시 돌려도 같다 — 재시도 없음
 
 
-def test_run_job_records_unknown_for_timeouts(logs, store, monkeypatch):
+def test_unknown_without_observer_hands_off_as_degraded(logs, store, monkeypatch):
+    """실행 여부를 알 수 없고 관찰자도 재실행 안전 표시도 없는 단계 — 임의로 재실행하지 않고 이관한다."""
     step = _raise(StepFailed({"error": "NAS_SSH_FAILED"}, 500, cause=subprocess.TimeoutExpired("ssh", 60)))
     monkeypatch.setattr(main, "_job_steps", lambda kind, job: [step])
     _queued(store, "REVOKE", "4", {"username": "exp-np-001", "delete_account": True})
@@ -157,15 +172,18 @@ def test_run_job_records_unknown_for_timeouts(logs, store, monkeypatch):
     main.run_job("revoke", "4", "exp-np-001")
 
     assert logs[-1]["action"] == Action.REVOKE and logs[-1]["phase"] == Phase.UNKNOWN
+    assert logs[-1]["error_code"] == "DEGRADED"
+    assert not [l for l in logs if l["phase"] == Phase.RETRY]
 
 
-def test_run_job_records_unexpected_errors(logs, store, monkeypatch):
+def test_run_job_retries_unexpected_errors_then_degrades(logs, store, monkeypatch):
     monkeypatch.setattr(main, "_job_steps", lambda kind, job: [_raise(RuntimeError("boom"))])
     _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
 
     main.run_job("provision", "9", "exp-np-001")
 
-    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "UNEXPECTED_ERROR"
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "DEGRADED"
+    assert "boom" in logs[-1]["error_detail"]
 
 
 def test_run_job_without_input_fails(logs, store):
@@ -173,17 +191,86 @@ def test_run_job_without_input_fails(logs, store):
     assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "JOB_INPUT_MISSING"
 
 
-def test_jobs_interrupted_by_restart_are_failed_not_rerun(logs, store, monkeypatch):
-    monkeypatch.setattr(main, "find_unfinished_jobs", lambda limit=100: [
-        ("provision", "1", "u", 11), ("revoke", "2", "u", 12), ("provision", "3", "u", 13)])
-    store[("PROVISION", "1")] = {"state": "running", "job": {"username": "u"}}
-    _queued(store, "REVOKE", "2", {"username": "u"})
+def test_restart_resumes_from_last_done_step(logs, store, lease_env, monkeypatch):
+    """제어기 재시작: lease를 인수하고, 저널에 남은 단계는 건너뛰고 이어서 실행한다."""
+    calls = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: _named_steps(calls, "s_a", "s_b", "s_c"))
+    store[("PROVISION", "9")] = {"state": "running", "job": {"username": "exp-np-001"}}
+    lease_env[11] = {"owner": "dead-controller", "alive": False,
+                     "done": ["s_a"], "ctx": {"pod_name": "ailab-exp-np-001-old1"}}
 
-    main.mark_interrupted_jobs()
+    main.run_job("provision", "9", "exp-np-001", job_id=11)
 
-    assert {(l["request_id"], l["error_code"]) for l in logs} == {
-        ("1", "CONTROLLER_RESTARTED"), ("3", "JOB_INPUT_MISSING")}
-    assert ("REVOKE", "2") in store
+    assert calls == ["s_b", "s_c"]                            # s_a는 다시 돌리지 않는다
+    assert logs[-1]["phase"] == Phase.SUCCESS
+    assert ("PROVISION", "9") not in store and 11 not in lease_env
+
+
+def test_claim_denied_by_live_owner_leaves_job_untouched(logs, store, lease_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: _named_steps(calls, "s_a"))
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+    lease_env[11] = {"owner": "other-controller", "alive": True, "done": [], "ctx": {}}
+
+    main.run_job("provision", "9", "exp-np-001", job_id=11)
+
+    assert calls == [] and logs == []                         # 남의 작업 — 손대지 않는다
+    assert store[("PROVISION", "9")]["state"] == "queued"
+
+
+def test_lease_lost_mid_job_stops_without_finishing(logs, store, lease_env, monkeypatch):
+    """실행 중 소유권이 넘어가면(지연된 옛 제어기) 끝 행을 쓰지 않고 물러난다 — 새 소유자가 기록한다."""
+    calls = []
+
+    def steal_after_first(ctx):
+        calls.append("s_a")
+        lease_env[11]["owner"] = "new-controller"
+    steal_after_first.__name__ = "s_a"
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [steal_after_first])
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+
+    main.run_job("provision", "9", "exp-np-001", job_id=11)
+
+    assert calls == ["s_a"]
+    assert not [l for l in logs if l["phase"] in (Phase.SUCCESS, Phase.FAIL, Phase.UNKNOWN)]
+    assert store[("PROVISION", "9")]["state"] == "running"    # 입력도 남긴다
+
+
+def test_unknown_with_observer_confirming_effect_continues(logs, store, monkeypatch):
+    """observe-before-retry: UNKNOWN이어도 실제 효과가 확인되면 재실행 없이 다음 단계로 간다."""
+    calls = []
+    flaky = _raise(StepFailed({"error": "TIMEOUT"}, 500, cause=subprocess.TimeoutExpired("kubectl", 5)))
+    flaky.__name__ = "s_make"
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [flaky] + _named_steps(calls, "s_next"))
+    monkeypatch.setitem(main.STEP_OBSERVERS, "s_make", lambda ctx: True)
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+
+    main.run_job("provision", "9", "exp-np-001")
+
+    assert calls == ["s_next"]
+    assert logs[-1]["phase"] == Phase.SUCCESS
+    assert not [l for l in logs if l["phase"] == Phase.RETRY]
+
+
+def test_unknown_with_observer_denying_effect_retries(logs, store, monkeypatch):
+    """관찰 결과 효과가 없으면 같은 단계를 다시 실행하고 RETRY 행을 남긴다."""
+    tries = []
+
+    def flaky(ctx):
+        tries.append(1)
+        if len(tries) == 1:
+            raise StepFailed({"error": "TIMEOUT"}, 500, cause=subprocess.TimeoutExpired("kubectl", 5))
+    flaky.__name__ = "s_make"
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [flaky])
+    monkeypatch.setitem(main.STEP_OBSERVERS, "s_make", lambda ctx: False)
+    _queued(store, "PROVISION", "9", {"username": "exp-np-001"})
+
+    main.run_job("provision", "9", "exp-np-001")
+
+    assert len(tries) == 2
+    retries = [l for l in logs if l["phase"] == Phase.RETRY]
+    assert len(retries) == 1 and retries[0]["attempt"] == 2 and retries[0]["resource_type"] == "s_make"
+    assert logs[-1]["phase"] == Phase.SUCCESS
 
 
 # ---------- 작업별 단계 목록 ----------

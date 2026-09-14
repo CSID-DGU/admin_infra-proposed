@@ -42,3 +42,16 @@ SET @has := (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'operation_log' AND COLUMN_NAME = 'target_state');
 SET @ddl := IF(@has = 0, 'ALTER TABLE operation_log ADD COLUMN target_state JSON AFTER error_detail', 'SELECT 1');
 PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- 작업 소유권(lease)과 진행 기록 (v2.1). operation_log는 append-only 저널이라 가변 상태
+-- (누가 잡고 있나, 어느 단계까지 했나)는 여기 둔다. 행은 작업당 하나, 작업이 끝나면 지운다.
+CREATE TABLE IF NOT EXISTS job_control (
+  job_id      BIGINT PRIMARY KEY,      -- operation_log 작업 시작 행의 id
+  request_id  VARCHAR(64)  NOT NULL,
+  action      VARCHAR(64)  NOT NULL,   -- PROVISION / REVOKE
+  owner       VARCHAR(128) NOT NULL,   -- 제어기 프로세스 식별자 (host-pid-난수)
+  lease_until DOUBLE       NOT NULL,   -- epoch 초. 지나면 다른 제어기가 인수한다
+  done_steps  TEXT,                    -- 끝난 단계 이름 JSON 배열
+  saved_ctx   TEXT,                    -- 이어하기 컨텍스트 JSON (pod_name·uid·포트 등)
+  updated_at  DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
