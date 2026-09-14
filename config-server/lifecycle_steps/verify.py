@@ -125,16 +125,23 @@ def step_verify_home_io(ctx):
     """② 사용자 권한으로 홈에 쓰기/읽기 왕복 + 홈이 NFS 마운트인지(silent split 검출)."""
     def check(ctx):
         u, token = ctx["username"], f".verify-{ctx['request_id']}"
+        # 소유권도 함께 관측한다 — sec=krb5 마운트에서 티켓이 없으면 NFS 클라이언트가 모든 파일을
+        # nobody(65534)로 매핑하고 쓰기를 거부한다. 그 경우 "권한 문제"가 아니라 인증 문제다.
         cmd = (f"su -s /bin/sh {u} -c 'echo ok > ~/{token} && cat ~/{token} && rm ~/{token}'"
-               f" && df -P /home/{u} | tail -1")
+               f"; df -P /home/{u} | tail -1; stat -c %u /home/{u}")
         out, rc = _sh(ctx["pod_name"], cmd)
-        lines = out.splitlines()
-        roundtrip = rc == 0 and any(l.strip() == "ok" for l in lines)
-        mount_src = lines[-1].split()[0] if lines else ""
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        roundtrip = any(l == "ok" for l in lines)
+        mount_line = next((l for l in lines if "/" in l.split()[0] or ":" in l.split()[0]), "")
+        mount_src = mount_line.split()[0] if mount_line else ""
+        owner_uid = lines[-1] if lines and lines[-1].isdigit() else ""
         # NFS 마운트 소스는 host:/path 꼴이다. 로컬 디스크에 조용히 쓰이는 사고를 여기서 잡는다.
         on_nfs = ":" in mount_src
-        return (roundtrip and on_nfs), {
-            "scope": "pod exec su + df", "roundtrip": roundtrip, "mount_src": mount_src, "rc": rc}
+        detail = {"scope": "pod exec su + df + stat", "roundtrip": roundtrip,
+                  "mount_src": mount_src, "owner_uid": owner_uid, "rc": rc}
+        if not roundtrip and owner_uid == "65534":
+            detail["likely_cause"] = "NFS가 소유자를 nobody로 매핑 — 인증 티켓 없음(krb5) 의심"
+        return (roundtrip and on_nfs), detail
     _run_probe(ctx, Action.VERIFY_ACCESS, "home_io", check)
 
 
@@ -179,7 +186,9 @@ def step_verify_endpoint(ctx):
     _run_probe(ctx, Action.VERIFY_ACCESS, "endpoint", check)
 
 
-VERIFY_ACCESS_STEPS = [step_verify_uid, step_verify_home_io, step_verify_krb5,
+# 순서 주의: 인증 티켓을 홈 I/O보다 먼저 본다. 홈은 sec=krb5로 마운트되어 티켓이 없으면
+# 쓰기가 거부되므로, 순서를 바꾸면 "홈 쓰기 실패"(증상)가 아니라 "티켓 없음"(원인)이 보고된다.
+VERIFY_ACCESS_STEPS = [step_verify_uid, step_verify_krb5, step_verify_home_io,
                        step_verify_gpu, step_verify_endpoint]
 
 

@@ -48,16 +48,26 @@ def test_uid_probe_fails_on_mismatch_with_evidence(probe_env):
 
 def test_home_io_fails_when_mount_is_local_disk(probe_env):
     """silent split: 왕복은 되는데 홈이 NFS가 아니라 노드 로컬 디스크인 경우."""
-    probe_env["sh"]["df -P"] = ("ok\n/dev/sda1 100 0 100 1% /home", 0)
+    probe_env["sh"]["df -P"] = ("ok\n/dev/sda1 100 0 100 1% /home\n50000", 0)
     with pytest.raises(StepFailed):
         verify.step_verify_home_io(dict(CTX))
     assert '"mount_src": "/dev/sda1"' in probe_env["logs"][-1]["error_detail"]
 
 
 def test_home_io_passes_on_nfs_roundtrip(probe_env):
-    probe_env["sh"]["df -P"] = ("ok\nnas:/volume1/share/user 100 0 100 1% /home", 0)
+    probe_env["sh"]["df -P"] = ("ok\nnas:/volume1/share/user 100 0 100 1% /home\n50000", 0)
     verify.step_verify_home_io(dict(CTX))
     assert probe_env["logs"][-1]["phase"] == Phase.SUCCESS
+
+
+def test_home_io_names_krb5_as_likely_cause_when_owner_is_nobody(probe_env):
+    """실측 사례: sec=krb5 마운트에서 티켓이 없으면 소유자가 nobody(65534)로 보이고 쓰기가 거부된다.
+    권한 문제로 오인하지 않도록 근거에 원인 후보를 적는다."""
+    probe_env["sh"]["df -P"] = ("nas:/volume1/share/user 100 0 100 1% /home\n65534", 1)
+    with pytest.raises(StepFailed):
+        verify.step_verify_home_io(dict(CTX))
+    detail = probe_env["logs"][-1]["error_detail"]
+    assert '"owner_uid": "65534"' in detail and "krb5" in detail
 
 
 def test_gpu_probe_skips_with_reason_when_not_requested(probe_env):
@@ -173,6 +183,12 @@ def test_revoked_fails_when_pod_still_exists(revoke_env):
 
 
 # ---------- 조건 분기 ----------
+
+def test_krb5_probe_runs_before_home_io(monkeypatch):
+    """홈은 sec=krb5로 마운트되므로 티켓이 원인, 홈 쓰기 실패가 증상이다 — 원인을 먼저 본다."""
+    names = [s.__name__ for s in verify.VERIFY_ACCESS_STEPS]
+    assert names.index("step_verify_krb5") < names.index("step_verify_home_io")
+
 
 def test_full_mode_appends_verify_steps(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_MODE", "full")
