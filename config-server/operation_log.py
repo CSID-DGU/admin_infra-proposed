@@ -15,6 +15,9 @@ from utils import get_log_db_connection
 # 제어기가 지금 실행 중인 작업의 번호(작업 시작 행의 id). 제어기가 작업을 실행하는 동안 여기에 두면
 # 그 사이의 모든 기록에 job_id가 붙어, 단계 함수가 작업 번호를 몰라도 된다. 동기 엔드포인트는 비어 있다.
 current_job_id = ContextVar("current_job_id", default=None)
+# 실행 중 단계의 시도 번호(v2.1). 재시도 엔진이 단계를 다시 돌릴 때 올려 두면, 단계 안의 모든
+# log_operation 호출이 attempt 인자 없이도 그 시도 번호로 기록된다.
+current_attempt = ContextVar("current_attempt", default=1)
 
 
 class Action(str, Enum):
@@ -118,6 +121,8 @@ def log_operation(
     request_id = str(request_id)
     if job_id is None:
         job_id = current_job_id.get()
+    if attempt == 1:
+        attempt = current_attempt.get()
 
     conn = None
     try:
