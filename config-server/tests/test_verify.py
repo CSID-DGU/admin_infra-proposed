@@ -170,3 +170,20 @@ def test_revoked_fails_when_pod_still_exists(revoke_env):
     revoke_env["tcp"][("10.0.0.8", 32001)] = (False, "refused")
     with pytest.raises(StepFailed):
         verify.step_verify_revoked(dict(RCTX))
+
+
+# ---------- 조건 분기 ----------
+
+def test_full_mode_appends_verify_steps(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_MODE", "full")
+    steps = main._job_steps("provision", {"username": "u"})
+    assert steps[-5:] == verify.VERIFY_ACCESS_STEPS
+    rsteps = main._job_steps("revoke", {"pod_name": "p", "delete_account": True})
+    assert rsteps[0] is verify.step_capture_access_targets
+    assert rsteps[-2] is verify.step_verify_revoked and rsteps[-1] is verify.step_verify_account_revoked
+
+
+def test_noprobe_mode_is_unchanged(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_MODE", "noprobe")
+    assert main._job_steps("provision", {"username": "u"}) == main.POD_CREATE_STEPS
+    assert main._job_steps("revoke", {"pod_name": "p"}) == main.POD_DELETE_STEPS
