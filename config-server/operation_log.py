@@ -46,6 +46,9 @@ class Action(str, Enum):
     DELETE_ACCOUNT = "DELETE_ACCOUNT"
     DELETE_HOME = "DELETE_HOME"
     REMOVE_KRB5 = "REMOVE_KRB5"
+    # 접근 검증(VERIFY_MODE=full, v3.0). resource_type이 시험 이름, error_detail이 관찰 근거다.
+    VERIFY_ACCESS = "VERIFY_ACCESS"
+    VERIFY_REVOKED = "VERIFY_REVOKED"
     # v2.0 작업 단위 행. 작업 등록 시 START, 제어기가 작업을 끝내면 SUCCESS/FAIL/UNKNOWN.
     # 제어기는 START만 있고 끝이 없는 행으로 아직 끝나지 않은 작업을 찾는다.
     PROVISION = "PROVISION"

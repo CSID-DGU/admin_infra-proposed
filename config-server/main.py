@@ -31,6 +31,7 @@ from operation_log import Action, Phase, log_operation, current_job_id, current_
 
 import job_control
 from job_control import LeaseLost
+import verify
 
 from utils import (
     get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
@@ -3696,7 +3697,8 @@ ALWAYS_RERUN = {"step_fetch_user_config"}
 DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
 # 이어하기 때 복원하는 컨텍스트. JSON으로 남길 수 있는 값만.
-SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name")
+SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
+                  "verify_ports", "verify_node")
 
 
 def _saved_ctx(ctx):
@@ -3715,7 +3717,10 @@ class _StepDegraded(Exception):
 def _execute_step(step, ctx, kind, request_id, username):
     """단계 하나를 재시도 정책으로 실행한다. UNKNOWN이면 재실행 전에 실제 상태를 먼저 본다."""
     name = step.__name__
-    for attempt in range(1, STEP_MAX_ATTEMPTS + 1):
+    # 접근 검증은 생성 직후 전파 지연(kinit 타이머·NFS)이 있어 기본보다 여유 있게 재시도한다.
+    # (verify 속성은 호출 시점에만 읽는다 — import 순서와 무관하게 동작)
+    max_attempts = verify.VERIFY_MAX_ATTEMPTS if name in verify.RERUN_SAFE_STEPS else STEP_MAX_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
         hook = PRE_STEP.get(name)
         if hook is not None:
             try:
@@ -3741,12 +3746,12 @@ def _execute_step(step, ctx, kind, request_id, username):
                         return
                 except Exception as oe:
                     raise _StepDegraded(name, "OBSERVE_FAILED", oe, unknowable=True) from err
-            elif name not in RERUN_SAFE:
+            elif name not in RERUN_SAFE and name not in verify.RERUN_SAFE_STEPS:
                 raise _StepDegraded(name, "UNRESUMABLE_UNKNOWN", err, unknowable=True) from err
         # 4xx는 다시 돌려도 결과가 같다(중복·검증류). UNKNOWN은 제외 — 위에서 이미 걸렀다.
         if isinstance(err, StepFailed) and not unknown and 400 <= err.status < 500:
             raise err
-        if attempt == STEP_MAX_ATTEMPTS:
+        if attempt == max_attempts:
             raise _StepDegraded(name, "RETRIES_EXHAUSTED", err, unknowable=unknown) from err
         code = err.body.get("error") if isinstance(err, StepFailed) and isinstance(err.body, dict) \
             else type(err).__name__
@@ -3759,11 +3764,20 @@ def _execute_step(step, ctx, kind, request_id, username):
 
 def _job_steps(kind, job):
     if kind == "provision":
-        return (ACCOUNT_CREATE_STEPS if job.get("account") else []) + POD_CREATE_STEPS
+        steps = (ACCOUNT_CREATE_STEPS if job.get("account") else []) + POD_CREATE_STEPS
+        if VERIFY_MODE == "full":
+            # 다섯 시험을 모두 통과해야 작업 SUCCESS 행이 남는다 — 통과 전엔 완료로 기록되지 않는다.
+            steps = steps + verify.VERIFY_ACCESS_STEPS
+        return steps
     steps = list(POD_DELETE_STEPS) if job.get("pod_name") else []
     if job.get("delete_account"):
         # 보존 대상인 홈은 지우지 않는다 — step_delete_home을 넣지 않는다.
         steps += [step_check_account_revocable, step_delete_account, step_remove_krb5]
+    if VERIFY_MODE == "full" and steps:
+        # 검사 대상(노드·포트)은 삭제 전에 잡아 두고, 차단 확인은 삭제가 다 끝난 뒤 한다.
+        steps = ([verify.step_capture_access_targets] if job.get("pod_name") else []) + steps \
+            + ([verify.step_verify_revoked] if job.get("pod_name") else []) \
+            + ([verify.step_verify_account_revoked] if job.get("delete_account") else [])
     return steps
 
 
