@@ -31,7 +31,7 @@ from adapters.operation_log import Action, Phase, log_operation, current_job_id,
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
-import verify
+from lifecycle_steps import verify
 
 from utils import (
     get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
