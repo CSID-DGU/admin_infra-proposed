@@ -284,19 +284,42 @@ def test_farm_timeout_is_unknown_and_ports_are_released(env, monkeypatch):
     assert any(c[0] == "release" for c in e.calls) and e.v1.pods == {}
 
 
-def test_restart_marks_running_job_failed_and_keeps_queued(env):
+def test_restart_resumes_interrupted_job_to_completion(env, lease_env):
+    """제어기 사망 후 재시작(C08): 실패로 마감하지 않고 인수해 끝까지 완료한다."""
     e = env
     e.api.post("/operations/provision", json={"request_id": "104", "username": "exp-np-e2e",
                                               "account": {"passwd_base64": PW}})
-    e.api.post("/operations/provision", json={"request_id": "105", "username": "exp-np-e2f",
-                                              "account": {"passwd_base64": PW}})
     e.redis[("PROVISION", "104")]["state"] = "running"     # 실행 중에 제어기가 죽은 상황
-    with main.app.app_context():
-        main.mark_interrupted_jobs()
-    assert result(e, "provision", "104")["error_code"] == "CONTROLLER_RESTARTED"
+    tick(e)                                                # 새 제어기의 첫 바퀴
+    assert result(e, "provision", "104")["phase"] == "SUCCESS"
+    assert "exp-np-e2e" in passwd_names() and len(e.v1.pods) == 1
+
+
+def test_restart_resumes_mid_pod_creation_without_duplicates(env, lease_env):
+    """계정 3단계와 노드 선택까지 끝내고 죽은 작업 — 저장된 pod_name·uid로 이어가고,
+    끝난 단계(계정 생성)는 다시 실행하지 않아 중복이 없다."""
+    e = env
+    # 죽은 제어기가 계정 3단계까지 실제로 끝낸 상태를 재현 (파일·홈·principal은 남아 있다)
+    r0 = e.api.put("/accounts/users", json={"name": "exp-np-e2g", "passwd_base64": PW, "request_id": "106"})
+    uid = r0.get_json()["user"]["uid"]
+    r = e.api.post("/operations/provision", json={"request_id": "106", "username": "exp-np-e2g",
+                                                  "account": {"passwd_base64": PW}})
+    jid = r.get_json()["job_id"]
+    e.redis[("PROVISION", "106")]["state"] = "running"
+    lease_env[jid] = {"owner": "dead-controller", "alive": False,
+                      "done": ["step_create_account", "step_create_home", "step_create_krb5_principal",
+                               "step_prepare_pod", "step_select_node"],
+                      "ctx": {"uid": uid, "gid": uid, "pod_name": "ailab-exp-np-e2g-saved01",
+                              "node": "farm2"}}
+    made_before = len([c for c in e.calls if c[0] == "krb5_principal"])
+
     tick(e)
-    assert result(e, "provision", "105")["phase"] == "SUCCESS"
-    assert "exp-np-e2e" not in passwd_names()             # 중단된 작업은 다시 실행되지 않음
+
+    assert result(e, "provision", "106")["phase"] == "SUCCESS", rows(e, "106")
+    assert list(e.v1.pods) == ["ailab-exp-np-e2g-saved01"]   # 저장된 이름 그대로, 한 개만
+    # 끝난 계정 단계는 재실행하지 않았다 — principal 생성 호출이 늘지 않는다
+    assert len([c for c in e.calls if c[0] == "krb5_principal"]) == made_before
+    assert ("krb5_deploy" in [c[0] for c in e.calls])        # 남은 단계는 실행됐다
 
 
 def test_sync_path_still_works_end_to_end(env):
@@ -353,7 +376,9 @@ def test_non_numeric_request_id_is_rejected(env):
 
 # ---------- baseline 보상 조건 ----------
 
-def test_pod_failure_after_node_selection_rolls_back_account_but_keeps_home(env, monkeypatch):
+def test_pod_failure_is_retried_then_handed_off_as_degraded(env, monkeypatch):
+    """5xx Pod 생성 실패: 재시도 후에도 안 되면 자원을 임의로 되돌리지 않고 DEGRADED로 이관한다(v2.1).
+    (구버전은 즉시 FAIL + 계정 되돌리기 — 재시도 도입으로 소진 시 이관으로 바뀌었다)"""
     e = env
     def broken(namespace, body):
         raise ApiException(status=500, reason="quota exceeded")
@@ -362,12 +387,13 @@ def test_pod_failure_after_node_selection_rolls_back_account_but_keeps_home(env,
                                               "account": {"passwd_base64": PW}})
     tick(e)
     res = result(e, "provision", "500")
-    assert res["phase"] == "FAIL" and res["error_code"] == "POD_CREATE_FAILED"
-    assert "exp-np-e2e" not in passwd_names()                       # 계정 되돌림
-    names = [c[0] for c in e.calls]
-    assert "delete_home" not in names                                # 홈은 보존
-    assert ("krb5_remove", ("exp-np-e2e", "farm2")) in e.calls and "krb5_remove_all" not in names
-    assert ("DELETE_ACCOUNT", "SUCCESS") in rows(e, "500")
+    assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED"
+    assert len([1 for a, p in rows(e, "500") if p == "RETRY"]) == 2   # 3회 시도
+    assert "exp-np-e2e" in passwd_names()                             # 계정은 점검용으로 보존
+    assert "delete_home" not in [c[0] for c in e.calls]
+    detail = e.db.execute("SELECT error_detail FROM operation_log WHERE request_id='500'"
+                          " AND action='PROVISION' AND phase='FAIL'").fetchone()[0]
+    assert "POD_CREATE_FAILED" in detail and "inspect" in detail      # 점검 근거를 남긴다
 
 
 def test_rollback_held_when_user_has_another_pod(env):
@@ -380,7 +406,7 @@ def test_rollback_held_when_user_has_another_pod(env):
     ctx = {"request_id": "601", "node": "farm2", "pod_name": "ailab-exp-np-e2e-failed"}
     with main.app.app_context():
         outcome = main._compensate_provision("provision", {"username": "exp-np-e2e"}, ctx,
-                                             done=list(main.ACCOUNT_CREATE_STEPS))
+                                             done=[s.__name__ for s in main.ACCOUNT_CREATE_STEPS])
     assert outcome == "held:ACCOUNT_IN_USE"
     assert "exp-np-e2e" in passwd_names() and len(e.v1.pods) == 1
 

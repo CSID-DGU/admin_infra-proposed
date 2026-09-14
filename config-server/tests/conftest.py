@@ -28,3 +28,38 @@ def pod_status(monkeypatch):
 @pytest.fixture
 def api():
     return main.app.test_client()
+
+
+@pytest.fixture(autouse=True)
+def lease_env(monkeypatch):
+    """재시도 지연 제거 + lease 저장소 메모리 대역. 실제 SQL은 test_job_control_sql.py에서 검증한다.
+    반환 dict: job_id -> {"owner","alive","done","ctx"}. alive=False면 만료된 lease로 취급한다."""
+    import job_control
+    monkeypatch.setattr(main, "RETRY_DELAY_SEC", 0)
+    # macOS에서 *.svc.cluster.local이 mDNS로 풀려 실제 Redis 접속이 수십 초 멈춘다 — 부가 저장은 무시
+    monkeypatch.setattr(main, "save_job_result", lambda a, r, d: None)
+    monkeypatch.setattr(main, "load_job_result", lambda a, r: None)
+    rows = {}
+
+    def claim(job_id, request_id, action, owner=None, ttl_sec=None):
+        owner = owner or job_control.OWNER
+        row = rows.get(job_id)
+        if row is not None and row["owner"] != owner and row.get("alive", True):
+            return None
+        if row is None:
+            row = rows[job_id] = {"owner": owner, "alive": True, "done": [], "ctx": {}}
+        else:
+            row.update(owner=owner, alive=True)
+        return list(row["done"]), dict(row["ctx"])
+
+    def record_step(job_id, done_steps, saved_ctx, owner=None):
+        row = rows.get(job_id)
+        if row is None or row["owner"] != (owner or job_control.OWNER):
+            raise job_control.LeaseLost(str(job_id))
+        row.update(done=list(done_steps), ctx=dict(saved_ctx))
+
+    monkeypatch.setattr(job_control, "claim", claim)
+    monkeypatch.setattr(job_control, "record_step", record_step)
+    monkeypatch.setattr(job_control, "release", lambda job_id, owner=None: rows.pop(job_id, None))
+    monkeypatch.setattr(job_control, "renew", lambda ids, owner=None, ttl_sec=None: len(ids))
+    return rows
