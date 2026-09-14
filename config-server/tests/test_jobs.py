@@ -335,7 +335,7 @@ def test_run_job_tags_every_row_with_job_number(logs, store, monkeypatch):
 
 
 def test_log_operation_writes_job_number_and_returns_row_id(monkeypatch):
-    import operation_log
+    from adapters import operation_log
     executed = []
 
     class Cur:

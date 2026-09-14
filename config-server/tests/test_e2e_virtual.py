@@ -470,7 +470,7 @@ def test_failed_provision_has_no_result(env):
 @pytest.fixture
 def full(env, monkeypatch):
     """VERIFY_MODE=full + probe 관찰 도구 대역. 기본값은 다섯 시험 전부 통과."""
-    import verify
+    from lifecycle_steps import verify
     e = env
     monkeypatch.setattr(main, "VERIFY_MODE", "full")
 
@@ -547,7 +547,7 @@ def test_full_provision_failing_probe_blocks_completion_as_degraded(full, lease_
     res = result(e, "provision", "801")
     assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED"
     assert not [1 for a, p in rows(e, "801") if a == "PROVISION" and p == "SUCCESS"]
-    import verify
+    from lifecycle_steps import verify
     fails = [1 for a, p in rows(e, "801") if a == "VERIFY_ACCESS" and p == "FAIL"]
     assert len(fails) == verify.VERIFY_MAX_ATTEMPTS               # 전파 지연 대비 여유 재시도
 

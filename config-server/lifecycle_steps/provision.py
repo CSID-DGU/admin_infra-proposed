@@ -1,0 +1,1392 @@
+"""생성 단계 — 계정·홈·principal·노드포트·Pod·Service
+
+main.py에서 얇게 이동한 코드다. main 소속 헬퍼·설정은 테스트가 main.*를 대역으로 바꾸는
+계약을 지키기 위해 지연 프록시(_main)로 호출 시점에 바인딩한다.
+"""
+import base64
+import crypt
+import json
+import os
+import re
+import subprocess
+import time
+
+import requests
+import urllib3
+from kubernetes import client
+
+from typing import List, Optional
+
+from adapters.operation_log import Action, Phase
+
+
+class _MainProxy:
+    def __getattr__(self, name):
+        import main
+        return getattr(main, name)
+
+
+_main = _MainProxy()
+
+
+def reconcile_nodeport_allocations(namespace: str) -> int:
+    """
+    MySQL의 nodeport_allocations 테이블과 실제 k8s NodePort Service 상태를 동기화.
+
+    문제 상황:
+        - NodePort 할당 정보는 MySQL에 저장되고, 실제 Service는 k8s(etcd)에 존재.
+        - config-server를 거치지 않고 Service가 삭제되거나 (kubectl delete svc 등),
+          config-server 비정상 종료로 release_nodeports()가 호출되지 않으면
+          MySQL에 포트가 점유된 채로 남아 포트 고갈 발생 가능.
+
+    동기화 방향: k8s -> MySQL  (k8s가 단일 진실 소스)
+        - k8s에 실제 존재하는 NodePort Service의 pod_name 목록 조회.
+        - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단해 삭제.
+
+    Args:
+        namespace: NodePort Service가 존재하는 k8s 네임스페이스
+
+    Returns:
+        int: 삭제된 stale 행 수 (0이면 동기화 불필요 또는 쓰로틀로 스킵)
+    """
+    global _last_reconcile_ts
+
+    # ── 쓰로틀 체크: 마지막 실행으로부터 _RECONCILE_INTERVAL_SEC 이내면 스킵 ──
+    now = time.time()
+    elapsed = now - _last_reconcile_ts
+    if elapsed < _main._RECONCILE_INTERVAL_SEC:
+        _main.app.logger.debug(
+            f"[RECONCILE] skipped (throttle: {int(_main._RECONCILE_INTERVAL_SEC - elapsed)}s remaining)"
+        )
+        return 0
+
+    _main.app.logger.info(f"[RECONCILE] start namespace={namespace}")
+    # 쓰로틀 기준 시각: 성공/실패와 무관하게 "시도" 단위로 갱신한다.
+    _last_reconcile_ts = time.time()
+
+    # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
+    #    label_selector로 config-server가 관리하는 Service만 필터링.
+    #    (app=ailab-nodeport 라벨은 create_nodeport_services()에서 부여)
+    _main.load_k8s()  # utils.load_k8s — main.py 상단 import에서 가져옴
+    v1 = client.CoreV1Api()
+
+    try:
+        services = v1.list_namespaced_service(
+            namespace=namespace,
+            label_selector="app=ailab-nodeport"
+        )
+    except Exception as e:
+        # k8s API 실패 시 reconcile 스킵. 포트 할당은 계속하고 다음 주기에 재시도.
+        _main.app.logger.warning("[RECONCILE] k8s API call failed, skipping reconcile: %s", e, exc_info=True)
+        return 0
+
+    # Service 메타데이터의 pod_name 라벨에서 살아있는 pod 이름 수집
+    live_pod_names = {
+        svc.metadata.labels["pod_name"]
+        for svc in services.items
+        if svc.metadata.labels and "pod_name" in svc.metadata.labels
+    }
+    _main.app.logger.debug(f"[RECONCILE] live pods in k8s: {live_pod_names}")
+
+    # ── 2. MySQL에서 현재 점유 중인 pod_name 목록 조회 ──
+    conn = _main.get_db_connection()
+    deleted_count = 0
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT pod_name FROM nodeport_allocations")
+            db_pod_names = {row[0] for row in cur.fetchall()}
+            _main.app.logger.debug(f"[RECONCILE] pods in MySQL: {db_pod_names}")
+
+            # k8s에는 없지만 MySQL에는 남아있는 stale pod_name 계산
+            stale_pod_names = db_pod_names - live_pod_names
+
+            if not stale_pod_names:
+                _main.app.logger.info("[RECONCILE] no stale entries, DB is in sync")
+                return 0
+
+            _main.app.logger.info(f"[RECONCILE] stale pods to remove: {stale_pod_names}")
+
+            # stale pod의 모든 NodePort 할당 행을 삭제
+            for pod in stale_pod_names:
+                cur.execute(
+                    "DELETE FROM nodeport_allocations WHERE pod_name=%s",
+                    (pod,)
+                )
+                deleted_count += cur.rowcount
+                _main.app.logger.info(f"[RECONCILE] removed {cur.rowcount} rows for stale pod={pod}")
+
+        conn.commit()
+        _main.app.logger.info(f"[RECONCILE] done, total deleted={deleted_count}")
+        return deleted_count
+
+    except Exception:
+        _main.app.logger.exception("[RECONCILE] failed, rolling back")
+        conn.rollback()
+        # reconcile 실패는 non-fatal. allocate_nodeports()는 stale 제거 없이 계속 진행.
+        return 0
+    finally:
+        conn.close()
+
+def get_cluster_reserved_nodeports() -> set:
+    """
+    클러스터 전체(모든 네임스페이스)에서 이미 점유 중인 NodePort 집합 조회.
+
+    nodeport_allocations 테이블에는 이 서비스가 직접 할당한 포트만 기록되므로,
+    고정 NodePort로 배포된 자기 자신이나 수동으로 생성된 Service가 점유한
+    포트는 DB만 봐서는 알 수 없다. 그런 포트가 available로 잘못 계산되면
+    이후 Service 생성 단계에서 "already allocated"로 실패한다.
+    """
+    _main.load_k8s()
+    v1 = client.CoreV1Api()
+    reserved = set()
+    for svc in v1.list_service_for_all_namespaces().items:
+        for port in svc.spec.ports or []:
+            if port.node_port:
+                reserved.add(port.node_port)
+    return reserved
+
+def allocate_nodeports(username, pod_name, node_name, ports):
+    """
+    ports:
+    [
+        {"internal_port": 22, "usage_purpose": "ssh"},
+        {"internal_port": 8888, "usage_purpose": "jupyter"},
+        ...
+    ]
+    """
+    _main.app.logger.info(f"[NODEPORT] allocate start username={username} pod={pod_name} node={node_name}")
+    _main.app.logger.debug(f"[NODEPORT] requested ports={ports}")
+
+    # 포트 할당 전에 MySQL과 k8s 실제 상태를 동기화한다.
+    # stale 행이 정리되어야 available 포트 계산이 정확해짐/
+    # 5분 쓰로틀 적용 — in-flight pod 오탐 방지 및 k8s/DB 부하 줄어듬
+    _main.reconcile_nodeport_allocations(namespace=_main.app.config["NAMESPACE"])
+
+    conn = _main.get_db_connection() #DB 연결
+
+    try:
+        with conn.cursor() as cur: #DB 커서 생성 (python pymysql 라이브러리)
+
+            cur.execute("SELECT node_port FROM nodeport_allocations FOR UPDATE")
+            used = {row[0] for row in cur.fetchall()}
+
+            try:
+                used |= _main.get_cluster_reserved_nodeports()
+            except Exception:
+                _main.app.logger.warning(
+                    "[NODEPORT] failed to query live k8s nodeport usage, "
+                    "falling back to DB-only availability check",
+                    exc_info=True,
+                )
+
+            _main.app.logger.debug(f"[NODEPORT] used ports count={len(used)}")
+            available = [
+                p for p in range(_main.NODEPORT_MIN, _main.NODEPORT_MAX + 1)
+                if p not in used
+            ]
+
+            _main.app.logger.debug(f"[NODEPORT] available ports count={len(available)}")
+
+            if len(available) < len(ports):
+                raise ValueError("Not enough NodePorts")
+
+            result_ports = []
+
+            for idx, port in enumerate(ports):
+                _main.app.logger.debug(f"[NODEPORT] assigning internal_port={port['internal_port']}")
+
+                node_port = available[idx]
+                _main.app.logger.info(f"[NODEPORT] allocated {port['internal_port']} -> {node_port}")
+
+                cur.execute("""
+                    INSERT INTO nodeport_allocations
+                    (username, pod_name, node_name, internal_port, node_port, purpose)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                """, (
+                    username,
+                    pod_name,
+                    node_name,
+                    port["internal_port"],
+                    node_port,
+                    port.get("usage_purpose", "custom")
+                ))
+
+                result_ports.append({
+                    "internal_port": port["internal_port"],
+                    "external_port": node_port,
+                    "usage_purpose": port.get("usage_purpose", "custom")
+                })
+            _main.app.logger.info(f"[NODEPORT] allocation success total={len(result_ports)}")
+            conn.commit() #Commit changes to stable storage.
+            return result_ports #Return the allocated ports.
+
+    except ValueError:
+        conn.rollback()
+        raise
+    except Exception:
+        _main.app.logger.exception(f"[NODEPORT] allocation failed pod={pod_name}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def release_nodeports(pod_name):
+    _main.app.logger.info(f"[NODEPORT] release start pod={pod_name}")
+    conn = _main.get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            _main.app.logger.debug(f"[NODEPORT] deleting DB rows for pod={pod_name}")
+
+            cur.execute(
+                "DELETE FROM nodeport_allocations WHERE pod_name=%s",
+                (pod_name,)
+            )
+
+        conn.commit()
+        _main.app.logger.info(f"[NODEPORT] release complete pod={pod_name}")
+    except Exception:
+        _main.app.logger.exception(f"[NODEPORT] release failed pod={pod_name}")
+        raise
+    finally:
+        conn.close()
+
+def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
+    ns = _main.app.config["NAMESPACE"]
+    rollback = {
+        "nodeportsReleased": False,
+        "podDeleted": False,
+        "servicesDeleted": False,
+    }
+
+    if delete_services:
+        try:
+            _main.delete_nodeport_services(pod_name, ns)
+            rollback["servicesDeleted"] = True
+        except Exception:
+            _main.app.logger.warning("[CREATE POD] cleanup service deletion failed", exc_info=True)
+
+    try:
+        _main.release_nodeports(pod_name)
+        rollback["nodeportsReleased"] = True
+    except Exception:
+        _main.app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
+
+    if v1 is not None:
+        try:
+            v1.delete_namespaced_pod(pod_name, ns)
+            rollback["podDeleted"] = True
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                rollback["podDeleted"] = True
+            else:
+                _main.app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+        except Exception:
+            _main.app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+
+    return rollback
+
+def step_fetch_user_config(ctx):
+    request_id, username = ctx["request_id"], ctx["username"]
+    if ctx.get("config_by_request"):
+        # 제어기 경로: 처리 중인 그 신청 하나의 설정을 신청 번호로 조회한다. 사용자명 조회는 열린 신청이
+        # 여럿이면 가장 최근 것을 골라 다른 신청의 설정을 가져올 수 있다. 동기 경로(baseline)는 그대로 둔다.
+        was_url = f"{_main.ADMIN_BE_INTERNAL_URL}/api/requests/config/by-request/{request_id}"
+    else:
+        was_url = _main.app.config["WAS_URL_TEMPLATE"].format(username=username)
+    _main.app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
+    _main.log_operation(request_id=request_id, username=username,
+                  action=Action.FETCH_USER_CONFIG, phase=Phase.START)
+
+    resp = None
+    try:
+        resp = requests.get(was_url, timeout=_main.app.config["HTTP_TIMEOUT_SEC"])
+        user_info = resp.json()
+    except requests.RequestException as e:
+        _main.app.logger.exception("[CREATE POD] WAS request failed")
+        _main.log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=_main._fail_phase(e),
+                      error_code="USER_CONFIG_FETCH_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_FETCH_FAILED",
+            str(e),
+        ), 502, cause=e)
+    except ValueError as e:
+        _main.app.logger.exception("[CREATE POD] invalid WAS response")
+        _main.log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_INVALID_RESPONSE", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_INVALID_RESPONSE",
+            str(e),
+            was_status=resp.status_code if resp is not None else None,
+        ), 502)
+
+    # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
+    if user_info.get("status") == 404 or resp.status_code == 404:
+        _main.app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
+        _main.log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_NOT_FOUND", error_detail=f"user {username!r} not found in WAS")
+        raise _main.StepFailed(_main.infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_NOT_FOUND",
+            f"user {username!r} not found in WAS",
+            was_status=resp.status_code,
+        ), 404)
+    if resp.status_code >= 400:
+        _main.app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
+        _main.log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_FETCH_FAILED",
+                      error_detail=f"WAS returned {resp.status_code} for user {username!r}")
+        raise _main.StepFailed(_main.infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_FETCH_FAILED",
+            f"WAS returned {resp.status_code} for user {username!r}",
+            was_status=resp.status_code,
+        ), 502)
+
+    _main.log_operation(request_id=request_id, username=username,
+                  action=Action.FETCH_USER_CONFIG, phase=Phase.SUCCESS)
+    _main.app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
+    ctx["user_info"] = user_info
+
+def step_prepare_pod(ctx):
+    """Pod 이름을 정하고 같은 이름의 Pod가 없는지 확인한 뒤 후보 노드 목록을 만든다."""
+    username, user_info = ctx["username"], ctx["user_info"]
+    ns = _main.app.config["NAMESPACE"]
+
+    pod_name = _main.generate_pod_name(username)
+    _main.app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
+    ctx["pod_name"] = pod_name
+
+    # pod_name 중복 확인
+    try:
+        _main.load_k8s()
+        v1 = client.CoreV1Api()
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] k8s client setup failed")
+        raise _main.StepFailed(_main.infra_error(
+            "CHECK_EXISTING_POD",
+            "K8S_CLIENT_SETUP_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500)
+
+    try:
+        v1.read_namespaced_pod(pod_name, ns)
+        _main.app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
+        raise _main.StepFailed(_main.infra_error(
+            "CHECK_EXISTING_POD",
+            "POD_ALREADY_EXISTS",
+            "pod already exists",
+            pod_name=pod_name,
+        ), 409)
+    except _main.StepFailed:
+        raise
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            _main.app.logger.exception("[CREATE POD] pod existence check failed")
+            raise _main.StepFailed(_main.infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_CHECK_FAILED",
+                e.body,
+                pod_name=pod_name,
+                **_main.k8s_error_fields(e),
+            ), 500)
+        _main.app.logger.debug("[CREATE POD] pod does not exist yet")
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] pod existence check failed")
+        raise _main.StepFailed(_main.infra_error(
+            "CHECK_EXISTING_POD",
+            "POD_CHECK_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    # Prometheus 기반 노드 선택
+    gpu_nodes = user_info.get("gpu_nodes", [])
+    node_list = [
+        str(n["node_name"]).strip().lower()
+        for n in gpu_nodes
+        if n.get("node_name")
+    ]
+
+    # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
+    if not node_list:
+        _main.app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
+        try:
+            _main.load_k8s()
+            _all_nodes = client.CoreV1Api().list_node().items
+        except client.exceptions.ApiException as e:
+            _main.app.logger.exception("[CREATE POD] fallback node list failed")
+            raise _main.StepFailed(_main.infra_error(
+                "LIST_NODES",
+                "NODE_LIST_FAILED",
+                e.body,
+                **_main.k8s_error_fields(e),
+            ), 500)
+        except Exception as e:
+            _main.app.logger.exception("[CREATE POD] fallback node list failed")
+            raise _main.StepFailed(_main.infra_error(
+                "LIST_NODES",
+                "NODE_LIST_FAILED",
+                str(e),
+            ), 500, cause=e)
+        node_list = [
+            n.metadata.name
+            for n in _all_nodes
+            if all(c.status == "True" for c in n.status.conditions if c.type == "Ready")
+            and not any(
+                "control-plane" in (t.key or "") and t.effect == "NoSchedule"
+                for t in (n.spec.taints or [])
+            )
+        ]
+
+    _main.app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
+    ctx["node_list"] = node_list
+
+def step_select_node(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    _main.set_pod_creation_status(request_id, "selecting_node", "GPU 노드 선택 중")
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  action=Action.SELECT_NODE, phase=Phase.START)
+
+    try:
+        best_node = _main.select_best_node_from_prometheus(
+            ctx["node_list"],
+            _main.app.config["PROM_URL"],
+            _main.app.config["HTTP_TIMEOUT_SEC"]
+        )
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] node selection failed")
+        _main.set_pod_creation_status(request_id, "failed", "노드 선택 실패")
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      action=Action.SELECT_NODE, phase=_main._fail_phase(e),
+                      error_code="NODE_SELECTION_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "SELECT_NODE",
+            "NODE_SELECTION_FAILED",
+            str(e),
+            pod_name=pod_name,
+        ), 500, cause=e)
+    _main.app.logger.info(f"[CREATE POD] selected best node: {best_node}")
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, action=Action.SELECT_NODE, phase=Phase.SUCCESS)
+    ctx["node"] = best_node
+
+def step_build_pod_spec(ctx):
+    """NodePort 할당과 farm 노드 keytab 배포가 build_pod_spec 안에서 함께 일어난다."""
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node = ctx["node"]
+    _main.app.logger.info("[CREATE POD] building pod spec")
+    _main.set_pod_creation_status(request_id, "building_pod_spec", f"pod spec 생성 중 (node={best_node})")
+
+    try:
+        if not best_node:
+            raise ValueError(
+                "no suitable node selected (check gpu_nodes and Prometheus metrics)"
+            )
+        spec_wrapper, allocated_ports = _main.build_pod_spec(
+            username,
+            ctx["user_info"],
+            best_node,
+            pod_name,
+            request_id=request_id,
+        )
+    except _main.PodSpecBuildError as e:
+        _main.set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise _main.StepFailed(_main.infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            progress=e.progress,
+            pod_name=pod_name,
+            # 호출자(admin_be)가 계정 삭제 보상 트랜잭션을 실행할 때 이 노드만 정리하도록
+            # 넘겨주기 위함 — 없으면 대상 노드를 몰라서 전체 farm을 무차별로 훑게 된다.
+            node=best_node,
+        ), 500, cause=e)
+    except ValueError as e:
+        _main.set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise _main.StepFailed(_main.infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            rollback={"nodeportsReleased": False},
+            pod_name=pod_name,
+        ), 400)
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] pod spec build failed")
+        _main.set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        raise _main.StepFailed(_main.infra_error(
+            "BUILD_POD_SPEC",
+            "POD_SPEC_BUILD_FAILED",
+            str(e),
+            rollback={"nodeportsReleased": False},
+            pod_name=pod_name,
+            node=best_node,
+        ), 500, cause=e)
+    _main.app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
+
+    ctx["pod_spec"] = spec_wrapper["config"]["kubernetes"]["pod"]
+    ctx["allocated_ports"] = allocated_ports
+    _main.app.logger.info("[CREATE POD] pod spec built")
+
+def step_create_pod_k8s(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node = ctx["node"]
+    ns = _main.app.config["NAMESPACE"]
+
+    try:
+        _main.load_k8s()
+        v1 = client.CoreV1Api()
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] k8s client setup failed")
+        rollback = _main._cleanup_create_failure(pod_name)
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_POD",
+            "K8S_CLIENT_SETUP_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500)
+    ctx["v1"] = v1
+
+    _main.app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+    _main.set_pod_creation_status(request_id, "creating_pod", f"k8s pod 생성 중 (node={best_node})")
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.CREATE_POD_K8S, phase=Phase.START)
+    try:
+        v1.create_namespaced_pod(
+            namespace=ns,
+            body=ctx["pod_spec"]
+        )
+    except client.exceptions.ApiException as e:
+        _main.app.logger.exception("[CREATE POD] pod creation failed")
+        _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
+                      error_code="POD_CREATE_FAILED", error_detail=str(e.body))
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_POD",
+            "POD_CREATE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **_main.k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] pod creation failed")
+        _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.CREATE_POD_K8S, phase=_main._fail_phase(e),
+                      error_code="POD_CREATE_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_POD",
+            "POD_CREATE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.CREATE_POD_K8S, phase=Phase.SUCCESS)
+    _main.app.logger.info("[CREATE POD] pod creation request sent")
+
+def step_wait_ready(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node, v1 = ctx["node"], ctx["v1"]
+    ns = _main.app.config["NAMESPACE"]
+
+    _main.app.logger.info("[CREATE POD] waiting for pod to become Ready")
+    # "이미지 pull / 컨테이너 기동 대기 중"처럼 두 단계를 합친 문구를 초기값으로도
+    # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
+    # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
+    _main.set_pod_creation_status(request_id, "pulling_image", "이미지 다운로드 중")
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.WAIT_READY, phase=Phase.START)
+    _main.app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage=pulling_image 이미지 다운로드 중")
+    try:
+        failure_reason = None
+        max_wait = _main.app.config["POD_READY_MAX_WAIT_SEC"]
+        last_progress_stage = "pulling_image"
+        for i in range(max_wait):
+            pod = v1.read_namespaced_pod(pod_name, ns)
+            if _main.is_pod_ready(pod):
+                _main.app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
+                break
+            failure_reason = _main.get_pod_failure_reason(pod)
+            if failure_reason:
+                _main.app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
+                break
+
+            # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
+            # Redis에 다시 쓴다. stage 필드 자체를 이미지 pull 중/컨테이너 기동 중으로
+            # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
+            if i % 5 == 0:
+                progress = _main.get_pod_progress_stage(v1, ns, pod_name)
+                if progress and progress[0] != last_progress_stage:
+                    last_progress_stage, progress_message = progress
+                    _main.set_pod_creation_status(request_id, last_progress_stage, progress_message)
+                    _main.app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage={last_progress_stage} {progress_message}")
+
+            time.sleep(1)
+        else:
+            failure_reason = failure_reason or f"pod not ready within {max_wait}s"
+
+        if failure_reason:
+            _main.app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
+            _main.set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
+            rollback = _main._cleanup_create_failure(pod_name, v1)
+            _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                          node_name=best_node, resource_type="pod",
+                          action=Action.WAIT_READY, phase=Phase.FAIL,
+                          error_code="POD_READY_TIMEOUT", error_detail=failure_reason)
+            raise _main.StepFailed(_main.infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_TIMEOUT",
+                failure_reason,
+                rollback=rollback,
+                pod_name=pod_name,
+            ), 500)
+    except _main.StepFailed:
+        raise
+    except client.exceptions.ApiException as e:
+        _main.app.logger.exception("[CREATE POD] pod ready check failed")
+        _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.WAIT_READY, phase=Phase.FAIL,
+                      error_code="POD_READY_CHECK_FAILED", error_detail=str(e.body))
+        raise _main.StepFailed(_main.infra_error(
+            "WAIT_POD_READY",
+            "POD_READY_CHECK_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **_main.k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] pod ready check failed")
+        _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.WAIT_READY, phase=_main._fail_phase(e),
+                      error_code="POD_READY_CHECK_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "WAIT_POD_READY",
+            "POD_READY_CHECK_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="pod",
+                  action=Action.WAIT_READY, phase=Phase.SUCCESS)
+
+def step_create_services(ctx):
+    request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
+    best_node, v1 = ctx["node"], ctx["v1"]
+    ns = _main.app.config["NAMESPACE"]
+
+    _main.app.logger.info("[CREATE POD] creating NodePort services")
+    _main.set_pod_creation_status(request_id, "creating_services", "NodePort 서비스 생성 중")
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="service",
+                  action=Action.CREATE_SERVICE, phase=Phase.START)
+    try:
+        _main.create_nodeport_services(username, ns, pod_name, ctx["allocated_ports"])
+    except client.exceptions.ApiException as e:
+        _main.app.logger.exception("[CREATE POD] service creation failed")
+        _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="service",
+                      action=Action.CREATE_SERVICE, phase=Phase.FAIL,
+                      error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e.body))
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_CREATE_FAILED",
+            e.body,
+            rollback=rollback,
+            pod_name=pod_name,
+            **_main.k8s_error_fields(e),
+        ), 500)
+    except Exception as e:
+        _main.app.logger.exception("[CREATE POD] service creation failed")
+        _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
+        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="service",
+                      action=Action.CREATE_SERVICE, phase=_main._fail_phase(e),
+                      error_code="NODEPORT_SERVICE_CREATE_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_NODEPORT_SERVICE",
+            "NODEPORT_SERVICE_CREATE_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        ), 500, cause=e)
+
+    _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                  node_name=best_node, resource_type="service",
+                  action=Action.CREATE_SERVICE, phase=Phase.SUCCESS)
+    _main.app.logger.info("[CREATE POD] services created successfully")
+
+    _main.app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
+    _main.set_pod_creation_status(request_id, "ready", f"컨테이너 생성 완료 (node={best_node})")
+
+POD_CREATE_STEPS = [
+    step_fetch_user_config,
+    step_prepare_pod,
+    step_select_node,
+    step_build_pod_spec,
+    step_create_pod_k8s,
+    step_wait_ready,
+    step_create_services,
+]
+
+def build_pod_spec(
+    username: str,
+    user_info: dict,
+    target_node: str,
+    pod_name: str,
+    request_id=None
+):
+    # create-pod 경로는 request_id로 진행 상황을 추적한다(한 사용자가 Pod를 여러 개
+    # 동시에 만들 수 있어 username만으로는 서로 다른 시도가 섞인다). migrate 경로는
+    # 아직 request_id를 안 넘기므로 그때는 기존처럼 username을 키로 쓴다.
+    status_key = request_id or username
+    _main.app.logger.info(f"[POD SPEC] start user={username} node={target_node}")
+    _main.app.logger.debug(f"[POD SPEC] user_info={user_info}")
+    ns = _main.app.config["NAMESPACE"]
+
+    # subPath mounts require the source files to already exist on the NFS share.
+    _main.ensure_etc_layout()
+
+    canonical = _main.resolve_k8s_node_name(target_node)
+    if not canonical:
+        raise ValueError(f"unknown kubernetes node: {target_node!r}")
+    if canonical != target_node:
+        _main.app.logger.info(
+            f"[POD SPEC] nodeName will use canonical {canonical!r} (was {target_node!r})"
+        )
+    target_node = canonical
+
+    image = _main.load_user_image(username, user_info["image"])
+
+    # passwd가 uid/gid의 단일 진실 소스 — WAS 값은 무시
+    passwd_rec = None
+    for _line in _main.read_passwd_lines():
+        _rec = _main.parse_passwd_line(_line)
+        if _rec and _rec["name"] == username:
+            passwd_rec = _rec
+            break
+    if passwd_rec is None:
+        raise ValueError(
+            f"user {username!r} not found in /etc/passwd — "
+            "PUT /accounts/users로 계정을 먼저 생성하세요"
+        )
+    uid = passwd_rec["uid"]
+    primary_gid = passwd_rec["gid"]
+    primary_group_name = username
+    for _line in _main.read_group_lines():
+        _rec = _main.parse_group_line(_line)
+        if _rec and _rec["gid"] == primary_gid:
+            primary_group_name = _rec["name"]
+            break
+
+    # group 멤버 홈 마운트용 gid 목록: groups 배열(신규 포맷) 우선, 없으면 gid 필드
+    groups_from_was = user_info.get("groups", [])
+    if groups_from_was and isinstance(groups_from_was, list) and isinstance(groups_from_was[0], dict):
+        gid_list = [g["gid"] for g in groups_from_was if isinstance(g, dict) and "gid" in g]
+    else:
+        gid_list = _main._normalize_gid_list(user_info.get("gid"))
+
+    gpu_nodes = user_info.get("gpu_nodes", [])
+    
+    # 기본 포트
+    ports = [
+        {"internal_port": 22, "usage_purpose": "ssh"},
+        {"internal_port": 8888, "usage_purpose": "jupyter"},
+    ]
+    _main.app.logger.debug(f"[POD SPEC] base ports={ports}")
+
+    # WAS 추가 포트
+    additional_ports = user_info.get("additional_ports", [])
+    ports.extend(additional_ports)
+    _main.app.logger.info(f"[POD SPEC] final ports={ports}")
+
+    # additional_ports에 novnc 포트가 포함돼 있으면 entrypoint.sh가 noVNC를 띄우도록 ENABLE_VNC 주입
+    enable_vnc = any(
+        p.get("usage_purpose") in ("novnc", "vnc") or p.get("internal_port") == 6080
+        for p in additional_ports
+    )
+    _main.app.logger.info(f"[POD SPEC] enable_vnc={enable_vnc}")
+    # 포트 할당
+    _main.set_pod_creation_status(status_key, "allocating_nodeport", "NodePort 할당 중")
+    _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                  node_name=target_node, resource_type="nodeport",
+                  action=Action.ALLOCATE_NODEPORT, phase=Phase.START)
+    try:
+        allocated_ports = _main.allocate_nodeports(
+            username=username,
+            pod_name=pod_name,
+            node_name=target_node,
+            ports=ports
+        )
+    except Exception as e:
+        _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                      node_name=target_node, resource_type="nodeport",
+                      action=Action.ALLOCATE_NODEPORT, phase=_main._fail_phase(e),
+                      error_detail=str(e))
+        raise
+    _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                  node_name=target_node, resource_type="nodeport",
+                  action=Action.ALLOCATE_NODEPORT, phase=Phase.SUCCESS)
+    try:
+        _main.app.logger.info(f"[POD SPEC] allocated_ports={allocated_ports}")
+        cpu_limit = _main.app.config["DEFAULT_CPU_LIMIT"]
+        memory_limit = _main.app.config["DEFAULT_MEM_LIMIT"]
+        num_gpu = 0
+    
+        tn_key = target_node.lower()
+        for node in gpu_nodes:
+            if (node.get("node_name") or "").lower() == tn_key:
+                cpu_limit = node.get("cpu_limit", cpu_limit)
+                memory_limit = node.get("memory_limit", memory_limit)
+                num_gpu = node.get("num_gpu", 0)
+                break
+    
+        _main.app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
+
+        # GPU 디바이스는 개별 hostPath로 수동 마운트하지 않는다. 이미지에 baked-in된
+        # NVIDIA_VISIBLE_DEVICES=all과 노드의 기본 컨테이너 런타임(nvidia-container-runtime)이
+        # 컨테이너 생성 시점마다 현재 호스트 디바이스 상태를 다시 조회해서 알아서 주입해준다.
+        # 예전에는 /dev/nvidia{i}를 수동으로 bind mount했는데, 이 마운트는 마운트 시점의
+        # inode에 고정되기 때문에 이후 호스트에서 드라이버 리로드 등으로 디바이스 파일이
+        # 재생성되면 이미 떠 있던 컨테이너의 GPU 접근이 복구 불가능하게 끊기는 문제가 있었다
+        # (nvidia-container-runtime 훅과 중복/충돌하는 구조였음). 레거시 시스템(uid-gid,
+        # docker run --gpus device=all --runtime=nvidia)도 개별 디바이스를 수동 마운트하지
+        # 않는 방식이라 이 문제가 없었다.
+
+        # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        # image-store PVC(pvc-image-store)는 제거 — 해당 PV의 NFS subdir가
+        # 미치환 템플릿(user-share/${pvc.annotations.nfs.io/username})이라 모든 유저 파드가
+        # mount access denied로 Ready 실패. MVP는 image-store 불필요.
+        volume_mounts = [
+            {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
+        ]
+        volumes = [
+            {
+                "name": "nfs-home",
+                # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
+                # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
+                # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
+                "hostPath": {"path": _main.resolve_farm_home_mount_root(target_node), "type": "Directory"},
+            },
+        ]
+
+        if _main.app.config["KRB5_REALM"]:
+            # keytab은 컨테이너에 마운트하지 않는다 — farm 노드에만 배포하고 호스트가 갱신한 TGT만 공유한다.
+            # 이 배포가 실패하면 예외가 아래 except로 전달되어 nodeport 롤백 + Pod 미생성으로 처리된다.
+            _main.set_pod_creation_status(status_key, "deploying_krb5", f"krb5 배포 중 (node={target_node})")
+            _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                          node_name=target_node, resource_type="kerberos",
+                          action=Action.DEPLOY_KRB5, phase=Phase.START)
+            try:
+                _main._deploy_krb5_to_farm(username, uid, target_node)
+            except Exception as e:
+                _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                              node_name=target_node, resource_type="kerberos",
+                              action=Action.DEPLOY_KRB5, phase=_main._fail_phase(e),
+                              error_detail=str(e))
+                raise
+            _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                          node_name=target_node, resource_type="kerberos",
+                          action=Action.DEPLOY_KRB5, phase=Phase.SUCCESS)
+
+            # rpc-gssd가 호스트에서 ccache를 읽을 수 있도록 Pod와 호스트가 /run/user/<uid> 공유
+            volume_mounts.append({
+                "name": "krb5-ccache",
+                "mountPath": f"/run/user/{uid}",
+            })
+            volumes.append({
+                "name": "krb5-ccache",
+                "hostPath": {
+                    "path": f"/run/user/{uid}",
+                    "type": "DirectoryOrCreate",
+                },
+            })
+
+        _main.app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
+    
+        spec = {
+                    "config": {
+                        "backend": "kubernetes",
+                        "kubernetes": {
+                            "connection": {
+                                    "host": "https://kubernetes.default.svc",
+                                    "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                                    "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                                },
+                            "pod": {
+                                "metadata": {
+                                    "name": pod_name,
+                                    "namespace": ns,
+                                    "labels": {
+                                        "app": "ailab-guest",
+                                        "managed-by": "ailab-infra",
+                                        "username": username,
+                                        "pod_name": pod_name,
+                                        # GPU 유실 점검 CronJob(check_gpu_pods.py)이 이 라벨로 대상을 고른다.
+                                        "has-gpu": "true" if num_gpu > 0 else "false"
+                                    }
+                                },
+                                "spec": {
+                                        "nodeName": target_node,
+                                        "containers": [
+                                            {
+                                                "name": "shell",
+                                                "image": image,
+                                                "imagePullPolicy": "IfNotPresent",
+                                                "stdin": True,
+                                                "tty": True,
+                                                "ports": [
+                                                    {
+                                                        "containerPort": m["internal_port"],
+                                                        "protocol": "TCP"
+                                                    }
+                                                    for m in allocated_ports
+                                                ],
+                                                "env": [
+                                                    {"name": "USER", "value": username},
+                                                    {"name": "USER_ID", "value": username},
+                                                    {"name": "USER_GROUP", "value": primary_group_name},
+                                                    {"name": "TARGET_UID", "value": str(uid)},
+                                                    {"name": "TARGET_GID", "value": str(primary_gid)},
+                                                    {"name": "UID", "value": str(uid)},
+                                                    {"name": "GID", "value": str(primary_gid)},
+                                                    {"name": "HOME", "value": f"/home/{username}"},
+                                                    {"name": "SHELL", "value": "/bin/bash"},
+                                                    # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
+                                                    # `echo "$USER_ID:$USER_PW" | chpasswd`로 로그인 비밀번호를 설정한다.
+                                                    # 이 값이 빠져 있으면 빈 비밀번호로 설정되어 이메일로 안내한 비밀번호로
+                                                    # 로그인이 되지 않는다.
+                                                    {"name": "USER_PW", "value": base64.b64decode(user_info["passwd_base64"], validate=True).decode("utf-8")},
+                                                    {"name": "USER_GROUPS", "value": _main._build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
+                                                    *([{"name": "ENABLE_VNC", "value": "true"}] if enable_vnc else []),
+                                                    *([
+                                                        {"name": "KRB5_REALM",          "value": _main.app.config["KRB5_REALM"]},
+                                                        {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{_main.app.config['KRB5_REALM']}"},
+                                                    ] if _main.app.config["KRB5_REALM"] else []),
+                                                ],
+                                                # readinessProbe가 없으면 k8s는 컨테이너 프로세스가 시작되기만 해도
+                                                # Ready로 본다. 실제로는 entrypoint.sh가 그 뒤에 계정 생성/비밀번호
+                                                # 설정/sshd 기동을 이어서 진행하므로, is_pod_ready()가 보는 Ready
+                                                # 조건이 실제 SSH 접속 가능 시점보다 먼저 참이 되는 문제가 있었다.
+                                                # sshd가 실제로 포트 22를 열 때까지 Ready를 미룬다.
+                                                "readinessProbe": {
+                                                    "tcpSocket": {"port": 22},
+                                                    "initialDelaySeconds": 2,
+                                                    "periodSeconds": 2,
+                                                    "failureThreshold": 30,
+                                                },
+                                                "resources": {
+                                                    "requests": {
+                                                        "cpu": _main.app.config["DEFAULT_CPU_REQUEST"],
+                                                        "memory": _main.app.config["DEFAULT_MEM_REQUEST"],
+                                                        "ephemeral-storage": _main.app.config["DEFAULT_EPHEMERAL_STORAGE_REQUEST"]
+                                                    },
+                                                    "limits": {
+                                                        "cpu": cpu_limit,
+                                                        "memory": memory_limit,
+                                                        "ephemeral-storage": _main.app.config["DEFAULT_EPHEMERAL_STORAGE_LIMIT"]
+                                                    }
+                                                },
+                                                "volumeMounts": volume_mounts
+                                            }
+                                        ],
+                                        "volumes": volumes,
+                                        "restartPolicy": "Never"
+                                    }
+                                }
+                            }
+                        },
+                        "environment": {
+                            "USER": {"value": username, "sensitive": False}
+                        },
+                        "metadata": {},
+                        "files": {}
+                    }
+        _main.app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
+        return spec, allocated_ports
+    except Exception as e:
+        _main.app.logger.warning(
+            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s — %s",
+            pod_name, e,
+            exc_info=True,
+        )
+        rollback = {"nodeportsReleased": False}
+        try:
+            _main.release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception:
+            _main.app.logger.warning(
+                "[POD SPEC] nodeport release failed during rollback pod=%s",
+                pod_name,
+                exc_info=True,
+            )
+        raise _main.PodSpecBuildError(str(e), progress=rollback) from e
+
+def _normalize_gid_list(raw_gid) -> List[int]:
+    if raw_gid is None:
+        return []
+    if isinstance(raw_gid, list):
+        values = raw_gid
+    else:
+        values = [raw_gid]
+    out = []
+    for value in values:
+        if isinstance(value, int):
+            out.append(value)
+        elif str(value).isdigit():
+            out.append(int(value))
+    return out
+
+def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str]:
+    primary_gid = None
+    for line in _main.read_passwd_lines():
+        rec = _main.parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            primary_gid = rec["gid"]
+            break
+
+    if primary_gid is None and gid_list:
+        primary_gid = gid_list[0]
+
+    if primary_gid is None:
+        raise ValueError(f"primary gid not found for user {username!r}")
+
+    primary_group_name = username
+    for line in _main.read_group_lines():
+        rec = _main.parse_group_line(line)
+        if rec and rec["gid"] == primary_gid:
+            primary_group_name = rec["name"]
+            break
+
+    return primary_gid, primary_group_name
+
+def _build_user_groups_env(
+    username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
+) -> str:
+    """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
+    entries = [f"{primary_group_name}:{primary_gid}"]
+    seen = {primary_gid}
+    g_lines = _main.read_group_lines()
+    for gid in gid_list:
+        if gid in seen:
+            continue
+        seen.add(gid)
+        for line in g_lines:
+            rec = _main.parse_group_line(line)
+            if rec and rec["gid"] == gid:
+                entries.append(f"{rec['name']}:{gid}")
+                break
+    return ",".join(entries)
+
+def _get_sudo_allowed_commands() -> List[str]:
+    return [cmd for cmd in _main.app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
+
+def _build_sudoers_policy(username: str) -> Optional[str]:
+    allowed_commands = _main._get_sudo_allowed_commands()
+    if not allowed_commands:
+        return None
+    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
+
+def _rollback_user(name: str) -> None:
+    pw_lines = _main.read_passwd_lines()
+    _main.write_passwd_lines([l for l in pw_lines if (_main.parse_passwd_line(l) or {}).get("name") != name])
+
+    sh_lines = _main.read_shadow_lines()
+    _main.write_shadow_lines([l for l in sh_lines if (_main.parse_shadow_line(l) or {}).get("name") != name])
+
+    g_lines = _main.read_group_lines()
+    cleaned = []
+    for gl in g_lines:
+        rec = _main.parse_group_line(gl)
+        if not rec:
+            cleaned.append(gl)
+            continue
+        if name in rec["members"]:
+            rec["members"] = [m for m in rec["members"] if m != name]
+        if rec["name"] == name and not rec["members"]:
+            continue
+        cleaned.append(_main.format_group_entry(rec))
+    _main.write_group_lines(cleaned)
+
+def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
+    """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
+    passwd 전체에서 사용 중이지 않은 uid를 반환한다.
+    시스템 계정이 중간 번호를 점유해도 건너뛰므로 충돌이 없다."""
+    used_uids = {rec["uid"] for line in lines if (rec := _main.parse_passwd_line(line))}
+    managed_uids = {
+        rec["uid"] for line in lines
+        if (rec := _main.parse_passwd_line(line))
+        and rec["uid"] >= min_uid
+        and rec.get("home", "").startswith("/home/")
+    }
+    candidate = max(managed_uids, default=min_uid - 1) + 1
+    while candidate in used_uids:
+        candidate += 1
+    return candidate
+
+def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
+    """group 파일 기준으로 관리 그룹용 다음 GID를 반환한다."""
+    reserved_gids = {65534}
+    used_gids = {
+        rec["gid"]
+        for line in lines
+        if (rec := _main.parse_group_line(line)) and isinstance(rec.get("gid"), int)
+    }
+    managed_gids = {
+        gid for gid in used_gids
+        if gid >= min_gid and gid not in reserved_gids
+    }
+    candidate = max(managed_gids, default=min_gid - 1) + 1
+    while candidate in used_gids or candidate in reserved_gids:
+        candidate += 1
+    return candidate
+
+def step_create_account(ctx):
+    """passwd/group/shadow/sudoers까지가 계정 단계다. 비밀번호는 동기 호출이면 평문(plaintext_pw)을
+    받아 여기서 해시하고, 제어기가 실행하는 작업이면 등록 때 만든 해시(passwd_hash)를 그대로 쓴다."""
+    request_id, name = ctx["request_id"], ctx["name"]
+    pg_name, supp_groups = ctx["pg_name"], ctx["supp_groups"]
+
+    _main.ensure_etc_layout()
+
+    # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
+    uid = gid = None
+    entry = None
+    _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.START)
+    try:
+        with _main.LockedFile(_main.app.config["PASSWD_PATH"], "r+") as f:
+            content = f.read()
+            lines = content.splitlines()
+
+            if any((_main.parse_passwd_line(l) or {}).get("name") == name for l in lines):
+                _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="USER_ALREADY_EXISTS", error_detail="user already exists")
+                raise _main.StepFailed({"error": "user already exists"}, 409)
+
+            uid = _main._allocate_next_uid(lines, min_uid=_main.UID_MIN)
+            if _main.UID_MAX is not None and uid > _main.UID_MAX:
+                _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="UID_RANGE_EXHAUSTED",
+                              error_detail=f"next uid {uid} exceeds UID_MAX {_main.UID_MAX}")
+                raise _main.StepFailed(_main.infra_error(
+                    "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
+                    f"uid range {_main.UID_MIN}~{_main.UID_MAX} exhausted",
+                ), 500)
+            gid = uid
+            _main.app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
+
+            entry = {
+                "name": name,
+                "passwd": "x",
+                "uid": uid,
+                "gid": gid,
+                "gecos": ctx["gecos"],
+                "home": f"/home/{name}",
+                "shell": "/bin/bash",
+            }
+            lines.append(_main.format_passwd_entry(entry))
+            new_content = "\n".join(lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+    except _main.StepFailed:
+        raise
+    except Exception as e:
+        _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="PASSWD_WRITE_FAILED", error_detail=str(e))
+        raise
+
+    # 2) group — primary 생성 + supplementary 멤버 추가
+    added_supp = []
+    try:
+        with _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
+            content = f.read()
+            g_lines = content.splitlines()
+
+            # primary group
+            primary_exists = any(
+                (_main.parse_group_line(gl) or {}).get("gid") == gid or
+                (_main.parse_group_line(gl) or {}).get("name") == pg_name
+                for gl in g_lines
+            )
+            if not primary_exists:
+                g_lines.append(_main.format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
+
+            # supplementary groups
+            for sg in supp_groups:
+                sg_gid = int(sg["gid"])
+                sg_name = sg["name"]
+                found = False
+                updated = []
+                for gl in g_lines:
+                    rec = _main.parse_group_line(gl)
+                    if rec and rec["gid"] == sg_gid:
+                        if name not in rec["members"]:
+                            rec["members"].append(name)
+                        updated.append(_main.format_group_entry(rec))
+                        found = True
+                    else:
+                        updated.append(gl)
+                g_lines = updated
+                if not found:
+                    g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
+                added_supp.append({"name": sg_name, "gid": sg_gid})
+
+            new_content = "\n".join(g_lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] group write failed for user=%s, rolling back", name)
+        _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="GROUP_WRITE_FAILED", error_detail=str(e))
+        _main._rollback_user(name)
+        raise _main.StepFailed({"error": "failed to write group"}, 500)
+
+    # 3) shadow
+    try:
+        passwd_sha512 = ctx.get("passwd_hash") or crypt.crypt(ctx["plaintext_pw"], crypt.mksalt(crypt.METHOD_SHA512))
+
+        today_days = int(time.time() // 86400)
+        sh_lines = _main.read_shadow_lines()
+        shadow_entry = {
+            "name": name,
+            "passwd": passwd_sha512,
+            "lastchg": today_days,
+            "min": 0,
+            "max": 99999,
+            "warn": 7,
+            "inactive": "",
+            "expire": "",
+            "flag": "",
+        }
+        sh_lines.append(_main.format_shadow_entry(shadow_entry))
+        _main.write_shadow_lines(sh_lines)
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] shadow write failed for user=%s, rolling back", name)
+        _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="SHADOW_WRITE_FAILED", error_detail=str(e))
+        _main._rollback_user(name)
+        raise _main.StepFailed({"error": "failed to write shadow"}, 500)
+
+    # 4) sudoers (로컬 호스트 관리, password-protected whitelist)
+    s_path = None
+    sudoers_policy = _main._build_sudoers_policy(name)
+    if sudoers_policy:
+        try:
+            s_path = _main.ensure_sudoers_file(_main.app.config["SUDOERS_DIR"], name, sudoers_policy)
+        except Exception as e:
+            _main.app.logger.exception("[ACCOUNTS] sudoers failed for user=%s, rolling back", name)
+            _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                          action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                          error_code="SUDOERS_CREATE_FAILED", error_detail=str(e))
+            _main._rollback_user(name)
+            raise _main.StepFailed({"error": "failed to create sudoers file"}, 500)
+
+    # passwd/group/shadow/sudoers까지가 계정 단계다. 홈과 Kerberos는 별도 단계로 기록해야
+    # 단계별 소요시간이 나뉘고 어느 단계에서 실패했는지가 action으로 드러난다. 뒤 단계가
+    # 실패하면 _rollback_user가 계정을 되돌리므로, 여기서 SUCCESS가 찍힌 계정이 이후
+    # 롤백됐는지는 같은 request_id의 뒤 단계 FAIL 행으로 판별한다.
+    _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
+    ctx.update(uid=uid, gid=gid, entry=entry, added_supp=added_supp, s_path=s_path)
+
+def step_create_home(ctx):
+    request_id, name = ctx["request_id"], ctx["name"]
+
+    # 5) NAS SSH로 홈 디렉터리 생성
+    _main.log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.START)
+    try:
+        _main.create_user_home_directory(name, ctx["uid"], ctx["gid"])
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        _main.log_operation(request_id=request_id, username=name, resource_type="storage",
+                      action=Action.CREATE_HOME, phase=_main._fail_phase(e),
+                      error_code="NAS_SSH_FAILED", error_detail=str(e))
+        _main._rollback_user(name)
+        raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}"), 500, cause=e)
+    _main.log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.SUCCESS)
+
+def step_create_krb5_principal(ctx):
+    request_id, name = ctx["request_id"], ctx["name"]
+
+    # 6) Kerberos principal 생성 + keytab k8s Secret 저장
+    if not _main.app.config.get("KRB5_REALM"):
+        return
+    _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.START)
+    try:
+        _main._create_krb5_principal_and_secret(name, ctx["uid"], ctx["gid"])
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
+        _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                      action=Action.CREATE_KRB5_PRINCIPAL, phase=_main._fail_phase(e),
+                      error_code="KDC_FAILED", error_detail=str(e))
+        try:
+            _main.delete_user_home_directory(name)
+        except Exception:
+            pass
+        # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
+        # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
+        # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이
+        # 그대로 남는다. 존재 여부와 무관하게 항상 삭제를 시도해 정리한다.
+        try:
+            _main._farm_ad_ssh(f"delete {name}")
+        except Exception:
+            _main.app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
+        _main._rollback_user(name)
+        raise _main.StepFailed(_main.infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}"), 500, cause=e)
+
+    # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
+    # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을
+    # 특정할 수 없다. krb5_cleanup_pending은 (username, node_name) 단위 예약이라
+    # node_name 없이 이 시점에 username만으로 지우면, 이번에 전혀 안 건드린 다른
+    # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
+    # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
+    # 몫만 정리한다.
+    _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
+
+ACCOUNT_CREATE_STEPS = [
+    step_create_account,
+    step_create_home,
+    step_create_krb5_principal,
+]

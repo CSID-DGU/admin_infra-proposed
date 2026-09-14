@@ -12,7 +12,7 @@ from datetime import datetime
 from kubernetes import client, config as k8s_config
 from kubernetes.stream import stream
 from flask import current_app as app
-from bg_img_redis import save_image_metadata, get_image_metadata
+from adapters.bg_img_redis import save_image_metadata, get_image_metadata
 
 DEFAULT_BASE_ETC_TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "base_etc")
 

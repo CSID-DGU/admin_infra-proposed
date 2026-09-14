@@ -21,10 +21,19 @@ from kubernetes import client
 from kubernetes.stream import stream
 
 from error import infra_error
-from operation_log import Action, Phase, log_operation
+from adapters.operation_log import Action, Phase, log_operation
 from utils import load_k8s, get_db_connection
 
-import main as _main  # StepFailed 등은 호출 시점에만 접근 — 순환 import 안전
+class _MainProxy:
+    """main 속성의 늦은 바인딩 — main 로드를 첫 속성 접근 시점까지 미뤄 import 순서와
+    무관하게 순환이 성립하지 않는다. StepFailed 등은 어차피 호출 시점에만 쓴다."""
+
+    def __getattr__(self, name):
+        import main
+        return getattr(main, name)
+
+
+_main = _MainProxy()
 
 VERIFY_EXEC_TIMEOUT_SEC = float(os.getenv("VERIFY_EXEC_TIMEOUT_SEC", "20"))
 VERIFY_TCP_TIMEOUT_SEC = float(os.getenv("VERIFY_TCP_TIMEOUT_SEC", "5"))

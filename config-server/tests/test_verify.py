@@ -3,7 +3,7 @@
 import pytest
 
 import main
-import verify
+from lifecycle_steps import verify
 from main import Phase, StepFailed
 
 
