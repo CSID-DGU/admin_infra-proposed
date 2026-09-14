@@ -38,6 +38,9 @@ class FakeV1:
             raise ApiException(status=404, reason="Not Found")
         del self.pods[name]
 
+    def list_namespaced_service(self, ns, label_selector=None):
+        return types.SimpleNamespace(items=[])
+
 
 class Sql:
     """pymysql 연결 흉내. %s → ? 만 바꿔 sqlite에서 같은 SQL을 실행한다."""
@@ -460,3 +463,103 @@ def test_failed_provision_has_no_result(env):
 
     res = result(e, "provision", "112")
     assert res["phase"] in ("FAIL", "UNKNOWN") and res["result"] is None
+
+
+# ---------- Proposed-Full (VERIFY_MODE=full) ----------
+
+@pytest.fixture
+def full(env, monkeypatch):
+    """VERIFY_MODE=full + probe 관찰 도구 대역. 기본값은 다섯 시험 전부 통과."""
+    import verify
+    e = env
+    monkeypatch.setattr(main, "VERIFY_MODE", "full")
+
+    def sh(pod, cmd):
+        if "id -u" in cmd:
+            u = cmd.split("/bin/sh ")[1].split(" ")[0]
+            uid = next(l.split(":")[2] for l in passwd_names_lines() if l.startswith(u + ":"))
+            return uid, 0
+        if "df -P" in cmd:
+            return "ok\nnas:/volume1/share/user 1 1 1 1% /home", 0
+        if "klist" in cmd:
+            return e.probe_klist if hasattr(e, "probe_klist") else ("", 0)
+        if "nvidia-smi" in cmd:
+            return "1", 0
+        return "", 0
+
+    def passwd_names_lines():
+        with main.app.app_context():
+            return main.read_passwd_lines()
+
+    monkeypatch.setattr(verify, "_sh", sh)
+    monkeypatch.setattr(verify, "log_operation", main.log_operation)   # env의 sqlite 기록기로
+    monkeypatch.setattr(verify, "load_k8s", lambda: None)
+    monkeypatch.setattr(verify.client, "CoreV1Api", lambda: e.v1)
+    monkeypatch.setattr(verify, "_tcp_check", lambda h, p, expect_banner=None: (True, "SSH-2.0-Test"))
+    monkeypatch.setattr(main, "_get_farm_node_info", lambda n: {"name": n, "host": "10.0.0.2", "port": 22})
+
+    class _NoRows:
+        def cursor(self):
+            outer = self
+
+            class Cur:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    pass
+
+                def execute(self, sql, params=()):
+                    pass
+
+                def fetchone(self):
+                    return (0,)
+
+                def fetchall(self):
+                    return []
+            return Cur()
+
+        def close(self):
+            pass
+    monkeypatch.setattr(verify, "get_db_connection", lambda: _NoRows())
+    return e
+
+
+def test_full_provision_passes_five_probes_then_succeeds(full, lease_env):
+    e = full
+    e.api.post("/operations/provision", json={"request_id": "800", "username": "exp-np-full",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    assert result(e, "provision", "800")["phase"] == "SUCCESS", rows(e, "800")
+    probes = [(a, p) for a, p in rows(e, "800") if a == "VERIFY_ACCESS"]
+    assert [p for _, p in probes].count("SUCCESS") == 5          # 다섯 시험 전부 근거 행이 남는다
+    seq = [a for a, p in rows(e, "800") if p == "SUCCESS"]
+    assert seq.index("CREATE_SERVICE") < seq.index("VERIFY_ACCESS")   # 자원이 다 만들어진 뒤 시험
+
+
+def test_full_provision_failing_probe_blocks_completion_as_degraded(full, lease_env):
+    """티켓 시험이 계속 실패하면 재시도 후 DEGRADED — 완료(SUCCESS)로 기록되지 않는다."""
+    e = full
+    e.probe_klist = ("kinit: no ticket", 1)
+    e.api.post("/operations/provision", json={"request_id": "801", "username": "exp-np-fulx",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    res = result(e, "provision", "801")
+    assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED"
+    assert not [1 for a, p in rows(e, "801") if a == "PROVISION" and p == "SUCCESS"]
+    import verify
+    fails = [1 for a, p in rows(e, "801") if a == "VERIFY_ACCESS" and p == "FAIL"]
+    assert len(fails) == verify.VERIFY_MAX_ATTEMPTS               # 전파 지연 대비 여유 재시도
+
+
+def test_full_revoke_verifies_blocked_access(full, lease_env):
+    e = full
+    e.api.post("/operations/provision", json={"request_id": "802", "username": "exp-np-fulr",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    pod_name = next(iter(e.v1.pods))
+    e.api.post("/operations/revoke", json={"request_id": "802", "pod_name": pod_name})
+    tick(e)
+    assert result(e, "revoke", "802")["phase"] == "SUCCESS", rows(e, "802")
+    assert ("VERIFY_REVOKED", "SUCCESS") in rows(e, "802")
+    assert e.v1.pods == {}
