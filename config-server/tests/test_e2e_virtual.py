@@ -372,6 +372,33 @@ def test_account_in_use_by_another_pod_is_not_revoked(env):
     assert len(e.v1.pods) == 1 and "exp-np-e2e" in passwd_names()    # 남은 컨테이너의 계정 유지
 
 
+def test_keytab_kept_when_user_has_another_pod_on_same_node(env, lease_env):
+    """실측 회귀(9/11 exp-np-probeyoon6yo): 같은 사용자의 Pod 두 개가 한 노드에 있을 때 하나를 지우면
+    keytab까지 지워져, 살아있는 Pod의 TGT가 만료 후 갱신되지 않고 홈 접근이 끊겼다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "900", "username": "exp-np-two",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    e.api.post("/operations/provision", json={"request_id": "901", "username": "exp-np-two"})
+    tick(e)
+    assert len(e.v1.pods) == 2
+    first, second = sorted(e.v1.pods)
+    before = [c for c in e.calls if c[0] == "krb5_remove"]
+
+    e.api.post("/operations/revoke", json={"request_id": "900", "pod_name": first})
+    tick(e)
+
+    assert result(e, "revoke", "900")["phase"] == "SUCCESS"
+    assert list(e.v1.pods) == [second]                      # 지운 것만 사라진다
+    assert [c for c in e.calls if c[0] == "krb5_remove"] == before   # keytab은 유지
+
+    # 마지막 Pod를 지울 때는 정리된다
+    e.api.post("/operations/revoke", json={"request_id": "901", "pod_name": second})
+    tick(e)
+    assert ("krb5_remove", ("exp-np-two", "farm2")) in e.calls
+    assert e.v1.pods == {}
+
+
 def test_non_numeric_request_id_is_rejected(env):
     r = env.api.post("/operations/provision", json={"request_id": "smoke-1", "username": "exp-np-e2e"})
     assert r.status_code == 400 and env.redis == {}
