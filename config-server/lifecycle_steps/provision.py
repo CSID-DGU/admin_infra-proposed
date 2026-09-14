@@ -15,6 +15,8 @@ import requests
 import urllib3
 from kubernetes import client
 
+from typing import List, Optional
+
 from adapters.operation_log import Action, Phase
 
 
@@ -1050,7 +1052,7 @@ def build_pod_spec(
             )
         raise _main.PodSpecBuildError(str(e), progress=rollback) from e
 
-def _normalize_gid_list(raw_gid) -> _main.List[int]:
+def _normalize_gid_list(raw_gid) -> List[int]:
     if raw_gid is None:
         return []
     if isinstance(raw_gid, list):
@@ -1065,7 +1067,7 @@ def _normalize_gid_list(raw_gid) -> _main.List[int]:
             out.append(int(value))
     return out
 
-def _resolve_primary_group(username: str, gid_list: _main.List[int]) -> tuple[int, str]:
+def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str]:
     primary_gid = None
     for line in _main.read_passwd_lines():
         rec = _main.parse_passwd_line(line)
@@ -1089,7 +1091,7 @@ def _resolve_primary_group(username: str, gid_list: _main.List[int]) -> tuple[in
     return primary_gid, primary_group_name
 
 def _build_user_groups_env(
-    username: str, primary_group_name: str, primary_gid: int, gid_list: _main.List[int]
+    username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
 ) -> str:
     """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
     entries = [f"{primary_group_name}:{primary_gid}"]
@@ -1106,10 +1108,10 @@ def _build_user_groups_env(
                 break
     return ",".join(entries)
 
-def _get_sudo_allowed_commands() -> _main.List[str]:
+def _get_sudo_allowed_commands() -> List[str]:
     return [cmd for cmd in _main.app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
 
-def _build_sudoers_policy(username: str) -> _main.Optional[str]:
+def _build_sudoers_policy(username: str) -> Optional[str]:
     allowed_commands = _main._get_sudo_allowed_commands()
     if not allowed_commands:
         return None
