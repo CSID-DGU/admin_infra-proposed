@@ -34,7 +34,7 @@ def api():
 def lease_env(monkeypatch):
     """재시도 지연 제거 + lease 저장소 메모리 대역. 실제 SQL은 test_job_control_sql.py에서 검증한다.
     반환 dict: job_id -> {"owner","alive","done","ctx"}. alive=False면 만료된 lease로 취급한다."""
-    import job_control
+    from adapters import job_control
     monkeypatch.setattr(main, "RETRY_DELAY_SEC", 0)
     # macOS에서 *.svc.cluster.local이 mDNS로 풀려 실제 Redis 접속이 수십 초 멈춘다 — 부가 저장은 무시
     monkeypatch.setattr(main, "save_job_result", lambda a, r, d: None)

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-import job_control
+from adapters import job_control
 
 # conftest의 autouse lease_env가 대역으로 바꾸기 전에 실제 구현을 잡아 둔다
 _REAL = {n: getattr(job_control, n) for n in ("claim", "record_step", "release", "renew")}

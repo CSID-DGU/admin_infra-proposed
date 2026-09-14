@@ -11,7 +11,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from main import app, find_unfinished_jobs, run_job
-import job_control
+from adapters import job_control
 
 POLL_SEC = float(os.getenv("CONTROLLER_POLL_SEC", "2"))
 # API 서버(gunicorn --workers=4)와 같은 동시 처리 수. baseline과 동시성 조건을 맞춘다.

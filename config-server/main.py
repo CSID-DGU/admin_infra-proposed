@@ -22,15 +22,15 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
-from pod_status import (
+from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
     save_job_result, load_job_result,
 )
-from operation_log import Action, Phase, log_operation, current_job_id, current_attempt
+from adapters.operation_log import Action, Phase, log_operation, current_job_id, current_attempt
 
-import job_control
-from job_control import LeaseLost
+from adapters import job_control
+from adapters.job_control import LeaseLost
 import verify
 
 from utils import (

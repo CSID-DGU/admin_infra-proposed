@@ -21,7 +21,7 @@ from kubernetes import client
 from kubernetes.stream import stream
 
 from error import infra_error
-from operation_log import Action, Phase, log_operation
+from adapters.operation_log import Action, Phase, log_operation
 from utils import load_k8s, get_db_connection
 
 import main as _main  # StepFailed 등은 호출 시점에만 접근 — 순환 import 안전
