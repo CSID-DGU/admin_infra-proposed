@@ -10,6 +10,28 @@ from enum import Enum
 from flask import current_app as app
 
 from utils import get_log_db_connection
+from adapters.bg_img_redis import r as _redis
+
+# 기록 실패(유실) 카운터 — 스택 자기 Redis 에 쌓이고 stack-down 때 함께 사라진다.
+# gunicorn 워커 4개 + 제어기가 별도 프로세스라 메모리 카운터로는 합산이 안 된다.
+_WRITE_FAILURES_KEY = "oplog:write_failures"
+
+
+def _count_write_failure():
+    """이력 기록 실패를 센다. 카운터 자신이 흐름을 막으면 안 되므로 실패는 무시한다 —
+    이중 실패(로그 DB·Redis 동시 다운)의 최후 백업은 호출부의 app.logger 행이다."""
+    try:
+        _redis.incr(_WRITE_FAILURES_KEY)
+    except Exception:
+        pass
+
+
+def write_failure_count():
+    """/health 노출용 누적 유실 건수. 조회 불능은 0(유실 없음)과 구분해 None."""
+    try:
+        return int(_redis.get(_WRITE_FAILURES_KEY) or 0)
+    except Exception:
+        return None
 
 
 # 제어기가 지금 실행 중인 작업의 번호(작업 시작 행의 id). 제어기가 작업을 실행하는 동안 여기에 두면
@@ -157,6 +179,7 @@ def log_operation(
             f"[OPERATION LOG] insert failed request_id={request_id} "
             f"action={action_value} phase={phase_value}"
         )
+        _count_write_failure()
         if raise_errors:
             raise
     finally:

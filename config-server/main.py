@@ -27,7 +27,8 @@ from adapters.pod_status import (
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
     save_job_result, load_job_result,
 )
-from adapters.operation_log import Action, Phase, log_operation, current_job_id, current_attempt
+from adapters.operation_log import (Action, Phase, log_operation, current_job_id,
+                                    current_attempt, write_failure_count)
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
@@ -80,7 +81,21 @@ UID_MAX = int(os.getenv("UID_MAX", "0")) or None
 NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
 # 제안 시스템 조건(noprobe | full). 실제 접근 시험(probe)을 수행할지를 이 값 하나로 가른다.
-VERIFY_MODE = os.getenv("VERIFY_MODE", "noprobe")
+# 이름은 RUN_MODE 가 정본이고 VERIFY_MODE 는 기존 배포 호환용 별칭이다. 허용 밖의 값(대문자
+# FULL, 오타)이 조용히 noprobe 로 돌면 ablation 두 팔이 같아져 차이가 0으로 나오므로,
+# 기동 시점에 즉시 죽는다. baseline 실행 모드는 실행 구조 결정(A1) 뒤에 이 목록에 추가한다.
+_ALLOWED_RUN_MODES = ("noprobe", "full")
+
+
+def _resolve_run_mode(env=None):
+    env = os.environ if env is None else env
+    mode = env.get("RUN_MODE") or env.get("VERIFY_MODE") or "noprobe"
+    if mode not in _ALLOWED_RUN_MODES:
+        raise SystemExit(f"RUN_MODE must be one of {_ALLOWED_RUN_MODES}, got {mode!r}")
+    return mode
+
+
+VERIFY_MODE = _resolve_run_mode()
 # 실험 스택은 AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이것들은 이름으로 식별된다.
 # 접두어를 주면 그 접두어로 시작하지 않는 이름은 받지 않아, 운영 계정을 덮어쓰거나 지우지 못하게 한다.
 # 비워 두면(운영) 제한 없음.
@@ -191,12 +206,14 @@ def health():
     responses:
 
       200:
-        description: 서버 정상
+        description: 서버 정상. run_mode 는 실행 중인 조건, oplog_write_failures 는
+          작업 이력 기록 실패 누적 건수(조회 불능이면 null — 0 과 구분).
         schema:
-          type: string
-          example: OK
+          type: object
+          example: {"status": "OK", "run_mode": "noprobe", "oplog_write_failures": 0}
     """
-    return "OK", 200
+    return jsonify(status="OK", run_mode=VERIFY_MODE,
+                   oplog_write_failures=write_failure_count()), 200
 
 def load_k8s():
     try:
