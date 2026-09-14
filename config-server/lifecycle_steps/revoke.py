@@ -214,15 +214,42 @@ def step_delete_pod_k8s(ctx):
     _main.app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
 def step_cleanup_pod_node_krb5(ctx):
+    """지운 Pod가 있던 노드에서 keytab을 정리한다.
+
+    같은 사용자의 다른 Pod가 그 노드에 남아 있으면 지우지 않는다. keytab을 지우면 호스트의
+    티켓 갱신 타이머까지 사라져, 살아있는 Pod의 TGT가 만료된 뒤 되살아나지 않는다. 그러면
+    sec=krb5로 마운트된 홈이 nobody로 매핑되어 사용자가 자기 홈에 접근하지 못한다.
+    계정 회수(step_check_account_revocable)에 있는 보류 규칙과 같은 이유이며, 여기서는
+    노드 단위로 본다 — 다른 노드의 Pod는 이 노드의 keytab이 필요 없다."""
     if ctx.get("already_absent"):
         return
     username, pod_node_name = ctx["username"], ctx.get("pod_node_name")
-    if _main.app.config.get("KRB5_REALM") and pod_node_name:
-        try:
-            _main._remove_krb5_from_farm(username, pod_node_name)
-        except Exception as e:
-            _main.app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
-            _main._record_krb5_cleanup_pending(username, pod_node_name)
+    if not (_main.app.config.get("KRB5_REALM") and pod_node_name):
+        return
+
+    try:
+        _main.load_k8s()
+        pods = client.CoreV1Api().list_namespaced_pod(
+            _main.app.config["NAMESPACE"], label_selector=f"username={username}").items
+        others = [p.metadata.name for p in pods
+                  if p.metadata.name != ctx.get("pod_name")
+                  and getattr(p.spec, "node_name", None) == pod_node_name]
+    except Exception as e:
+        # 남은 Pod를 확인하지 못하면 지우지 않는다. 잘못 지우면 살아있는 사용자의 접근이 끊기고,
+        # 남겨 두면 재조정 잡이 고아 후보로 보고한다 — 실패 방향을 안전한 쪽으로 고정한다.
+        _main.app.logger.warning(f"[DELETE POD] 남은 Pod 확인 실패로 keytab 정리 보류: {username} @ {pod_node_name} — {e}")
+        return
+
+    if others:
+        _main.app.logger.info(
+            f"[DELETE POD] {username}의 Pod {len(others)}개가 {pod_node_name}에 남아 있어 keytab을 유지한다")
+        return
+
+    try:
+        _main._remove_krb5_from_farm(username, pod_node_name)
+    except Exception as e:
+        _main.app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
+        _main._record_krb5_cleanup_pending(username, pod_node_name)
 
 def _new_delete_rollback():
     return {
