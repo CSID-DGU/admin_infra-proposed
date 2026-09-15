@@ -25,6 +25,12 @@ class _MainProxy:
         import main
         return getattr(main, name)
 
+    def __setattr__(self, name, value):
+        # 쓰기도 main 모듈로 위임한다. 이게 없으면 _main.X = ... 가 프록시 인스턴스에만
+        # 저장돼 main 의 상태(_last_reconcile_ts 등)와 이원화된다(#57).
+        import main
+        setattr(main, name, value)
+
 
 _main = _MainProxy()
 
@@ -49,11 +55,12 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
     Returns:
         int: 삭제된 stale 행 수 (0이면 동기화 불필요 또는 쓰로틀로 스킵)
     """
-    global _last_reconcile_ts
-
+    # 쓰로틀 상태(_last_reconcile_ts)는 main 모듈이 소유한다. 이 함수가 main.py에서 이 모듈로
+    # 옮겨질 때(#49) _RECONCILE_INTERVAL_SEC 는 _main. 참조로 고쳐졌지만 _last_reconcile_ts 는
+    # 누락돼, 자기 모듈에 없는 이름을 global로 읽어 NameError 로 NodePort 예약이 전면 실패했다(#57).
     # ── 쓰로틀 체크: 마지막 실행으로부터 _RECONCILE_INTERVAL_SEC 이내면 스킵 ──
     now = time.time()
-    elapsed = now - _last_reconcile_ts
+    elapsed = now - _main._last_reconcile_ts
     if elapsed < _main._RECONCILE_INTERVAL_SEC:
         _main.app.logger.debug(
             f"[RECONCILE] skipped (throttle: {int(_main._RECONCILE_INTERVAL_SEC - elapsed)}s remaining)"
@@ -62,7 +69,7 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
     _main.app.logger.info(f"[RECONCILE] start namespace={namespace}")
     # 쓰로틀 기준 시각: 성공/실패와 무관하게 "시도" 단위로 갱신한다.
-    _last_reconcile_ts = time.time()
+    _main._last_reconcile_ts = time.time()
 
     # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
     #    label_selector로 config-server가 관리하는 Service만 필터링.
