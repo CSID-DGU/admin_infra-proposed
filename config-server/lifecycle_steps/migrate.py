@@ -123,6 +123,10 @@ def step_migrate_cleanup_old(ctx):
                 raise
         _main.load_k8s()
         _main.delete_account_secret(client.CoreV1Api(), ns, old_pod)
+        # 기존 노드의 keytab도 정리한다(같은 사용자의 다른 Pod가 그 노드에 남아 있으면 유지). 안 지우면 회수 때는
+        # 마지막 노드만 정리되므로 기존 노드에 keytab이 계속 남는다.
+        _main.step_cleanup_pod_node_krb5({"username": ctx["username"], "pod_name": old_pod,
+                                          "pod_node_name": ctx.get("from_node")})
     except Exception as e:
         _main.app.logger.exception(f"[MIGRATE] 기존 Pod({old_pod}) 정리 실패 — 새 Pod는 정상, 수동 정리 필요")
         ctx["old_pod_cleanup"] = "failed"

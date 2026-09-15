@@ -61,7 +61,9 @@ from utils import (
 
 app = Flask(__name__)
 
-# 로그 설정
+# 로그 설정 — Flask가 app.logger에 붙여 둔 기본 출력(stderr)을 떼고 하나만 쓴다. 둘 다 두면 모든 로그가 두 줄씩 찍힌다.
+from flask.logging import default_handler  # noqa: E402
+app.logger.removeHandler(default_handler)
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
