@@ -26,12 +26,12 @@ from error import infra_error, k8s_error_fields
 from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest)
 from adapters.pod_status import (
-    set_pod_creation_status as _store_pod_status, get_pod_creation_status,
+    set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
     save_job_result, load_job_result,
 )
 from adapters.operation_log import (Action, Phase, log_operation, current_job_id,
-                                    current_attempt, current_username, write_failure_count)
+                                    current_attempt, write_failure_count)
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
@@ -60,27 +60,6 @@ from utils import (
 )
 
 app = Flask(__name__)
-
-# 작업별 마지막으로 기록한 진행 단계. 같은 단계를 반복해서 쓰지 않는다(Ready 대기는 5초마다 같은 단계를 다시 쓴다).
-_last_progress = {}
-
-
-def set_pod_creation_status(key_value, stage, message=""):
-    """진행 상황을 Redis에 쓰고, 제어기가 작업을 실행하는 중이면 단계가 바뀔 때마다 작업 이력에도 남긴다.
-
-    Redis 진행 상황은 마지막 단계 하나만 1시간 보관한다. 작업 이력에 남겨야 이미지 다운로드·마운트 재시도 같은
-    중간 과정이 시각과 함께 남고, 신청 상세 타임라인에서 볼 수 있다.
-    """
-    _store_pod_status(key_value, stage, message)
-    job_id, username = current_job_id.get(), current_username.get()
-    if job_id is None or not username or _last_progress.get(job_id) == stage:
-        return
-    if len(_last_progress) > 1000:
-        _last_progress.clear()
-    _last_progress[job_id] = stage
-    log_operation(request_id=key_value, username=username, action=Action.PROGRESS, phase=Phase.INFO,
-                  resource_type=str(stage)[:32],
-                  error_detail=json.dumps({"stage": stage, "message": message}, ensure_ascii=False))
 
 # 로그 설정
 handler = logging.StreamHandler(sys.stdout)
@@ -1198,8 +1177,6 @@ JOB_STEPS_MAX_JOBS = 5
 _STEP_SUMMARY_KEYS = ("expected_uid", "requested", "visible", "node", "placed_in_candidates", "roundtrip",
                       "owner_uid", "connected", "reason", "likely_cause", "step", "compensation",
                       "interrupted_after", "unknown", "degraded", "rc",
-                      # 진행 상황 변화 행
-                      "stage", "message",
                       # 컨테이너 준비 대기: 이미지 새로 받음/노드에 있던 이미지, 받은 시간·크기, 재시도 횟수
                       "image_source", "image_pull_seconds", "image_size_mb", "mount_retries", "restarts")
 _INTERNAL_ADDRESS = re.compile(r"\d{1,3}(\.\d{1,3}){3}|:/")
