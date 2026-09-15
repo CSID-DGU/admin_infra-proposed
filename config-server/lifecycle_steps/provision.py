@@ -789,9 +789,12 @@ def step_wait_ready(ctx):
             pod_name=pod_name,
         ), 500, cause=e)
 
+    # 이미지 다운로드처럼 오래 걸린 이유가 작업 기록에 남도록 이벤트 요약을 함께 적는다.
+    start_summary = _main.summarize_pod_start_events(v1, ns, pod_name)
     _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                   node_name=best_node, resource_type="pod",
-                  action=Action.WAIT_READY, phase=Phase.SUCCESS)
+                  action=Action.WAIT_READY, phase=Phase.SUCCESS,
+                  error_detail=json.dumps(start_summary) if start_summary else None)
 
 def step_create_services(ctx):
     request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
