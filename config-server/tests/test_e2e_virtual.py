@@ -303,8 +303,12 @@ def test_restart_resumes_mid_pod_creation_without_duplicates(env, lease_env):
     끝난 단계(계정 생성)는 다시 실행하지 않아 중복이 없다."""
     e = env
     # 죽은 제어기가 계정 3단계까지 실제로 끝낸 상태를 재현 (파일·홈·principal은 남아 있다)
-    r0 = e.api.put("/accounts/users", json={"name": "exp-np-e2g", "passwd_base64": PW, "request_id": "106"})
-    uid = r0.get_json()["user"]["uid"]
+    ctx = {"request_id": "106", "name": "exp-np-e2g", "pg_name": "exp-np-e2g", "supp_groups": [], "gecos": "",
+           "plaintext_pw": base64.b64decode(PW).decode()}
+    with main.app.app_context():
+        for step in main.ACCOUNT_CREATE_STEPS:
+            step(ctx)
+    uid = ctx["uid"]
     r = e.api.post("/operations/provision", json={"request_id": "106", "username": "exp-np-e2g",
                                                   "account": {"passwd_base64": PW}})
     jid = r.get_json()["job_id"]
@@ -323,22 +327,6 @@ def test_restart_resumes_mid_pod_creation_without_duplicates(env, lease_env):
     # 끝난 계정 단계는 재실행하지 않았다 — principal 생성 호출이 늘지 않는다
     assert len([c for c in e.calls if c[0] == "krb5_principal"]) == made_before
     assert ("krb5_deploy" in [c[0] for c in e.calls])        # 남은 단계는 실행됐다
-
-
-def test_sync_path_still_works_end_to_end(env):
-    e = env
-    r = e.api.put("/accounts/users", json={"name": "exp-np-sync", "passwd_base64": PW, "request_id": "200"})
-    assert r.status_code == 201 and r.get_json()["user"]["name"] == "exp-np-sync"
-    r = e.api.post("/create-pod", json={"username": "exp-np-sync", "request_id": "200"})
-    assert r.status_code == 201 and r.get_json()["node"] == "farm2" and len(r.get_json()["ports"]) == 2
-    r = e.api.post("/delete-pod", json={"pod_name": r.get_json()["pod_name"], "request_id": "200"})
-    assert r.status_code == 200 and r.get_json()["progress"]["podDeleted"]
-    r = e.api.delete("/accounts/users/exp-np-sync?node_name=farm2&request_id=200")
-    assert r.status_code == 200
-    assert "delete_home" in [c[0] for c in e.calls]       # 동기 경로는 baseline대로 홈 삭제
-    assert [c[1] for c in e.calls if c[0] == "was"] == ["http://admin-prod.default/api/requests/config/exp-np-sync"]
-    assert e.api.delete("/accounts/users/exp-np-sync").status_code == 404
-    assert not [1 for a, p in rows(e, "200") if a in ("PROVISION", "REVOKE")]  # 동기 경로는 작업 행을 안 남김
 
 
 # ---------- 가상 E2E로 찾은 문제의 수정 확인 (#25) ----------
@@ -475,7 +463,7 @@ def test_provision_result_carries_created_resources(env):
     gid = int(passwd_line("exp-np-res").split(":")[3])
     assert (made["uid"], made["gid"]) == (uid, gid)
     assert made["pod_name"] == next(iter(e.v1.pods)) and made["node"] == "farm2"
-    # 포트는 /create-pod 응답과 같은 형식이라 admin_be가 그대로 저장할 수 있다.
+    # 포트는 admin_be가 신청 기록에 그대로 저장하는 형식(internal_port·external_port·usage_purpose)이다.
     assert sorted(p["usage_purpose"] for p in made["ports"]) == ["jupyter", "ssh"]
     assert all(p["external_port"] and p["internal_port"] for p in made["ports"])
 

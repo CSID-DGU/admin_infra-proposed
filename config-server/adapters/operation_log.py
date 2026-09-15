@@ -48,7 +48,7 @@ class Action(str, Enum):
     """
 
     CREATE_ACCOUNT = "CREATE_ACCOUNT"
-    # 계정 생성 API(/accounts/users) 안에서 계정 다음에 이어지는 두 단계. 계정과 action을
+    # 계정 생성 단계에서 계정 다음에 이어지는 두 단계. 계정과 action을
     # 나눠야 단계별 소요시간이 따로 잡히고, 어느 단계에서 실패했는지가 action만으로 드러난다.
     CREATE_HOME = "CREATE_HOME"
     CREATE_KRB5_PRINCIPAL = "CREATE_KRB5_PRINCIPAL"

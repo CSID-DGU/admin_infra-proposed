@@ -289,7 +289,7 @@ else
   echo "프론트엔드 이미지가 없어 건너뜀"
 fi
 
-step "검증 (테스트 계정 ${PREFIX}000 생성 후 삭제)"
+step "검증 (admin_be·프론트엔드 연결, 접두어 제한)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
 kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" PREFIX="$PREFIX" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" FE_HOST="$FE_HOST" python - <<'PY'
 import base64, json, os, sys, time, requests
@@ -312,8 +312,9 @@ for _ in range(12):
         err = type(e).__name__
         time.sleep(5)
 check("admin_be(WAS) 응답", not err, err)
-# 접두어 없는 이름은 거절돼야 한다. 이 이름은 스택 계정 대장에 없어서, 막히지 않더라도 404로 끝나고 아무것도 건드리지 않는다.
-r = requests.delete(f"{base}/accounts/users/guardprobe000", timeout=30)
+# 접두어 없는 이름은 거절돼야 한다. 막히지 않더라도 request_id가 숫자가 아니어서 400으로 끝나 작업은 등록되지 않는다.
+r = requests.post(f"{base}/operations/revoke", timeout=30,
+                  json={"request_id": "not-a-number", "username": "guardprobe000", "delete_account": True})
 check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
 fe = os.environ.get("FE", "")
 
@@ -344,36 +345,13 @@ if fe:
             lambda: requests.get("http://nginx-ailab-ingress-nginx-controller.ailab-frontend.svc.cluster.local/",
                                  headers={"Host": os.environ["FE_HOST"]}, timeout=10),
             lambda c: c == 200)
-# 계정 삭제는 계정·홈을 먼저 지우고, 노드를 지정하지 않으면 모든 farm 노드를 차례로 돌며 Kerberos 키를 지운다.
-# 느린 노드가 있으면 이 뒷부분이 수 분 걸리므로 응답은 30초만 기다리고, 계정 대장에서 사라졌는지로 판정한다.
-# 이 테스트 계정은 Pod를 만들지 않아 farm 노드에 키가 배포되지 않는다.
-# 이 테스트 계정은 어느 farm 노드에도 keytab을 배포하지 않는다. 노드를 안 주면 모든 farm 노드를 차례로
-# 도는 Kerberos 정리(수 분)가 돌고, 그 요청이 다음 배포 때 이전 Pod의 종료를 붙잡는다. 노드 하나만 준다.
-farm_nodes = json.loads(os.environ.get("FARM_NODES_JSON") or "[]")
-cleanup = {"node_name": farm_nodes[0]["name"]} if farm_nodes else {}
-def delete_account():
-    try:
-        return requests.delete(f"{base}/accounts/users/{name}", params=cleanup, timeout=30).status_code
-    except requests.exceptions.ReadTimeout:
-        return "응답 대기 30초 초과(Kerberos 정리 진행 중)"
-delete_account()  # 이전 실행에서 남은 것이 있으면 정리
-r = requests.put(f"{base}/accounts/users", timeout=120, json={
-    "request_id": f"smoke-{name}", "name": name, "passwd_base64": base64.b64encode(os.urandom(12).hex().encode()).decode(),
-    "gecos": "stack smoke test", "primary_group_name": name, "enable_sudo": False, "supplementary_groups": []})
-uid = (r.json().get("user") or {}).get("uid") if r.status_code == 201 else None
-check("계정 생성", r.status_code == 201, f"{r.status_code} {r.text[:200]}")
-check(f"UID가 대역 {lo}~{hi} 안", uid is not None and lo <= int(uid) <= hi, uid)
-res = delete_account()
-gone = requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code == 404
-check("계정 삭제 (계정 대장에서 사라짐)", gone, res)
-if gone and res != 200:
-    print(f"    참고: 삭제 응답 {res}")
+# 계정 생성·회수는 아래 비동기 작업 검증에서 확인한다(동기 계정 API는 없앴다).
 sys.exit(0 if ok else 1)
 PY
 
 step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 ${PREFIX}001)"
-# 위 검증은 동기 API(/accounts/users)를 확인했고, 여기서는 v2.0 비동기 흐름
-# (POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로 도는지 확인한다.
+# v2.0 비동기 흐름(POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로
+# 도는지, 계정이 스택 UID 대역 안에서 만들어지고 회수되는지 확인한다.
 # 작업의 신청 번호는 admin_be 신청 PK와 같은 형식(양의 정수)만 받는다. 실제 신청과 겹치지 않도록
 # 현재 시각(초)을 쓴다 — 스택 admin_be의 신청 번호는 1부터 늘어나므로 닿지 않는다.
 JOB_RID=$(date +%s)
@@ -381,7 +359,7 @@ JOB_RID2=$((JOB_RID + 1))
 # 계정 회수는 keytab을 지울 farm 노드를 모르면 보류한다(baseline admin_be와 같은 조건). 회수 작업
 # 시험에는 그래서 노드를 하나 실어 보낸다. 공개 로그에 남지 않게 값은 출력하지 않고 넘기기만 한다.
 JOB_NODE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i '^farm' | head -1)
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" python - <<'PY'
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" python - <<'PY'
 import base64, os, sys, time, requests
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 rid, rid2, node = os.environ["RID"], os.environ["RID2"], os.environ.get("NODE") or None
@@ -391,8 +369,13 @@ def check(label, cond, detail=""):
     print(("OK  " if cond else "NG  ") + label + ("" if cond else f"  ({detail})"))
     ok = ok and cond
 
+def account_line():
+    """이 Pod가 쓰는 스택 계정 대장(/kube_share/passwd)에서 시험 계정 행을 찾는다."""
+    with open("/kube_share/passwd") as f:
+        return next((l for l in f if l.split(":", 1)[0] == name), None)
+
 def account_status():
-    return requests.get(f"{base}/accounts/users/{name}", timeout=10).status_code
+    return 200 if account_line() else 404
 
 def new_password():
     return base64.b64encode(os.urandom(12).hex().encode()).decode()
@@ -406,10 +389,10 @@ def wait(fn, times=24, gap=5):
         time.sleep(gap)
     return None
 
-try:  # 이전 실행에서 남은 것이 있으면 정리
-    requests.delete(f"{base}/accounts/users/{name}", timeout=30)
-except requests.exceptions.ReadTimeout:
-    pass
+if account_status() == 200:  # 이전 실행에서 남은 시험 계정은 회수 작업으로 먼저 정리
+    requests.post(f"{base}/operations/revoke", timeout=30, json={
+        "request_id": str(int(rid) - 1), "username": name, "node_name": node, "delete_account": True})
+    wait(lambda: account_status() == 404)
 
 # 1) 생성 작업. 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal까지 만든 뒤 설정
 #    조회에서 실패한다. 거기서 끝나지 않고 이번 작업이 만든 계정을 제어기가 되돌리는 것까지가 정상이다.
@@ -429,6 +412,10 @@ check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
 # 되돌리기는 노드를 모르면 보류한다(ACCOUNT_NODE_UNKNOWN). 이 시험은 노드가 정해지기 전 단계에서
 # 실패하므로 계정은 보류되어 남는 것이 정상이다 — baseline admin_be도 같은 상황에서 삭제하지 않고 알린다.
 check("되돌리기 보류 규칙대로 계정이 남음", account_status() == 200, account_status())
+line = account_line()
+uid = int(line.split(":")[2]) if line else None
+lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
+check(f"UID가 대역 {lo}~{hi} 안", uid is not None and lo <= uid <= hi, uid)
 
 # 2) 회수 작업. 위에서 남은 계정을 회수 작업으로 지운다. 보류 조건에 걸리지 않게 노드를 실어 보낸다.
 check("회수에 쓸 farm 노드를 찾음", node is not None, "노드 목록이 비어 있음")
@@ -439,11 +426,7 @@ check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)",
       wait(lambda: account_status() == 404) is True, account_status())
 
 if account_status() != 404:
-    # 시험 계정을 남긴 채 끝내지 않는다. 동기 경로는 노드를 몰라도 모든 farm 노드를 훑어 정리한다.
-    try:
-        requests.delete(f"{base}/accounts/users/{name}", timeout=60)
-    except requests.exceptions.ReadTimeout:
-        pass
+    print(f"    참고: 시험 계정 {name}이 계정 대장에 남음 — 다음 배포의 사전 정리에서 다시 회수한다")
 sys.exit(0 if ok else 1)
 PY
 

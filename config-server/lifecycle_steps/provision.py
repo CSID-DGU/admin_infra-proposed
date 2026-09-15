@@ -773,7 +773,7 @@ def build_pod_spec(
     pod_name: str,
     request_id=None
 ):
-    # create-pod 경로는 request_id로 진행 상황을 추적한다(한 사용자가 Pod를 여러 개
+    # 생성 작업은 request_id로 진행 상황을 추적한다(한 사용자가 Pod를 여러 개
     # 동시에 만들 수 있어 username만으로는 서로 다른 시도가 섞인다). migrate 경로는
     # 아직 request_id를 안 넘기므로 그때는 기존처럼 username을 키로 쓴다.
     status_key = request_id or username
@@ -805,7 +805,7 @@ def build_pod_spec(
     if passwd_rec is None:
         raise ValueError(
             f"user {username!r} not found in /etc/passwd — "
-            "PUT /accounts/users로 계정을 먼저 생성하세요"
+            "account를 담아 생성 작업(POST /operations/provision)을 등록하세요"
         )
     uid = passwd_rec["uid"]
     primary_gid = passwd_rec["gid"]
