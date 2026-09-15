@@ -149,6 +149,36 @@ def test_endpoint_probe_requires_ssh_banner(probe_env):
     assert probe_env["logs"][-1]["phase"] == Phase.SUCCESS
 
 
+def test_endpoint_probe_waits_for_nodeport_then_passes(probe_env, monkeypatch):
+    """Service를 만든 직후 거절되던 포트가 잠시 뒤 열리면 같은 시험 안에서 통과한다(작업 재시도 없음)."""
+    answers = iter([(False, "[Errno 111] Connection refused"), (False, "[Errno 111] Connection refused"),
+                    (True, "SSH-2.0-OpenSSH_8.9")])
+    monkeypatch.setattr(verify, "_tcp_check", lambda host, port, expect_banner=None: next(answers))
+    monkeypatch.setattr(verify.time, "sleep", lambda s: None)
+    verify.step_verify_endpoint(dict(CTX))
+    last = probe_env["logs"][-1]
+    assert last["phase"] == Phase.SUCCESS and '"tries": 3' in last["error_detail"]
+    assert [l["phase"] for l in probe_env["logs"]].count(Phase.FAIL) == 0
+
+
+def test_endpoint_probe_gives_up_after_wait(probe_env, monkeypatch):
+    clock = iter(range(0, 1000, 5))
+    monkeypatch.setattr(verify.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(verify.time, "sleep", lambda s: None)
+    monkeypatch.setattr(verify, "VERIFY_ENDPOINT_WAIT_SEC", 20)
+    with pytest.raises(StepFailed):
+        verify.step_verify_endpoint(dict(CTX))   # 대역에 없는 포트 → 계속 거절
+    assert probe_env["logs"][-1]["phase"] == Phase.FAIL
+
+
+def test_endpoint_probe_does_not_wait_when_connected_but_not_ssh(probe_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(verify, "_tcp_check", lambda host, port, expect_banner=None: calls.append(1) or (True, "HTTP/1.1 400"))
+    with pytest.raises(StepFailed):
+        verify.step_verify_endpoint(dict(CTX))
+    assert len(calls) == 1
+
+
 def test_probe_tool_error_records_unknown_and_raises(probe_env, monkeypatch):
     import subprocess
     def boom(pod, cmd):
