@@ -10,7 +10,6 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `request_models.py` | HTTP 요청 본문 모델(pydantic)과 검증 데코레이터이다. 경로 함수는 검증이 끝난 모델만 받고, 검증 실패는 한 가지 형식의 400으로 응답한다. Swagger 요청 스키마도 이 모델에서 만든다. | HTTP JSON 본문 | 검증된 모델 또는 400 `{error: INVALID_REQUEST, errors: [...]}` |
 | `utils.py` | `main.py`가 사용하는 Kubernetes, MySQL, Docker image, 계정 파일, NFS 디렉토리 보조 함수 모음이다. | 환경변수, Flask `current_app.config`, Kubernetes API, NFS 파일, Docker CLI | DB connection, Pod/Service 조작, 파일 읽기/쓰기, 이미지 저장/로드 metadata, PVC 디렉토리 권한 변경 |
 | `bg_img_redis.py` | 사용자 이미지 저장/로드 상태를 Redis에 기록하고 조회한다. | `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB`, username, 상태값 | Redis key `img:<username>`의 JSON metadata |
-| `test.py` | WAS/Prometheus 의존성을 mock 값으로 대체한 레거시/실험용 Flask 서버이다. | HTTP JSON 요청, Kubernetes API | ContainerSSH config JSON, PVC/계정 API 응답. 일부 helper 이름은 현재 `utils.py`와 다를 수 있어 실행 전 점검이 필요하다. |
 | `Dockerfile` | config-server 운영 이미지를 빌드한다. | 현재 디렉토리 소스, `requirements.txt` | Python 3.10 slim 기반 gunicorn 이미지 |
 | `requirements.txt` | Python 런타임 의존성 목록이다. | pip | Flask, Kubernetes client, PyMySQL, Redis, requests, flasgger, gunicorn 설치 |
 | `Makefile` | Helm 배포 shortcut을 둔 파일이다. | `make deploy`, Helm chart 경로 | config-server Helm upgrade/install 실행 |
@@ -65,17 +64,6 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `get_image_metadata` | 특정 사용자 이미지 metadata를 조회한다. | username | dict 또는 `None` |
 | `get_all_images` | `img:*` key 전체를 사용자명 기준 dict로 반환한다. | 없음 | `{username: metadata}` |
 | `delete_image_metadata` | 특정 사용자 이미지 metadata를 삭제한다. | username | Redis key 삭제 |
-
-## `test.py` 함수
-
-| 함수 | 역할 | 입력 | 출력/효과 |
-| --- | --- | --- | --- |
-| `health` | mock 서버 헬스체크이다. | 없음 | `"OK"` |
-| `config` | mock 사용자 정보로 ContainerSSH Kubernetes Pod config를 반환한다. | JSON `username` | ContainerSSH config JSON |
-| `report_background` | 세션 종료 후 background process 여부를 확인해 Pod 삭제 여부를 결정한다. | JSON `username`, `pod_name`, optional `has_background` | background/deleted JSON |
-| `create_or_resize_pvc`, `resize_pvc` | 단일 사용자 PVC를 생성/확장한다. | JSON `username`, `storage` | created/resized JSON |
-| `select_best_node_from_prometheus` | 하드코딩된 Prometheus URL로 최적 노드를 고르는 실험 함수이다. | node list | best node 또는 `None` |
-| `create_user`, `delete_user`, `add_user_groups` | 레거시 `/accounts` 계정 CRUD API이다. | JSON 또는 path username | passwd/group/shadow 파일 갱신 JSON |
 
 ## `main.py` 주요 함수 동작 상세
 
