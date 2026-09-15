@@ -11,7 +11,7 @@ from kubernetes import client
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
-from adapters.operation_log import Action, Phase, current_job_id, current_attempt, current_username
+from adapters.operation_log import Action, Phase, current_job_id, current_attempt
 from lifecycle_steps import verify
 
 class _MainProxy:
@@ -317,11 +317,9 @@ def run_job(kind, request_id, username, job_id=None):
     """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다. 실행하는 동안의 모든
     기록에는 작업 번호(job_id)가 붙는다."""
     token = current_job_id.set(job_id)
-    user_token = current_username.set(username)
     try:
         _run_job(kind, request_id, username, job_id)
     finally:
-        current_username.reset(user_token)
         current_job_id.reset(token)
 
 def _release_lease(job_id):

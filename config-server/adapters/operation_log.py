@@ -40,8 +40,6 @@ current_job_id = ContextVar("current_job_id", default=None)
 # 실행 중 단계의 시도 번호(v2.1). 재시도 엔진이 단계를 다시 돌릴 때 올려 두면, 단계 안의 모든
 # log_operation 호출이 attempt 인자 없이도 그 시도 번호로 기록된다.
 current_attempt = ContextVar("current_attempt", default=1)
-# 제어기가 실행 중인 작업의 사용자. 진행 상황 기록이 작업 이력에 사용자를 채우는 데 쓴다.
-current_username = ContextVar("current_username", default=None)
 
 
 class Action(str, Enum):
@@ -78,9 +76,10 @@ class Action(str, Enum):
     PROVISION = "PROVISION"
     REVOKE = "REVOKE"
     MIGRATE = "MIGRATE"
-    # 진행 상황 변화(이미지 다운로드 중 → 컨테이너 시작 중 등). 제어기가 작업을 실행하는 동안 단계가 바뀔 때마다
-    # 남긴다. resource_type이 진행 단계 이름, error_detail이 {"stage","message"}다.
-    PROGRESS = "PROGRESS"
+    # 컨테이너 준비 대기(WAIT_READY) 안의 세부 단계. Pod 이벤트로 판정하며 다른 단계와 같이 START/SUCCESS/FAIL로 남는다.
+    PULL_IMAGE = "PULL_IMAGE"            # 노드에 이미지를 받는 중 (이미 있으면 기록되지 않음)
+    START_CONTAINER = "START_CONTAINER"  # 이미지 준비 뒤 컨테이너 생성·시작·준비 확인
+    MOUNT_VOLUME = "MOUNT_VOLUME"        # 볼륨 마운트 재시도 중
 
 
 class Phase(str, Enum):
@@ -90,8 +89,6 @@ class Phase(str, Enum):
     RETRY = "RETRY"
     # 요청은 나갔으나 응답을 못 받아 실제로 실행됐는지 알 수 없음(timeout). FAIL과 구분한다 (v2.0)
     UNKNOWN = "UNKNOWN"
-    # 결과가 아니라 기록용 행(진행 상황 변화)
-    INFO = "INFO"
 
 
 def _lookup_elapsed_ms(conn, request_id, action, attempt):

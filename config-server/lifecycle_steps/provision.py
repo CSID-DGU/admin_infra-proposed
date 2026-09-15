@@ -698,6 +698,14 @@ def step_create_pod_k8s(ctx):
                   action=Action.CREATE_POD_K8S, phase=Phase.SUCCESS)
     _main.app.logger.info("[CREATE POD] pod creation request sent")
 
+# 준비 대기 안의 세부 단계. 진행 상황(Pod 이벤트) 단계 이름 → 작업 이력의 단계.
+WAIT_READY_SUBSTAGES = {
+    "pulling_image": Action.PULL_IMAGE,
+    "starting_container": Action.START_CONTAINER,
+    "mount_retrying": Action.MOUNT_VOLUME,
+}
+
+
 def step_wait_ready(ctx):
     request_id, username, pod_name = ctx["request_id"], ctx["username"], ctx["pod_name"]
     best_node, v1 = ctx["node"], ctx["v1"]
@@ -712,6 +720,15 @@ def step_wait_ready(ctx):
                   node_name=best_node, resource_type="pod",
                   action=Action.WAIT_READY, phase=Phase.START)
     _main.app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage=pulling_image 이미지 다운로드 중")
+    # 지금 열려 있는 세부 단계. 다음 세부 단계로 넘어가거나 준비가 끝나면 SUCCESS, 실패하면 FAIL로 닫는다.
+    sub_log = dict(request_id=request_id, username=username, pod_name=pod_name, node_name=best_node, resource_type="pod")
+    open_sub = [None]
+
+    def close_sub(phase, error_code=None):
+        if open_sub[0] is not None:
+            _main.log_operation(action=open_sub[0], phase=phase, error_code=error_code, **sub_log)
+            open_sub[0] = None
+
     try:
         failure_reason = None
         max_wait = _main.app.config["POD_READY_MAX_WAIT_SEC"]
@@ -720,6 +737,7 @@ def step_wait_ready(ctx):
             pod = v1.read_namespaced_pod(pod_name, ns)
             if _main.is_pod_ready(pod):
                 _main.app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
+                close_sub(Phase.SUCCESS)
                 break
             failure_reason = _main.get_pod_failure_reason(pod)
             if failure_reason:
@@ -731,6 +749,11 @@ def step_wait_ready(ctx):
             # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
             if i % 5 == 0:
                 progress = _main.get_pod_progress_stage(v1, ns, pod_name)
+                sub_action = WAIT_READY_SUBSTAGES.get(progress[0]) if progress else None
+                if sub_action is not None and sub_action != open_sub[0]:
+                    close_sub(Phase.SUCCESS)
+                    open_sub[0] = sub_action
+                    _main.log_operation(action=sub_action, phase=Phase.START, **sub_log)
                 if progress and progress[0] != last_progress_stage:
                     last_progress_stage, progress_message = progress
                     _main.set_pod_creation_status(request_id, last_progress_stage, progress_message)
@@ -741,6 +764,7 @@ def step_wait_ready(ctx):
             failure_reason = failure_reason or f"pod not ready within {max_wait}s"
 
         if failure_reason:
+            close_sub(Phase.FAIL, "POD_READY_TIMEOUT")
             _main.app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
             _main.set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
             rollback = _main._cleanup_create_failure(pod_name, v1)
@@ -758,6 +782,7 @@ def step_wait_ready(ctx):
     except _main.StepFailed:
         raise
     except client.exceptions.ApiException as e:
+        close_sub(Phase.FAIL, "POD_READY_CHECK_FAILED")
         _main.app.logger.exception("[CREATE POD] pod ready check failed")
         _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
         rollback = _main._cleanup_create_failure(pod_name, v1)
@@ -774,6 +799,7 @@ def step_wait_ready(ctx):
             **_main.k8s_error_fields(e),
         ), 500)
     except Exception as e:
+        close_sub(Phase.FAIL, "POD_READY_CHECK_FAILED")
         _main.app.logger.exception("[CREATE POD] pod ready check failed")
         _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
         rollback = _main._cleanup_create_failure(pod_name, v1)
