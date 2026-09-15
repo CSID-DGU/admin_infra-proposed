@@ -24,6 +24,8 @@ def probe_env(monkeypatch, logs):
     monkeypatch.setattr(main, "_get_farm_node_info",
                         lambda name: {"name": name, "host": "10.0.0.8", "port": 22})
     monkeypatch.setattr(verify, "log_operation", lambda **kw: logs.append(kw))
+    env["status"] = []
+    monkeypatch.setattr(main, "set_pod_creation_status", lambda *a, **k: env["status"].append(a))
     env["logs"] = logs
     return env
 
@@ -44,6 +46,42 @@ def test_uid_probe_fails_on_mismatch_with_evidence(probe_env):
         verify.step_verify_uid(dict(CTX))
     last = probe_env["logs"][-1]
     assert last["phase"] == Phase.FAIL and '"expected_uid": "50000"' in last["error_detail"]
+
+
+def test_uid_probe_reads_uid_from_passwd_when_account_was_reused(probe_env, monkeypatch):
+    """같은 사용자의 두 번째 신청은 계정 단계가 없어 문맥에 uid가 없다(2026-09-15 full 스택 KeyError)."""
+    monkeypatch.setattr(main, "read_passwd_lines",
+                        lambda: ["exp-np-001:x:50007:50007:t:/home/exp-np-001:/bin/bash"])
+    probe_env["sh"]["id -u"] = ("50007", 0)
+    ctx = {k: v for k, v in CTX.items() if k != "uid"}
+    verify.step_verify_uid(ctx)
+    last = probe_env["logs"][-1]
+    assert last["phase"] == Phase.SUCCESS and '"expected_uid": "50007"' in last["error_detail"]
+
+
+def test_uid_probe_fails_with_evidence_when_account_missing(probe_env, monkeypatch):
+    monkeypatch.setattr(main, "read_passwd_lines", lambda: [])
+    ctx = {k: v for k, v in CTX.items() if k != "uid"}
+    with pytest.raises(StepFailed) as ei:
+        verify.step_verify_uid(ctx)
+    assert "VERIFY_TOOL_FAILED" not in str(ei.value.body)
+    assert "계정 대장" in probe_env["logs"][-1]["error_detail"]
+
+
+def test_krb5_probe_uses_passwd_uid_when_account_was_reused(probe_env, monkeypatch):
+    monkeypatch.setattr(main, "read_passwd_lines",
+                        lambda: ["exp-np-001:x:50007:50007:t:/home/exp-np-001:/bin/bash"])
+    probe_env["sh"]["/run/user/50007/"] = ("", 0)
+    ctx = {k: v for k, v in CTX.items() if k != "uid"}
+    verify.step_verify_krb5(ctx)
+    assert probe_env["logs"][-1]["phase"] == Phase.SUCCESS
+
+
+def test_access_probe_records_progress_for_screen(probe_env):
+    probe_env["sh"]["id -u"] = ("50000", 0)
+    verify.step_verify_uid(dict(CTX))
+    stage, message = probe_env["status"][-1][1], probe_env["status"][-1][2]
+    assert stage == "verifying" and "접근 확인 중: 계정 권한" in message and "시도 1/" in message
 
 
 def test_home_io_fails_when_mount_is_local_disk(probe_env):

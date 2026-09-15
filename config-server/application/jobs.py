@@ -232,6 +232,13 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             "pod_name": ctx.get("pod_name"), "node": ctx.get("node"),
             "ports": ctx.get("allocated_ports") or [],
         })
+        if kind == "provision" and _main.VERIFY_MODE == "full":
+            # 진행 상황은 컨테이너 생성 직후 "컨테이너 생성 완료"로 한 번 기록되고 접근 시험이 그 뒤에 돈다.
+            # 시험까지 끝났다는 것을 화면에 남긴다. 표시용이라 실패해도 결과 기록은 계속한다.
+            try:
+                _main.set_pod_creation_status(request_id, "ready", "컨테이너 생성·접근 확인 완료")
+            except Exception:
+                _main.app.logger.warning("[JOB] pod status update failed", exc_info=True)
     _record_job_result(kind, request_id, username, {
         "phase": phase.value, "error_code": error_code, "error_detail": error_detail,
         "pod_name": ctx.get("pod_name"), "node_name": ctx.get("node") or ctx.get("pod_node_name"),
