@@ -2189,6 +2189,112 @@ def get_job_result(kind, request_id):
                     "result": load_job_result(action.value, request_id)}), 200
 
 
+# 한 신청에서 돌려줄 최근 작업 수. 재승인·재회수가 반복돼도 응답이 커지지 않게 한다.
+JOB_STEPS_MAX_JOBS = 5
+# 단계 기록 요약에 내보내도 되는 근거 항목. 접근 시험 근거에는 노드 내부 주소, NAS 마운트 경로,
+# 명령 출력이 섞여 있어 그대로 내보내지 않는다(이 기록은 관리자 화면에 보인다).
+_STEP_SUMMARY_KEYS = ("expected_uid", "requested", "visible", "node", "placed_in_candidates", "roundtrip",
+                      "owner_uid", "connected", "reason", "likely_cause", "step", "compensation",
+                      "interrupted_after", "unknown", "degraded", "rc")
+_INTERNAL_ADDRESS = re.compile(r"\d{1,3}(\.\d{1,3}){3}|:/")
+_TERMINAL_PHASES = (Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value)
+
+
+def _step_summary(detail):
+    try:
+        data = json.loads(detail) if detail else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    summary = {}
+    for key in _STEP_SUMMARY_KEYS:
+        value = data.get(key)
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        if isinstance(value, str):
+            if _INTERNAL_ADDRESS.search(value):
+                continue
+            value = value[:120]
+        summary[key] = value
+    return summary or None
+
+
+def _utc_iso(ts):
+    # operation_log.created_at은 UTC로 저장된다.
+    return ts.isoformat() + "Z" if isinstance(ts, datetime) else (str(ts) if ts is not None else None)
+
+
+@app.route("/operations/<kind>/<request_id>/steps", methods=["GET"])
+def get_job_steps(kind, request_id):
+    """
+    작업 단계 기록 조회 (v2.0)
+
+    한 신청의 생성(provision) 또는 회수(revoke) 작업을 최근 순으로 최대 5개, 작업마다 단계별 결과를
+    시각순으로 돌려준다. 단계는 끝난 행(SUCCESS/FAIL/RETRY/UNKNOWN)만 담는다. 접근 시험 근거는 화면에
+    보여도 되는 항목만 summary로 요약한다(내부 주소·마운트 경로·명령 출력 제외). 관리자 인증은 이 API를
+    부르는 admin_be가 맡는다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke]}
+      - {in: path, name: request_id, required: true, type: string}
+    responses:
+      200: {description: 조회 성공 — 작업이 없으면 jobs가 빈 목록}
+      404: {description: 알 수 없는 작업 종류}
+    """
+    action = JOB_ACTIONS.get(kind)
+    if action is None:
+        return jsonify({"error": f"unknown job kind {kind!r}"}), 404
+    conn = get_log_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # 작업 시작 행은 자기 id가 작업 번호다.
+            cur.execute(
+                "SELECT id FROM operation_log WHERE request_id=%s AND action=%s AND phase=%s AND job_id=id "
+                "ORDER BY id DESC LIMIT %s",
+                (str(request_id), action.value, Phase.START.value, JOB_STEPS_MAX_JOBS),
+            )
+            job_ids = [r[0] for r in cur.fetchall()]
+            rows = []
+            if job_ids:
+                marks = ",".join(["%s"] * len(job_ids))
+                cur.execute(
+                    "SELECT job_id, action, phase, attempt, resource_type, error_code, error_detail, created_at "
+                    f"FROM operation_log WHERE job_id IN ({marks}) ORDER BY id",
+                    tuple(job_ids),
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    jobs = {job_id: {"job_id": job_id, "started_at": None, "finished_at": None, "phase": Phase.START.value,
+                     "error_code": None, "steps": []} for job_id in job_ids}
+    probe_actions = (Action.VERIFY_ACCESS.value, Action.VERIFY_REVOKED.value)
+    for job_id, act, phase, attempt, resource_type, error_code, detail, created_at in rows:
+        job = jobs.get(job_id)
+        if job is None:
+            continue
+        at = _utc_iso(created_at)
+        if act == action.value and phase == Phase.START.value:
+            job["started_at"] = at
+            continue
+        if act != action.value and phase == Phase.START.value:
+            continue  # 단계 시작 행은 끝 행과 짝이라 끝 행만 담는다
+        if act == action.value and phase in _TERMINAL_PHASES:
+            job.update(finished_at=at, phase=phase, error_code=error_code)
+        job["steps"].append({
+            "at": at, "action": act, "phase": phase, "attempt": attempt,
+            "probe": resource_type if act in probe_actions else None,
+            # 재시도 행의 resource_type은 다시 돌린 단계 이름이다
+            "step": resource_type if phase == Phase.RETRY.value else None,
+            "error_code": error_code, "summary": _step_summary(detail),
+        })
+    return jsonify({"request_id": str(request_id), "kind": kind,
+                    "jobs": [jobs[job_id] for job_id in job_ids]}), 200
+
+
 
 
 
