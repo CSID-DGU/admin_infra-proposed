@@ -77,6 +77,13 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   value: "{{ .Values.farm.adSsh.keyPath }}"
 - name: FARM_AD_DC_NODES_JSON
   value: '{{ .Values.farm.adSsh.nodes | toJson }}'
+# admin_be와 공유하는 내부 API 토큰. Secret이 없으면 비어 검사가 꺼진다.
+- name: CONFIG_API_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: "{{ .Values.apiToken.secretName }}"
+      key: token
+      optional: true
 {{- end -}}
 
 {{- define "containerssh-config-server.volumeMounts" -}}
