@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # 실험 스택을 내린다.
 #
-#   stack-down.sh <noprobe|full>
+#   stack-down.sh <baseline|noprobe|full>
 #
 # 네임스페이스를 지우기 전에 이 스택이 만든 테스트 계정(접두어로 구분)을 config-server API로 먼저 지운다.
 # AD principal·NAS 홈·farm keytab은 운영과 공유하는 자원이라 네임스페이스를 지워도 사라지지 않는다.
 set -euo pipefail
 
-STACK=${1:?"스택 이름(noprobe|full)"}
+STACK=${1:?"스택 이름(baseline|noprobe|full)"}
 [ -r /etc/kubernetes/ci-deployer.conf ] && export KUBECONFIG=/etc/kubernetes/ci-deployer.conf
 case "$STACK" in
+  baseline) PREFIX=exp-bl- ;;
   noprobe) PREFIX=exp-np- ;;
   full)    PREFIX=exp-fu- ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;

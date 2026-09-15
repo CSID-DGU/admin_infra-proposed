@@ -80,11 +80,11 @@ UID_MAX = int(os.getenv("UID_MAX", "0")) or None
 # 사용자 Pod NodePort 대역 — 클러스터 전체에서 공유되므로 스택끼리 같은 순간 같은 포트를 고르지 않게 나눈다.
 NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
-# 제안 시스템 조건(noprobe | full). 실제 접근 시험(probe)을 수행할지를 이 값 하나로 가른다.
-# 이름은 RUN_MODE 가 정본이고 VERIFY_MODE 는 기존 배포 호환용 별칭이다. 허용 밖의 값(대문자
-# FULL, 오타)이 조용히 noprobe 로 돌면 ablation 두 팔이 같아져 차이가 0으로 나오므로,
-# 기동 시점에 즉시 죽는다. baseline 실행 모드는 실행 구조 결정(A1) 뒤에 이 목록에 추가한다.
-_ALLOWED_RUN_MODES = ("noprobe", "full")
+# 실행 방식(baseline | noprobe | full). 세 방식은 같은 제어기·같은 단계 함수를 쓰고 이 값 하나로만 갈린다.
+# baseline: 재시도·결과 확인·이어하기 없이 운영과 같은 뒷정리 후 종료 / noprobe: 복구 기능 /
+# full: noprobe + 실제 접근 시험. 이름은 RUN_MODE 가 정본이고 VERIFY_MODE 는 기존 배포 호환용 별칭이다.
+# 허용 밖의 값(대문자 FULL, 오타)이 조용히 다른 방식으로 돌면 비교 결과가 틀어지므로 기동 시점에 즉시 죽는다.
+_ALLOWED_RUN_MODES = ("baseline", "noprobe", "full")
 
 
 def _resolve_run_mode(env=None):

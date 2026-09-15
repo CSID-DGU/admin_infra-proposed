@@ -1,31 +1,38 @@
 # 실험 스택 설치
 
-제안 시스템을 `ailab-noprobe`, `ailab-full` 네임스페이스에 띄우는 스크립트다. 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다.
+제안 시스템을 `ailab-baseline`, `ailab-noprobe`, `ailab-full` 네임스페이스에 띄우는 스크립트다. 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다.
 
 | 입력 | 값 |
 | --- | --- |
-| stack | `noprobe` 또는 `full` |
+| stack | `baseline`, `noprobe`, `full` |
 | ref | 이 레포의 브랜치·태그·커밋 |
+| fe_ref / be_ref | admin_fe / admin_be의 브랜치·태그·커밋 (be 기본 `develop`) |
 | action | `up`(띄우기, 이미 있으면 재배포) / `down`(테스트 계정 정리 후 내리기) |
 
 ```bash
-gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=noprobe -f ref=develop
+gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=baseline -f ref=develop
 ```
 
-두 스택에 같은 코드를 올릴 때는 `ref`에 같은 커밋 SHA를 준다. 두 스택의 차이는 `VERIFY_MODE` 하나여야 한다.
+세 스택에는 같은 커밋(`ref`, `fe_ref`, `be_ref` 모두)을 올린다. 세 스택의 차이는 config-server의 실행 방식(`VERIFY_MODE`) 하나여야 한다.
 
 ## 스택별 할당 값
 
-| 항목 | `ailab-noprobe` | `ailab-full` |
-| --- | --- | --- |
-| config-server 릴리스 | `config-server-noprobe` | `config-server-full` |
-| config-server nodePort | 30182 | 30282 |
-| 화면 주소 | `http://noprobe.210.94.179.18.nip.io:30081` | `http://full.210.94.179.18.nip.io:30081` |
-| `VERIFY_MODE` | `noprobe` | `full` |
-| UID/GID 대역 | 50000~54999 | 55000~59999 |
-| 사용자 Pod NodePort 대역 | 32000~32249 | 32250~32499 |
-| 테스트 계정 접두어 | `exp-np-` | `exp-fu-` |
-| 계정 대장 경로 | 운영 `kubeSharePath`/`exp-noprobe` | 운영 `kubeSharePath`/`exp-full` |
+| 항목 | `ailab-baseline` | `ailab-noprobe` | `ailab-full` |
+| --- | --- | --- | --- |
+| config-server 릴리스 | `config-server-baseline` | `config-server-noprobe` | `config-server-full` |
+| config-server nodePort | 30382 | 30182 | 30282 |
+| 화면 주소 | `http://baseline.210.94.179.18.nip.io:30081` | `http://noprobe.210.94.179.18.nip.io:30081` | `http://full.210.94.179.18.nip.io:30081` |
+| 실행 방식(`VERIFY_MODE`) | `baseline` | `noprobe` | `full` |
+| UID/GID 대역 | 60000~64999 | 50000~54999 | 55000~59999 |
+| 사용자 Pod NodePort 대역 | 32500~32749 | 32000~32249 | 32250~32499 |
+| 테스트 계정 접두어 | `exp-bl-` | `exp-np-` | `exp-fu-` |
+| 계정 대장 경로 | 운영 `kubeSharePath`/`exp-baseline` | 운영 `kubeSharePath`/`exp-noprobe` | 운영 `kubeSharePath`/`exp-full` |
+
+| 실행 방식 | 단계 실패 | 결과 불명 | 제어기 재시작 | 접근 시험 |
+| --- | --- | --- | --- | --- |
+| `baseline` | 재시도 없이 운영과 같은 뒷정리(이번 작업이 만든 계정 되돌리기) 후 FAIL | 조회 없이 FAIL | 이어하지 않고 노드 미상으로 뒷정리 후 FAIL(`INTERRUPTED`) | 없음 |
+| `noprobe` | 재시도, 한도 넘으면 DEGRADED | 먼저 실제 상태 조회 | 멈춘 단계부터 이어서 | 없음 |
+| `full` | noprobe와 같음 | noprobe와 같음 | noprobe와 같음 | 있음 |
 
 운영은 UID 20000대, NodePort 30000~32767 전체, config-server 30082, admin_be 30083을 쓴다.
 
@@ -42,7 +49,7 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=nopr
 | 7 | 계정 대장 경로 생성 |
 | 8 | config-server 설치(`controller.enabled=true`로 v2.0 제어기도 같이 설치). NFS·NAS·Kerberos·farm 설정은 운영 릴리스 값을 그대로 쓰고 스택별 값만 덮어씀 |
 | 9 | 프론트엔드 설치. `nginx.conf`의 `/api/`·`/pod-status/` 대상만 스택으로 바꿔 빌드한 이미지 |
-| 9-1 | admin_be 설치. 운영 이미지를 digest로 고정하고 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스와 DNS 외에는 나가는 연결을 네트워크 정책으로 막음 |
+| 9-1 | admin_be 설치. `be_ref`로 빌드한 이미지에 DB·Redis·config-server 주소, Slack·메일, JWT 서명키를 덮어씀. 같은 네임스페이스·DNS·메일·쿠버네티스 API 외에는 나가는 연결을 네트워크 정책으로 막음 |
 | 10 | 테스트 계정 `<접두어>000`을 만들고 지워서 UID 대역, 작업 이력, 운영 대장에 흔적이 없는지 확인(동기 API) |
 | 11 | 테스트 계정 `<접두어>001`로 v2.0 비동기 작업(`/operations/provision`·`/operations/revoke`)을 등록하고, 제어기가 실제로 처리해 계정을 만들고 지우는지 확인 |
 
@@ -60,7 +67,7 @@ admin_infra는 공개 레포라 Actions 로그를 누구나 볼 수 있다. 스�
 
 방화벽이 새 포트를 막고 있어, 화면은 운영 프론트엔드가 쓰는 30081에 호스트 이름 규칙으로 연다. 위 표의 주소로 접속한다.
 
-가입은 운영과 같이 메일 인증을 거친다. **우분투 사용자명은 반드시 스택 접두어(`exp-np-`, `exp-fu-`)로 시작해야 한다.** AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이름으로 구분하기 때문에, config-server가 접두어 없는 이름을 거절한다. 스택 admin_be는 운영 메일 설정으로 인증 코드를 보내고, Slack 알림은 보내지 않는다. 가입한 계정을 관리자로 지정하려면 배포 서버에서 실행한다(이메일이 공개 로그에 남지 않도록 워크플로로 돌리지 않는다).
+가입은 운영과 같이 메일 인증을 거친다. **우분투 사용자명은 반드시 스택 접두어(`exp-bl-`, `exp-np-`, `exp-fu-`)로 시작해야 한다.** AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이름으로 구분하기 때문에, config-server가 접두어 없는 이름을 거절한다. 스택 admin_be는 운영 메일 설정으로 인증 코드를 보내고, Slack 알림은 보내지 않는다. 가입한 계정을 관리자로 지정하려면 배포 서버에서 실행한다(이메일이 공개 로그에 남지 않도록 워크플로로 돌리지 않는다).
 
 ```bash
 bash ops/proposed-stack/make-admin.sh noprobe <가입한 이메일>
@@ -78,10 +85,10 @@ kubectl -n ailab-noprobe get pods -o wide
 
 설치 때마다 운영 admin DB에서 신청 화면에 필요한 기준 데이터만 복사한다: 자원 그룹(`resource_groups`), 노드(`nodes`), GPU(`gpus`), 이미지(`container_image`, `resource_group_images`), 메일 문구(`message_templates`). 사용자·신청·그룹은 복사하지 않는다. 운영 DB는 읽기만 하며, 재실행하면 운영 값으로 갱신된다.
 
-## 스택 전용 admin_be (브랜치 빌드)
+## 스택 admin_be (브랜치 빌드)
 
-제안 시스템 v2.0은 admin_be가 작업 등록 경로(`POST /operations/provision`·`revoke`)를 부르도록 바뀌어야 한다. 이 변경을 운영에 넣으면 비교 기준(Operational Baseline)이 깨지므로, admin_be 브랜치를 병합하지 않은 채로 스택에만 올린다.
+admin_be는 세 스택 모두 작업 등록 인터페이스(`POST /operations/provision`·`revoke`, `GET /operations/{kind}/{신청번호}`)만 쓴다. baseline도 같은 be를 쓰고, 방식 차이는 config-server 제어기에서만 난다(9/14 결정). 옛 동기 경로는 admin_be `legacy-sync` 태그에 남아 있다.
 
-admin_infra의 "Deploy Proposed Stack" 워크플로에서 `be_ref`에 admin_be의 브랜치·태그·커밋을 주면, 그 코드로 `admin-prod-exp:<sha>` 이미지를 빌드해 스택에 올린다. 승인까지 제안 시스템 실행 구조(작업 등록 → 제어기)로 돌리려면 `be_async`도 켠다. 기본은 꺼짐인데, `Operational Baseline`을 이 스택 admin_be의 동기 승인 경로로 측정하기 때문이다. 비우면 운영 admin_be 이미지를 digest로 고정해 그대로 쓴다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 아무리 올려도 운영에는 닿지 않는다.
+워크플로의 `be_ref`(기본 `develop`)로 `admin-prod-exp:<sha>` 이미지를 빌드해 올린다. 운영 admin_be 이미지는 이 인터페이스를 모르므로 쓰지 않는다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 올려도 운영에는 닿지 않는다.
 
 스택 전용 이미지는 설정 파일을 굽지 않는다. 설정은 운영 `admin-prod-config` Secret 복사본을 `/app/config`에 마운트해서 받고, 스택 자원을 가리키는 값만 `SPRING_APPLICATION_JSON`으로 덮어쓴다.

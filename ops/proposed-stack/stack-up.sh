@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
+# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
+# 세 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE) 하나만 다르다.
 #
-#   stack-up.sh <noprobe|full> <config-server 이미지(저장소:태그)> [프론트엔드 이미지] [admin_be 이미지] [be_async]
+#   stack-up.sh <baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
 #
 # admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
 # 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
 set -euo pipefail
 
-STACK=${1:?"스택 이름(noprobe|full)"}
+STACK=${1:?"스택 이름(baseline|noprobe|full)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
 FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
-# 비우면 운영 admin_be 이미지를 그대로 쓴다. 값을 주면 그 이미지로 올린다 — admin_be 브랜치에서
-# 빌드한 스택 전용 이미지를 올릴 때 쓴다(운영 admin_be 배포는 main push에만 걸려 있어 그대로 남는다).
-BE_IMAGE=${4:-}
-# "true"면 스택 admin_be의 승인을 제안 시스템 실행 구조(작업 등록 → 제어기)로 돌린다. 기본은 꺼짐이다 —
-# Operational Baseline은 스택 admin_be의 동기 승인 경로로 측정하므로, 켜 두면 그 조건이 깨진다.
-BE_ASYNC=${5:-}
+# admin_be 브랜치에서 빌드한 스택 전용 이미지. 운영 admin_be 이미지는 작업 등록 인터페이스
+# (/operations/*)를 모르므로 쓰지 않는다 — 비우면 틀린 조건으로 뜨지 않도록 중단한다.
+BE_IMAGE=${4:?"admin_be 이미지(저장소:태그)"}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 if [ -r /etc/kubernetes/ci-deployer.conf ]; then
@@ -31,6 +29,7 @@ PROD_DB_POD=my-mysql-0
 # 할당 값. 운영(UID 20000대, NodePort 30000~32767 전체, config-server 30082, admin_be 30083)과
 # 겹치지 않게 잡았다. 바꿀 때는 docs/환경 구축 가이드의 표도 같이 고친다.
 case "$STACK" in
+  baseline) UID_MIN=60000; UID_MAX=64999; NP_MIN=32500; NP_MAX=32749; CONFIG_NODEPORT=30382; PREFIX=exp-bl- ;;
   noprobe) UID_MIN=50000; UID_MAX=54999; NP_MIN=32000; NP_MAX=32249; CONFIG_NODEPORT=30182; PREFIX=exp-np- ;;
   full)    UID_MIN=55000; UID_MAX=59999; NP_MIN=32250; NP_MAX=32499; CONFIG_NODEPORT=30282; PREFIX=exp-fu- ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
@@ -159,15 +158,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --wait --timeout 10m
 
 step "admin_be"
-if [ -n "$BE_IMAGE" ]; then
-  ADMIN_IMAGE=$BE_IMAGE
-else
-  # 운영과 같은 것을 돌린다는 근거가 태그가 아니라 digest여야 해서, 돌고 있는 운영 Pod에서 읽는다.
-  ADMIN_IMAGE=$(kubectl -n "$PROD_BE_NS" get pod -l app=admin-prod --field-selector=status.phase=Running \
-    -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
-  ADMIN_IMAGE=${ADMIN_IMAGE#docker-pullable://}
-  [ -n "$ADMIN_IMAGE" ] || { echo "운영 admin_be 이미지를 찾지 못함"; exit 1; }
-fi
+ADMIN_IMAGE=$BE_IMAGE
 # 운영 admin_be는 설정 파일을 이미지가 아니라 admin-prod-config Secret으로 받는다. 같은 파일을 복사해
 # 같은 위치에 넣고, 운영 자원을 가리키는 값만 아래 SPRING_APPLICATION_JSON으로 덮어쓴다.
 kubectl -n "$PROD_BE_NS" get secret admin-prod-config >/dev/null 2>&1 || { echo "운영 admin-prod-config Secret이 없음"; exit 1; }
@@ -180,15 +171,9 @@ PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpat
 # 메일(가입 인증 코드, 만료 안내)은 운영 설정 그대로 보낸다. 서명키는 새로 줘서 운영에서 발급한 토큰이
 # 여기서 통하지 않게 한다.
 SINK=http://127.0.0.1:9/
-# 제안 시스템 실행 구조(승인 API는 작업 등록만 하고 제어기가 실행)는 스택 전용 admin_be 이미지를 올리면서
-# be_async를 켰을 때만 쓴다. 기본이 꺼짐이어야 baseline을 이 스택의 admin_be로 측정할 수 있다.
-PROPOSED_JSON=""
-if [ -n "$BE_IMAGE" ] && [ "$BE_ASYNC" = "true" ]; then
-  PROPOSED_JSON=',"proposed":{"async-approval":{"enabled":true}}'
-fi
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}$PROPOSED_JSON}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
