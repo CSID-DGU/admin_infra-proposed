@@ -15,6 +15,7 @@
 import json
 import os
 import socket
+import time
 
 from flask import current_app as app
 from kubernetes import client
@@ -39,6 +40,10 @@ VERIFY_EXEC_TIMEOUT_SEC = float(os.getenv("VERIFY_EXEC_TIMEOUT_SEC", "20"))
 VERIFY_TCP_TIMEOUT_SEC = float(os.getenv("VERIFY_TCP_TIMEOUT_SEC", "5"))
 # 생성 직후 kinit 타이머·NFS 전파 지연이 있어 일반 단계(3회)보다 여유 있게 재시도한다.
 VERIFY_MAX_ATTEMPTS = int(os.getenv("VERIFY_MAX_ATTEMPTS", "5"))
+# 접속 포트(NodePort Service)는 만든 직후 노드에 규칙이 반영되기까지 1~2초 걸려 그 사이 접속이 거절된다.
+# 거절·무응답일 때만 이 시간 안에서 다시 붙어 보고, 붙었는데 SSH가 아니면 곧바로 실패로 본다.
+VERIFY_ENDPOINT_WAIT_SEC = float(os.getenv("VERIFY_ENDPOINT_WAIT_SEC", "20"))
+VERIFY_ENDPOINT_INTERVAL_SEC = 1.0
 
 # 화면의 "(현재 단계: …)"에 보일 생성 접근 시험 이름
 PROBE_LABELS = {"uid": "계정 권한", "krb5_ticket": "인증 티켓", "home_io": "홈 읽기·쓰기",
@@ -223,9 +228,16 @@ def step_verify_endpoint(ctx):
                      if p.get("usage_purpose") == "ssh"]
         if not ssh_ports:
             return False, {"scope": "tcp", "reason": "ssh 포트 할당 없음"}
-        ok, banner = _tcp_check(node["host"], ssh_ports[0], expect_banner=True)
+        deadline = time.monotonic() + VERIFY_ENDPOINT_WAIT_SEC
+        tries = 0
+        while True:
+            tries += 1
+            ok, banner = _tcp_check(node["host"], ssh_ports[0], expect_banner=True)
+            if (ok and banner) or time.monotonic() >= deadline:
+                break
+            time.sleep(VERIFY_ENDPOINT_INTERVAL_SEC)
         return (ok and banner.startswith("SSH-")), {
-            "scope": f"tcp {node['host']}:{ssh_ports[0]}", "connected": ok, "banner": banner[:40]}
+            "scope": f"tcp {node['host']}:{ssh_ports[0]}", "connected": ok, "banner": banner[:40], "tries": tries}
     _run_probe(ctx, Action.VERIFY_ACCESS, "endpoint", check)
 
 
