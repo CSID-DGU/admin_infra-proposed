@@ -518,6 +518,7 @@ def _migrate_internal(data):
     username = data.get("username")
     nodes = data.get("nodes")  # resource group에 속한 node_id 목록
     min_ratio = data.get("min_improvement_ratio", 0.2)
+    force = bool(data.get("force"))
 
     ns = app.config["NAMESPACE"]
 
@@ -562,8 +563,8 @@ def _migrate_internal(data):
 
     best_node, best_score = min(scores.items(), key=lambda x: x[1])
 
-    # 3. 이전(migrate) 기준 판단
-    if best_score > current_score * (1 - min_ratio):
+    # 3. 이전(migrate) 기준 판단 — 관리자가 강제 이전을 고르면 개선 비율을 보지 않는다.
+    if not force and best_score > current_score * (1 - min_ratio):
         return jsonify({
             "status": "skipped",
             "reason": "no_significant_improvement",
