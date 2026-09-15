@@ -127,7 +127,7 @@ class MigrateRequest(RequestBody):
     username: str = Field(min_length=1, examples=["exp-np-001"])
     nodes: List[str] = Field(min_length=1, description="후보 노드 목록(현재 노드 포함)", examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
-    force: Optional[bool] = None
+    force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
 
 
 class AddGroupRequest(RequestBody):

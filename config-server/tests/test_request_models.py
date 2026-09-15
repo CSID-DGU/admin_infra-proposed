@@ -124,3 +124,14 @@ def test_apispec_serves_model_definitions(client):
     spec = r.get_json()
     assert "ProvisionRequest" in spec["definitions"] and "CreatePodRequest" not in spec["definitions"]
     assert "/create-pod" not in spec["paths"] and "/operations/provision" in spec["paths"]
+
+
+def test_migrate_rejects_negative_ratio_and_accepts_force():
+    import pydantic
+    try:
+        rm.MigrateRequest(username="u", nodes=["farm1"], min_improvement_ratio=-1000)
+        raise AssertionError("음수 비율이 통과함")
+    except pydantic.ValidationError:
+        pass
+    dumped = rm.MigrateRequest(username="u", nodes=["farm1"], force=True, pod_name="p", request_id=3).model_dump(exclude_none=True)
+    assert dumped == {"username": "u", "nodes": ["farm1"], "force": True}
