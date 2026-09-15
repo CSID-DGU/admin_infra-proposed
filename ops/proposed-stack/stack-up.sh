@@ -53,11 +53,47 @@ running_pod() {
 }
 getpw() { kubectl -n "$NS" get secret stack-db -o jsonpath="{.data.$1}" | base64 -d; }
 
+# 운영 계정 대장(NAS의 kubeSharePath)은 예전엔 실행 중인 운영 config-server Pod 안에서 읽었다. 운영을 내려도
+# 배포가 돌도록, 스택 네임스페이스에 그 경로만 붙인 임시 도우미 Pod를 띄워 읽고 끝나면 지운다.
+LEDGER_POD=ledger-helper
+ledger_cleanup() { kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
+start_ledger_helper() {  # $1: NFS 서버, $2: 계정 대장 경로
+  kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+  # NAS 마운트가 안 되는 노드가 있어, 이 스택 config-server가 이미 떠 있으면 같은 노드에 붙인다.
+  local node pin=""
+  node=$(kubectl -n "$NS" get pod -l "app=containerssh-config-server,!job-name" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+  [ -n "$node" ] && pin="  nodeName: $node"
+  cat <<YAML | kubectl -n "$NS" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $LEDGER_POD
+  labels: {app: ledger-helper}
+spec:
+$pin
+  restartPolicy: Never
+  containers:
+    - name: helper
+      image: $IMAGE
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "1800"]
+      volumeMounts: [{name: kube-share, mountPath: /kube_share}]
+  volumes:
+    - name: kube-share
+      nfs: {server: "$1", path: "$2"}
+YAML
+  kubectl -n "$NS" wait --for=condition=Ready pod/"$LEDGER_POD" --timeout=5m >/dev/null
+}
+ledger() { kubectl -n "$NS" exec "$LEDGER_POD" -- "$@"; }
+BASE=$(mktemp); trap 'rm -f "$BASE"; ledger_cleanup' EXIT
+
 step "사전 확인"
-PROD_POD=$(running_pod "$PROD_NS" app=containerssh-config-server)
-[ -n "$PROD_POD" ] || { echo "운영 config-server Pod를 찾지 못함"; exit 1; }
-USED=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
-[ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
+# NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 그대로 쓴다. 값은 릴리스에 남아 있어 운영 Pod가 없어도 읽힌다.
+helm -n "$PROD_NS" get values "$PROD_RELEASE" -o yaml > "$BASE"
+KUBE_SHARE=$(sed -n 's/^[[:space:]]*kubeSharePath:[[:space:]]*//p' "$BASE" | head -1 | tr -d "\"'")
+NFS_SERVER=$(awk '/^nfs:/{f=1; next} f && /^[^[:space:]]/{f=0} f && /^[[:space:]]+server:/{sub(/^[[:space:]]+server:[[:space:]]*/, ""); gsub(/["\047]/, ""); print; exit}' "$BASE")
+[ -n "$KUBE_SHARE" ] || { echo "운영 kubeSharePath를 찾지 못함"; exit 1; }
+[ -n "$NFS_SERVER" ] || { echo "운영 nfs.server를 찾지 못함"; exit 1; }
 for PORT in "$CONFIG_NODEPORT"; do
   TAKEN=$(kubectl get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{range .spec.ports[*]}{.nodePort}{" "}{end}{"\n"}{end}' \
     | awk -v ns="$NS" -v p="$PORT" '$1 != ns { for (i = 2; i <= NF; i++) if ($i == p) c++ } END { print c+0 }')
@@ -66,11 +102,21 @@ done
 HOST_TAKEN=$(kubectl get ing -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{range .spec.rules[*]}{.host}{" "}{end}{"\n"}{end}' \
   | awk -v ns="$NS" -v h="$FE_HOST" '$1 != ns { for (i = 2; i <= NF; i++) if ($i == h) c++ } END { print c+0 }')
 [ "$HOST_TAKEN" = 0 ] || { echo "ingress 호스트 $FE_HOST를 다른 네임스페이스가 쓰고 있음"; exit 1; }
-echo "UID $UID_MIN~$UID_MAX 비어 있음, config-server nodePort $CONFIG_NODEPORT 사용 가능, 화면 호스트 $FE_HOST 사용 가능"
+echo "config-server nodePort $CONFIG_NODEPORT 사용 가능, 화면 호스트 $FE_HOST 사용 가능"
 
 step "네임스페이스 $NS"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace "$NS" ailab.dgu/proposed-stack="$STACK" --overwrite >/dev/null
+
+step "계정 대장 확인 (임시 도우미 Pod)"
+start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
+USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
+[ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
+# config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
+# 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
+# config-server가 처음 계정을 만들 때 기본 파일로 채운다.
+ledger mkdir -p "/kube_share/exp-$STACK"
+echo "UID $UID_MIN~$UID_MAX 비어 있음, 스택 계정 대장 /kube_share/exp-$STACK"
 
 step "SSH 키 복사 ($PROD_NS → $NS)"
 for s in nas-ssh-key farm-ssh-key farm-ad-ssh-key; do
@@ -125,23 +171,12 @@ else
   echo "임시 디스크 사용"
 fi
 
-step "계정 대장 경로"
-# config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
-# 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
-# config-server가 처음 계정을 만들 때 기본 파일로 채운다.
-kubectl -n "$PROD_NS" exec "$PROD_POD" -- mkdir -p "/kube_share/exp-$STACK"
-echo "/kube_share/exp-$STACK"
-
 step "config-server ($RELEASE, $IMAGE)"
-BASE=$(mktemp); trap 'rm -f "$BASE"' EXIT
-# NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 그대로 쓰고, 스택마다 달라야 하는 값만 덮어쓴다.
-helm -n "$PROD_NS" get values "$PROD_RELEASE" -o yaml > "$BASE"
+# 운영 릴리스 값($BASE, 사전 확인에서 읽음)에 스택마다 달라야 하는 값만 덮어쓴다.
 # 첫 설치가 실패한 릴리스는 upgrade가 받지 않을 수 있으므로 지우고 다시 설치한다.
 if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
   helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
 fi
-KUBE_SHARE=$(sed -n 's/^[[:space:]]*kubeSharePath:[[:space:]]*//p' "$BASE" | head -1 | tr -d "\"'")
-[ -n "$KUBE_SHARE" ] || { echo "운영 kubeSharePath를 찾지 못함"; exit 1; }
 helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" \
   --set namespace="$NS" --set config.namespace="$NS" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
@@ -218,6 +253,15 @@ step "기준 데이터 복사 (운영 admin DB → 스택)"
 REF_TABLES="resource_groups nodes gpus container_image resource_group_images message_templates"
 smy()  { kubectl -n "$NS" exec mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N "$@"' _ "$@" </dev/null; }
 smyi() { kubectl -n "$NS" exec -i mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot "$@"' _ "$@"; }
+if [ "$(kubectl -n "$PROD_DB_NS" get pod "$PROD_DB_POD" -o jsonpath='{.status.phase}' 2>/dev/null)" != Running ]; then
+  # 운영을 내린 뒤에는 복사할 원본이 없다. 스택에 이미 받아 둔 기준 데이터가 있으면 그대로 쓴다.
+  HAVE=$(smy -e "SELECT COUNT(*) FROM web_admin.resource_groups" 2>/dev/null || echo 0)
+  if [ "${HAVE:-0}" -gt 0 ]; then
+    echo "운영 DB가 멈춰 있어 복사하지 않고 스택의 기존 기준 데이터를 씀 (자원 그룹 ${HAVE}행)"
+  else
+    echo "운영 DB가 멈춰 있고 스택에 기준 데이터가 없음 — 운영 DB를 잠시 띄우거나 다른 스택에서 기준 데이터를 옮겨야 함"; exit 1
+  fi
+else
 smy -e "DROP DATABASE IF EXISTS refdata_src; CREATE DATABASE refdata_src"
 kubectl -n "$PROD_DB_NS" exec "$PROD_DB_POD" -- sh -c \
   'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction --no-tablespaces --skip-triggers --set-gtid-purged=OFF "$MYSQL_DATABASE" "$@"' _ $REF_TABLES \
@@ -235,6 +279,7 @@ for T in $REF_TABLES; do
   echo "$T: 운영 $(smy -e "SELECT COUNT(*) FROM refdata_src.$T")행 → 스택 $(smy -e "SELECT COUNT(*) FROM web_admin.$T")행 (운영에만 있는 열: $SKIP)"
 done
 smy -e "DROP DATABASE refdata_src"
+fi
 
 step "프론트엔드"
 if [ -n "$FE_IMAGE" ]; then
@@ -426,7 +471,7 @@ else
 fi
 echo "--- 스택 DB의 작업 이력"
 kubectl -n "$NS" exec mysql-0 -- sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT action, phase FROM operation_state_db.operation_log WHERE request_id IN ('smoke-${PREFIX}000','$JOB_RID','$JOB_RID2') ORDER BY id\" 2>/dev/null" | tail -20
-LEAK=$(kubectl -n "$PROD_NS" exec "$PROD_POD" -- sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
+LEAK=$(ledger sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
 [ "$LEAK" = 0 ] && echo "OK  운영 계정 대장에 ${PREFIX} 계정 없음" || { echo "NG  운영 계정 대장에 ${PREFIX} 계정 ${LEAK}개"; exit 1; }
 
 step "완료"
