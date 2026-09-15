@@ -610,7 +610,14 @@ def _migrate_internal(data):
 
     set_pod_creation_status(username, "creating_pod", f"마이그레이션: k8s pod 생성 중 (node={best_node})")
     try:
-        ensure_account_secret(v1, ns, new_pod_name, username, user_info["passwd_base64"])
+        # 신청의 비밀번호는 승인 완료 뒤 지워지므로 옛 Pod의 비밀번호 Secret을 이어받는다.
+        password_b64 = login_password_for_recreate(v1, ns, old_pod_name, user_info)
+    except LoginPasswordMissing as e:
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: 로그인 비밀번호 없음")
+        release_nodeports(new_pod_name)
+        return jsonify(infra_error("MIGRATE", "LOGIN_PASSWORD_MISSING", str(e))), 422
+    try:
+        ensure_account_secret(v1, ns, new_pod_name, username, password_b64)
         created = v1.create_namespaced_pod(namespace=ns, body=pod_spec)
         own_account_secret(v1, ns, new_pod_name, created)
     except Exception:
@@ -1250,7 +1257,8 @@ from lifecycle_steps.provision import (  # noqa: E402
     _resolve_primary_group, _build_user_groups_env, _get_sudo_allowed_commands,
     _build_sudoers_policy, _rollback_user, _allocate_next_uid, _allocate_next_gid,
     step_create_account, step_create_home, step_create_krb5_principal, ACCOUNT_CREATE_STEPS,
-    account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret)
+    account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret,
+    LoginPasswordMissing, decode_login_password, login_password_for_recreate)
 from lifecycle_steps.revoke import (  # noqa: E402
     step_delete_services, step_release_nodeports, step_delete_pod_k8s,
     step_cleanup_pod_node_krb5, _new_delete_rollback, POD_DELETE_STEPS,
