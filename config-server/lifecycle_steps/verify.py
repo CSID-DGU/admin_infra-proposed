@@ -158,16 +158,25 @@ def step_verify_krb5(ctx):
 
 
 def step_verify_gpu(ctx):
-    """④ 신청한 GPU가 컨테이너 안에서 보이는가. GPU 미신청이면 대상 아님으로 기록하고 통과."""
+    """④ 신청한 GPU가 컨테이너 안에서 보이는가. GPU 미신청이면 대상 아님으로 기록하고 통과.
+    기대 개수는 컨테이너가 실제로 배치된 노드의 num_gpu다. gpu_nodes는 배치 후보 목록이라 노드마다 GPU 수가
+    달라서, 후보 중 최댓값을 쓰면 GPU가 적은 노드에 정상 배치된 컨테이너도 실패로 판정된다."""
     def check(ctx):
         gpu_nodes = (ctx.get("user_info") or {}).get("gpu_nodes") or []
-        want = max((int(g.get("num_gpu") or 0) for g in gpu_nodes), default=0)
+        node = str(ctx.get("node") or "").lower()
+        placed = [g for g in gpu_nodes if str(g.get("node_name") or "").lower() == node]
+        if placed:
+            want = int(placed[0].get("num_gpu") or 0)
+        else:
+            # 배치 노드를 후보 목록에서 찾지 못하면(이름 불일치 등) 가장 엄격한 기준으로 본다.
+            want = max((int(g.get("num_gpu") or 0) for g in gpu_nodes), default=0)
         if want <= 0:
             return None, {"scope": "skip", "reason": "GPU 미신청"}
         out, rc = _sh(ctx["pod_name"], "nvidia-smi -L | wc -l")
         seen = int(out.splitlines()[-1].strip() or 0) if rc == 0 and out else 0
         return (rc == 0 and seen >= want), {
-            "scope": "pod exec nvidia-smi", "requested": want, "visible": seen, "rc": rc}
+            "scope": "pod exec nvidia-smi", "node": ctx.get("node"), "placed_in_candidates": bool(placed),
+            "requested": want, "visible": seen, "rc": rc}
     _run_probe(ctx, Action.VERIFY_ACCESS, "gpu", check)
 
 
