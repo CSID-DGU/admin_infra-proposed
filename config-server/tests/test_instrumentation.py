@@ -38,9 +38,13 @@ def test_run_mode_rejects_unknown_value_loudly():
     """대문자 FULL·오타가 조용히 noprobe 로 돌면 ablation 이 0으로 나온다 — 기동 시점에 죽어야 한다."""
     with pytest.raises(SystemExit, match="noprobe"):
         main._resolve_run_mode({"VERIFY_MODE": "FULL"})
-    with pytest.raises(SystemExit, match="got 'baseline'"):
-        # baseline 실행 모드는 A1 결정 뒤에 추가한다 — 그전에는 거부가 맞다
-        main._resolve_run_mode({"RUN_MODE": "baseline"})
+    with pytest.raises(SystemExit, match="got 'BASELINE'"):
+        main._resolve_run_mode({"RUN_MODE": "BASELINE"})
+
+
+def test_run_mode_accepts_three_modes_only():
+    for mode in ("baseline", "noprobe", "full"):
+        assert main._resolve_run_mode({"RUN_MODE": mode}) == mode
 
 
 # ---------- 유실 카운터 ----------

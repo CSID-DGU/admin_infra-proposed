@@ -84,6 +84,24 @@ def test_gpu_probe_fails_when_fewer_visible_than_requested(probe_env):
         verify.step_verify_gpu(ctx)
 
 
+def test_gpu_probe_expects_gpu_count_of_placed_node_not_candidate_max(probe_env):
+    """후보 FARM2(2)·FARM6(3) 중 FARM2에 배치됐으면 2개면 통과다(2026-09-15 full 스택에서 오판정)."""
+    probe_env["sh"]["nvidia-smi"] = ("2", 0)
+    ctx = dict(CTX, node="farm2", user_info={"gpu_nodes": [
+        {"node_name": "FARM2", "num_gpu": 2}, {"node_name": "FARM6", "num_gpu": 3}]})
+    verify.step_verify_gpu(ctx)
+    assert probe_env["logs"][-1]["phase"] == Phase.SUCCESS
+    assert '"requested": 2' in probe_env["logs"][-1]["error_detail"]
+
+
+def test_gpu_probe_fails_when_placed_node_gpus_not_visible(probe_env):
+    probe_env["sh"]["nvidia-smi"] = ("2", 0)
+    ctx = dict(CTX, node="farm6", user_info={"gpu_nodes": [
+        {"node_name": "FARM2", "num_gpu": 2}, {"node_name": "FARM6", "num_gpu": 3}]})
+    with pytest.raises(StepFailed):
+        verify.step_verify_gpu(ctx)
+
+
 def test_endpoint_probe_requires_ssh_banner(probe_env):
     probe_env["tcp"][("10.0.0.8", 32001)] = (True, "HTTP/1.1 400")   # 열려 있지만 SSH가 아님
     with pytest.raises(StepFailed):

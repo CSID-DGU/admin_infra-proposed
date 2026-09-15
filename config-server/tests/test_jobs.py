@@ -273,6 +273,127 @@ def test_unknown_with_observer_denying_effect_retries(logs, store, monkeypatch):
     assert logs[-1]["phase"] == Phase.SUCCESS
 
 
+# ---------- baseline 모드 ----------
+
+@pytest.fixture
+def baseline(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_MODE", "baseline")
+
+
+@pytest.fixture
+def account_revoke(monkeypatch):
+    """계정 되돌리기 단계 대역. 받은 ctx를 모으고, node_name이 없으면 운영과 같이 보류(409)한다."""
+    seen = []
+
+    def check(ctx):
+        seen.append(dict(ctx))
+        if not ctx.get("node_name"):
+            raise StepFailed({"error": "ACCOUNT_NODE_UNKNOWN"}, 409)
+    monkeypatch.setattr(main, "step_check_account_revocable", check)
+    monkeypatch.setattr(main, "step_delete_account", lambda ctx: seen.append("deleted"))
+    monkeypatch.setattr(main, "step_remove_krb5", lambda ctx: seen.append("krb5_removed"))
+    return seen
+
+
+def test_baseline_fails_once_without_retry_and_compensates(baseline, logs, store, account_revoke, monkeypatch):
+    calls = []
+    failing = _raise(StepFailed(infra_error("CREATE_POD", "POD_CREATE_FAILED", "quota"), 500))
+    failing.__name__ = "step_create_pod_k8s"
+    steps = _named_steps(calls, "step_create_account", "step_create_krb5_principal") + [failing]
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: steps)
+    _queued(store, "PROVISION", "9", {"username": "exp-bl-001", "account": {"passwd_hash": "x"}})
+
+    def select_node(ctx):
+        ctx["node"] = "farm1"
+    steps[1] = _with_side_effect(steps[1], select_node)
+
+    main.run_job("provision", "9", "exp-bl-001")
+
+    assert not [l for l in logs if l["phase"] == Phase.RETRY]             # 재시도 없음
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "POD_CREATE_FAILED"
+    assert "DEGRADED" not in json.dumps(logs[-1])
+    assert json.loads(logs[-1]["error_detail"])["compensation"] == "account_removed"
+    assert "deleted" in account_revoke and "krb5_removed" in account_revoke
+
+
+def _with_side_effect(step, effect):
+    def wrapped(ctx):
+        step(ctx)
+        effect(ctx)
+    wrapped.__name__ = step.__name__
+    return wrapped
+
+
+def test_baseline_unknown_is_fail_without_observing(baseline, logs, store, monkeypatch):
+    """운영 admin_be는 타임아웃을 실패로 보고 뒷정리한다. baseline도 결과를 조회하지 않고 FAIL로 끝낸다."""
+    observed = []
+    flaky = _raise(StepFailed({"error": "TIMEOUT"}, 500, cause=subprocess.TimeoutExpired("kubectl", 5)))
+    flaky.__name__ = "s_make"
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [flaky])
+    monkeypatch.setitem(main.STEP_OBSERVERS, "s_make", lambda ctx: observed.append(1) or True)
+    _queued(store, "PROVISION", "9", {"username": "exp-bl-001"})
+
+    main.run_job("provision", "9", "exp-bl-001")
+
+    assert observed == []
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "TIMEOUT"
+    assert json.loads(logs[-1]["error_detail"])["unknown"] is True
+
+
+def test_baseline_unexpected_error_fails_once(baseline, logs, store, monkeypatch):
+    tries = []
+
+    def boom(ctx):
+        tries.append(1)
+        raise RuntimeError("boom")
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: [boom])
+    _queued(store, "REVOKE", "4", {"username": "exp-bl-001", "pod_name": "ailab-exp-bl-001-a"})
+
+    main.run_job("revoke", "4", "exp-bl-001")
+
+    assert tries == [1]
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "UNEXPECTED_ERROR"
+
+
+def test_baseline_restart_does_not_resume_and_holds_account(baseline, logs, store, lease_env,
+                                                            account_revoke, monkeypatch):
+    """운영에서 config-server가 처리 중 죽으면 admin_be는 노드를 모른 채 뒷정리해 계정 삭제를 보류한다."""
+    calls = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: _named_steps(
+        calls, "step_create_account", "step_create_krb5_principal", "step_create_pod_k8s"))
+    store[("PROVISION", "9")] = {"state": "running",
+                                 "job": {"username": "exp-bl-001", "account": {"passwd_hash": "x"}}}
+    lease_env[11] = {"owner": "dead-controller", "alive": False,
+                     "done": ["step_create_account", "step_create_krb5_principal"],
+                     "ctx": {"node": "farm1", "pod_name": "ailab-exp-bl-001-old1"}}
+
+    main.run_job("provision", "9", "exp-bl-001", job_id=11)
+
+    assert calls == []                                                    # 이어서 실행하지 않는다
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "INTERRUPTED"
+    detail = json.loads(logs[-1]["error_detail"])
+    assert detail["interrupted_after"] == "step_create_krb5_principal"
+    assert detail["compensation"] == "held:ACCOUNT_NODE_UNKNOWN"
+    assert account_revoke[0].get("node_name") is None
+    assert ("PROVISION", "9") not in store and 11 not in lease_env
+
+
+def test_baseline_first_run_of_claimed_job_executes_normally(baseline, logs, store, lease_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_job_steps", lambda kind, job: _named_steps(calls, "s_a", "s_b"))
+    _queued(store, "PROVISION", "9", {"username": "exp-bl-001"})
+
+    main.run_job("provision", "9", "exp-bl-001", job_id=12)
+
+    assert calls == ["s_a", "s_b"]
+    assert logs[-1]["phase"] == Phase.SUCCESS
+
+
+def test_baseline_has_no_access_probes(baseline):
+    job = {"username": "u", "account": {"passwd_hash": "x"}}
+    assert main._job_steps("provision", job) == main.ACCOUNT_CREATE_STEPS + main.POD_CREATE_STEPS
+
+
 # ---------- 작업별 단계 목록 ----------
 
 def test_provision_steps():

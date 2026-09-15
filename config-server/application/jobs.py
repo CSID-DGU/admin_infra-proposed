@@ -100,12 +100,27 @@ class _StepDegraded(Exception):
         self.step_name, self.reason, self.cause = step_name, reason, cause
         self.unknowable = unknowable  # True면 실행 여부 자체를 모름 → 작업 끝 행을 UNKNOWN으로
 
+def _is_baseline():
+    return _main.VERIFY_MODE == "baseline"
+
+def _end_phase(unknown):
+    """baseline은 운영 admin_be처럼 결과 불명(타임아웃 등)도 실패로 판정하고 뒷정리한다.
+    결과 불명이었다는 사실은 error_detail에 남긴다."""
+    return Phase.UNKNOWN if unknown and not _is_baseline() else Phase.FAIL
+
 def _execute_step(step, ctx, kind, request_id, username):
-    """단계 하나를 재시도 정책으로 실행한다. UNKNOWN이면 재실행 전에 실제 상태를 먼저 본다."""
+    """단계 하나를 재시도 정책으로 실행한다. UNKNOWN이면 재실행 전에 실제 상태를 먼저 본다.
+    baseline은 한 번만 실행하고, 실패하면 확인·재시도 없이 그 오류를 그대로 넘긴다(운영 동기 경로와 같음)."""
     name = step.__name__
+    baseline = _is_baseline()
     # 접근 검증은 생성 직후 전파 지연(kinit 타이머·NFS)이 있어 기본보다 여유 있게 재시도한다.
     # (verify 속성은 호출 시점에만 읽는다 — import 순서와 무관하게 동작)
-    max_attempts = verify.VERIFY_MAX_ATTEMPTS if name in verify.RERUN_SAFE_STEPS else _main.STEP_MAX_ATTEMPTS
+    if baseline:
+        max_attempts = 1
+    elif name in verify.RERUN_SAFE_STEPS:
+        max_attempts = verify.VERIFY_MAX_ATTEMPTS
+    else:
+        max_attempts = _main.STEP_MAX_ATTEMPTS
     for attempt in range(1, max_attempts + 1):
         hook = _main.PRE_STEP.get(name)
         if hook is not None:
@@ -122,6 +137,8 @@ def _execute_step(step, ctx, kind, request_id, username):
         finally:
             current_attempt.reset(token)
 
+        if baseline:
+            raise err
         unknown = err.unknown if isinstance(err, _main.StepFailed) else _main._is_unknown_result(err)
         if unknown:
             observer = _main.STEP_OBSERVERS.get(name)
@@ -263,6 +280,16 @@ def _compensate_provision(kind, job, ctx, done):
         return f"failed:{type(e).__name__}"
     return "account_removed"
 
+def _interrupt_baseline_job(kind, request_id, username, job, ctx, done):
+    """baseline에서 제어기가 작업 도중 죽었다가 인수한 작업. 운영에서 config-server가 요청 처리 중 죽으면
+    admin_be는 연결 오류만 받고 어느 노드에 배포하던 중이었는지 모른 채 뒷정리한다(노드를 모르면 계정 삭제
+    보류). 이어서 실행하지 않고 그 결과를 그대로 재현한다 — 노드·Pod 정보를 넘기지 않는다."""
+    _main.app.logger.warning(f"[JOB] baseline: {kind} request_id={request_id} 중단된 작업 — 이어하지 않고 종료")
+    blind = {k: v for k, v in ctx.items() if k not in ("node", "pod_name", "pod_node_name")}
+    detail = {"interrupted_after": done[-1], "compensation": _compensate_provision(kind, job, blind, done)}
+    _finish_job(kind, request_id, username, Phase.FAIL, "INTERRUPTED",
+                json.dumps(detail, ensure_ascii=False, default=str), ctx)
+
 def run_job(kind, request_id, username, job_id=None):
     """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다. 실행하는 동안의 모든
     기록에는 작업 번호(job_id)가 붙는다."""
@@ -314,6 +341,10 @@ def _run_job(kind, request_id, username, job_id=None):
     ctx = _job_ctx(kind, request_id, job)
     ctx.update(saved)
     done = list(done)
+    if done and _is_baseline():
+        _interrupt_baseline_job(kind, request_id, username, job, ctx, done)
+        _release_lease(job_id)
+        return
     if done:
         _main.app.logger.info(f"[JOB] resume {kind} request_id={request_id} after {done[-1]}")
     else:
@@ -348,7 +379,9 @@ def _run_job(kind, request_id, username, job_id=None):
     except _main.StepFailed as e:
         code = e.body.get("error") if isinstance(e.body, dict) else None
         detail = {"error": e.body, "compensation": _compensate_provision(kind, job, ctx, done)}
-        _finish_job(kind, request_id, username, Phase.UNKNOWN if e.unknown else Phase.FAIL,
+        if e.unknown:
+            detail["unknown"] = True
+        _finish_job(kind, request_id, username, _end_phase(e.unknown),
                     str(code)[:64] if code else "STEP_FAILED",
                     json.dumps(detail, ensure_ascii=False, default=str), ctx)
         _release_lease(job_id)
@@ -356,7 +389,7 @@ def _run_job(kind, request_id, username, job_id=None):
     except Exception as e:
         _main.app.logger.exception(f"[JOB] {kind} request_id={request_id} unexpected error")
         detail = {"error": str(e), "compensation": _compensate_provision(kind, job, ctx, done)}
-        _finish_job(kind, request_id, username, _main._fail_phase(e), "UNEXPECTED_ERROR",
+        _finish_job(kind, request_id, username, _end_phase(_main._fail_phase(e) == Phase.UNKNOWN), "UNEXPECTED_ERROR",
                     json.dumps(detail, ensure_ascii=False, default=str), ctx)
         _release_lease(job_id)
         return
