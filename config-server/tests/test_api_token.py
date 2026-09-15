@@ -16,7 +16,7 @@ def test_request_without_token_is_rejected_before_validation(client):
 
 
 def test_wrong_token_is_rejected(client):
-    r = client.post("/delete-pod", json={"pod_name": "ailab-u-1"}, headers={"X-Internal-Token": "nope"})
+    r = client.delete("/pods/ailab-u-1", headers={"X-Internal-Token": "nope"})
     assert r.status_code == 401
 
 

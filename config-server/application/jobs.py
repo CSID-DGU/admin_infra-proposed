@@ -11,7 +11,7 @@ from kubernetes import client
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
-from adapters.operation_log import Action, Phase, current_job_id, current_attempt
+from adapters.operation_log import Action, Phase, current_job_id, current_attempt, current_username
 from lifecycle_steps import verify
 
 class _MainProxy:
@@ -75,6 +75,7 @@ RERUN_SAFE = {
     "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s",
     "step_cleanup_pod_node_krb5", "step_check_account_revocable",
     "step_delete_account", "step_delete_home", "step_remove_krb5",
+    "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
 }
 
 PRE_STEP = {
@@ -82,12 +83,13 @@ PRE_STEP = {
     "step_create_services": lambda ctx: _main.delete_nodeport_services(ctx["pod_name"], _main.app.config["NAMESPACE"]),
 }
 
-ALWAYS_RERUN = {"step_fetch_user_config"}
+ALWAYS_RERUN = {"step_fetch_user_config", "step_migrate_inherit_password"}
 
 DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
 SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
-                  "verify_ports", "verify_node")
+                  "verify_ports", "verify_node",
+                  "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup")
 
 def _saved_ctx(ctx):
     return {k: ctx[k] for k in SAVED_CTX_KEYS if k in ctx}
@@ -164,11 +166,13 @@ def _execute_step(step, ctx, kind, request_id, username):
         if _main.RETRY_DELAY_SEC:
             time.sleep(_main.RETRY_DELAY_SEC)
 
-JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE}
+JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE}
 
 _JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
 
 def _job_steps(kind, job):
+    if kind == "migrate":
+        return list(_main.MIGRATE_STEPS)
     if kind == "provision":
         steps = (_main.ACCOUNT_CREATE_STEPS if job.get("account") else []) + _main.POD_CREATE_STEPS
         if _main.VERIFY_MODE == "full":
@@ -195,6 +199,10 @@ def _job_ctx(kind, request_id, job):
     if kind == "revoke":
         ctx.update(pod_name=job.get("pod_name"), node_name=job.get("node_name"),
                    rollback=_main._new_delete_rollback())
+    if kind == "migrate":
+        # 새 Pod 이름은 Pod 준비 단계가 정한다. 기존 Pod는 old_pod_name으로 따로 둔다.
+        ctx.update(config_by_request=True, old_pod_name=job.get("pod_name"), nodes=job["nodes"],
+                   min_ratio=job.get("min_improvement_ratio", 0.2), force=bool(job.get("force")))
     return ctx
 
 def find_unfinished_jobs(limit=100):
@@ -204,11 +212,11 @@ def find_unfinished_jobs(limit=100):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT s.action, s.request_id, s.username, s.id FROM operation_log s "
-                "WHERE s.action IN (%s, %s) AND s.phase = %s AND NOT EXISTS ("
+                "WHERE s.action IN (%s, %s, %s) AND s.phase = %s AND NOT EXISTS ("
                 " SELECT 1 FROM operation_log e WHERE e.request_id = s.request_id"
                 " AND e.action = s.action AND e.id > s.id AND e.phase IN (%s, %s, %s)) "
                 "ORDER BY s.id LIMIT %s",
-                (Action.PROVISION.value, Action.REVOKE.value, Phase.START.value,
+                (Action.PROVISION.value, Action.REVOKE.value, Action.MIGRATE.value, Phase.START.value,
                  Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value, limit),
             )
             return [(_JOB_KIND[a], r, u, j) for a, r, u, j in cur.fetchall()]
@@ -217,7 +225,7 @@ def find_unfinished_jobs(limit=100):
 
 def _finish_job(kind, request_id, username, phase, error_code=None, error_detail=None, ctx=None):
     ctx = ctx or {}
-    if kind == "provision" and phase != Phase.SUCCESS:
+    if kind in ("provision", "migrate") and phase != Phase.SUCCESS:
         # Pod 단계까지 가지 못한 실패(계정 단계 등)는 진행 상황이 "started"에 멈춰 있으므로 닫아 준다.
         try:
             if (_main.get_pod_creation_status(request_id) or {}).get("stage") != "failed":
@@ -227,11 +235,19 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
     if phase == Phase.SUCCESS:
         # 작업이 만든 자원을 결과 조회에 실어 준다. 동기 경로는 같은 값을 응답 본문으로 돌려주므로,
         # 비동기 경로로 승인하는 쪽(admin_be)도 이 값으로 신청 기록을 채운다.
-        _main.save_job_result(JOB_ACTIONS[kind].value, request_id, {
+        result = {
             "uid": ctx.get("uid"), "gid": ctx.get("gid"),
             "pod_name": ctx.get("pod_name"), "node": ctx.get("node"),
             "ports": ctx.get("allocated_ports") or [],
-        })
+        }
+        if kind == "migrate":
+            skipped = bool(ctx.get("skipped"))
+            result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),
+                          from_node=ctx.get("from_node"), to_node=None if skipped else ctx.get("node"),
+                          old_pod_name=ctx.get("old_pod_name"), old_pod_cleanup=ctx.get("old_pod_cleanup"))
+            if skipped:
+                result.update(pod_name=None, node=None, ports=[])
+        _main.save_job_result(JOB_ACTIONS[kind].value, request_id, result)
         if kind == "provision" and _main.VERIFY_MODE == "full":
             # 진행 상황은 컨테이너 생성 직후 "컨테이너 생성 완료"로 한 번 기록되고 접근 시험이 그 뒤에 돈다.
             # 시험까지 끝났다는 것을 화면에 남긴다. 표시용이라 실패해도 결과 기록은 계속한다.
@@ -301,9 +317,11 @@ def run_job(kind, request_id, username, job_id=None):
     """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다. 실행하는 동안의 모든
     기록에는 작업 번호(job_id)가 붙는다."""
     token = current_job_id.set(job_id)
+    user_token = current_username.set(username)
     try:
         _run_job(kind, request_id, username, job_id)
     finally:
+        current_username.reset(user_token)
         current_job_id.reset(token)
 
 def _release_lease(job_id):
@@ -358,6 +376,8 @@ def _run_job(kind, request_id, username, job_id=None):
         _main.app.logger.info(f"[JOB] start {kind} request_id={request_id}")
     try:
         for step in _main._job_steps(kind, job):
+            if ctx.get("skipped"):
+                break  # 마이그레이션에서 옮길 이유가 없다고 판정되면 남은 단계를 돌리지 않는다
             name = step.__name__
             if name in _main.ALWAYS_RERUN:
                 step(ctx)

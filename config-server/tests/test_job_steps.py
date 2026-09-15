@@ -47,7 +47,7 @@ def _t(sec):
 
 
 def test_unknown_kind_is_404(api):
-    assert api.get("/operations/migrate/3/steps").status_code == 404
+    assert api.get("/operations/nope/3/steps").status_code == 404
 
 
 def test_request_without_jobs_returns_empty_list(api, monkeypatch):
