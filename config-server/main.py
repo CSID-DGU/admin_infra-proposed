@@ -610,10 +610,13 @@ def _migrate_internal(data):
 
     set_pod_creation_status(username, "creating_pod", f"마이그레이션: k8s pod 생성 중 (node={best_node})")
     try:
-        v1.create_namespaced_pod(namespace=ns, body=pod_spec)
+        ensure_account_secret(v1, ns, new_pod_name, username, user_info["passwd_base64"])
+        created = v1.create_namespaced_pod(namespace=ns, body=pod_spec)
+        own_account_secret(v1, ns, new_pod_name, created)
     except Exception:
         set_pod_creation_status(username, "failed", "마이그레이션 실패: pod 생성 실패")
         release_nodeports(new_pod_name)
+        delete_account_secret(v1, ns, new_pod_name)
         raise
 
     # 8. Ready 대기 (생성 작업과 같은 POD_READY_MAX_WAIT_SEC를 쓴다 —
@@ -646,6 +649,7 @@ def _migrate_internal(data):
         set_pod_creation_status(username, "failed", "마이그레이션 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
+        delete_account_secret(v1, ns, new_pod_name)
         return jsonify({"error": "new pod failed to start", "detail": migrate_failure_reason}), 500
 
     # 9. 새 Pod 성공 후 Service 생성
@@ -661,6 +665,7 @@ def _migrate_internal(data):
         set_pod_creation_status(username, "failed", "마이그레이션 실패: 서비스 생성 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
+        delete_account_secret(v1, ns, new_pod_name)
         return jsonify({"error": "service creation failed"}), 500
 
     # 10. 기존 Pod 정리 — 새 Pod는 이미 정상 기동되어 서비스 중이므로, 여기서 실패해도
@@ -671,6 +676,7 @@ def _migrate_internal(data):
         delete_nodeport_services(old_pod_name, ns)
         release_nodeports(old_pod_name)
         delete_pod_util(old_pod_name, ns)
+        delete_account_secret(v1, ns, old_pod_name)
     except Exception:
         app.logger.exception(f"[MIGRATE] 기존 Pod({old_pod_name}) 정리 실패 — 새 Pod는 정상 기동됨, 수동 정리 필요")
         old_pod_cleanup_failed = True
@@ -1226,7 +1232,7 @@ from lifecycle_steps.provision import (  # noqa: E402
     _resolve_primary_group, _build_user_groups_env, _get_sudo_allowed_commands,
     _build_sudoers_policy, _rollback_user, _allocate_next_uid, _allocate_next_gid,
     step_create_account, step_create_home, step_create_krb5_principal, ACCOUNT_CREATE_STEPS,
-)
+    account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret)
 from lifecycle_steps.revoke import (  # noqa: E402
     step_delete_services, step_release_nodeports, step_delete_pod_k8s,
     step_cleanup_pod_node_krb5, _new_delete_rollback, POD_DELETE_STEPS,

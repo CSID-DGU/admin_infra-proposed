@@ -125,6 +125,7 @@ def step_delete_pod_k8s(ctx):
     try:
         v1.delete_namespaced_pod(pod_name, ns)
         rollback["podDeleteRequested"] = True
+        _main.delete_account_secret(v1, ns, pod_name)
     except client.exceptions.ApiException as e:
         if e.status == 404:
             rollback["podDeleted"] = True

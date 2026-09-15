@@ -258,6 +258,49 @@ def release_nodeports(pod_name):
     finally:
         conn.close()
 
+def account_secret_name(pod_name):
+    return f"{pod_name}-account"
+
+
+def ensure_account_secret(v1, ns, pod_name, username, passwd_base64):
+    """Pod가 읽을 로그인 비밀번호 Secret을 만든다(있으면 새 값으로 바꾼다)."""
+    password = base64.b64decode(passwd_base64, validate=True).decode("utf-8")
+    body = client.V1Secret(
+        metadata=client.V1ObjectMeta(name=account_secret_name(pod_name), namespace=ns,
+                                     labels={"app": "ailab-account", "ailab.dgu/pod": pod_name, "username": username}),
+        type="Opaque",
+        string_data={"USER_PW": password},
+    )
+    try:
+        v1.create_namespaced_secret(namespace=ns, body=body)
+    except client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+        v1.replace_namespaced_secret(account_secret_name(pod_name), ns, body)
+
+
+def own_account_secret(v1, ns, pod_name, created_pod):
+    """Secret의 소유자를 Pod로 지정해, Pod가 어떤 경로로 지워져도 쿠버네티스가 Secret을 함께 지우게 한다."""
+    uid = getattr(getattr(created_pod, "metadata", None), "uid", None)
+    if not uid:
+        return
+    try:
+        v1.patch_namespaced_secret(account_secret_name(pod_name), ns, {"metadata": {"ownerReferences": [
+            {"apiVersion": "v1", "kind": "Pod", "name": pod_name, "uid": uid, "blockOwnerDeletion": False}]}})
+    except Exception:
+        _main.app.logger.warning("[ACCOUNT SECRET] 소유자 지정 실패 — 회수 단계가 직접 지운다: %s", pod_name, exc_info=True)
+
+
+def delete_account_secret(v1, ns, pod_name):
+    try:
+        v1.delete_namespaced_secret(account_secret_name(pod_name), ns)
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            _main.app.logger.warning("[ACCOUNT SECRET] 삭제 실패: %s", pod_name, exc_info=True)
+    except Exception:
+        _main.app.logger.warning("[ACCOUNT SECRET] 삭제 실패: %s", pod_name, exc_info=True)
+
+
 def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
     ns = _main.app.config["NAMESPACE"]
     rollback = {
@@ -290,6 +333,7 @@ def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
                 _main.app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
         except Exception:
             _main.app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+        delete_account_secret(v1, ns, pod_name)
 
     return rollback
 
@@ -568,10 +612,12 @@ def step_create_pod_k8s(ctx):
                   node_name=best_node, resource_type="pod",
                   action=Action.CREATE_POD_K8S, phase=Phase.START)
     try:
-        v1.create_namespaced_pod(
+        ensure_account_secret(v1, ns, pod_name, username, ctx["user_info"]["passwd_base64"])
+        created = v1.create_namespaced_pod(
             namespace=ns,
             body=ctx["pod_spec"]
         )
+        own_account_secret(v1, ns, pod_name, created)
     except client.exceptions.ApiException as e:
         _main.app.logger.exception("[CREATE POD] pod creation failed")
         _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
@@ -987,13 +1033,13 @@ def build_pod_spec(
                                                     {"name": "TARGET_GID", "value": str(primary_gid)},
                                                     {"name": "UID", "value": str(uid)},
                                                     {"name": "GID", "value": str(primary_gid)},
-                                                    {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
                                                     # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
                                                     # `echo "$USER_ID:$USER_PW" | chpasswd`로 로그인 비밀번호를 설정한다.
-                                                    # 이 값이 빠져 있으면 빈 비밀번호로 설정되어 이메일로 안내한 비밀번호로
-                                                    # 로그인이 되지 않는다.
-                                                    {"name": "USER_PW", "value": base64.b64decode(user_info["passwd_base64"], validate=True).decode("utf-8")},
+                                                    # 값은 Pod 설정에 평문으로 두지 않고 Pod별 Secret에서 읽는다
+                                                    # (Pod 설정은 조회 권한만 있으면 누구나 볼 수 있다). Secret은 Pod를
+                                                    # 만들기 직전에 ensure_account_secret()이 만든다.
+                                                    {"name": "USER_PW", "valueFrom": {"secretKeyRef": {"name": account_secret_name(pod_name), "key": "USER_PW"}}},
                                                     {"name": "USER_GROUPS", "value": _main._build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
                                                     *([{"name": "ENABLE_VNC", "value": "true"}] if enable_vnc else []),
                                                     *([
