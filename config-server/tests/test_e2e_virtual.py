@@ -26,6 +26,12 @@ class FakeV1:
             raise ApiException(status=409, reason="Conflict")
         self.secrets[name] = {"data": dict(body.string_data or {}), "owners": []}
 
+    def read_namespaced_secret(self, name, namespace):
+        if name not in self.secrets:
+            raise ApiException(status=404, reason="Not Found")
+        data = {k: base64.b64encode(str(v).encode()).decode() for k, v in self.secrets[name]["data"].items()}
+        return types.SimpleNamespace(data=data)
+
     def replace_namespaced_secret(self, name, namespace, body):
         self.secrets[name] = {"data": dict(body.string_data or {}), "owners": []}
 

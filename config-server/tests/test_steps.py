@@ -1,4 +1,4 @@
-"""단계 함수의 결과 불명(UNKNOWN) 구분, 단계 순서, 남아 있는 동기 경로(/delete-pod)의 응답."""
+"""단계 함수의 결과 불명(UNKNOWN) 구분, 단계 순서, 남아 있는 동기 경로(DELETE /pods/<name>)의 응답."""
 import subprocess
 
 import requests
@@ -57,14 +57,14 @@ def test_step_order_matches_current_flow():
         "step_delete_account", "step_delete_home", "step_remove_krb5"]
 
 
-# ---------- /delete-pod은 단계 결과를 응답으로 돌려준다 ----------
+# ---------- DELETE /pods/<name>은 단계 결과를 응답으로 돌려준다 ----------
 
 def test_delete_pod_already_absent_body(api, monkeypatch):
     def absent(ctx):
         ctx["rollback"]["podDeleted"] = True
         ctx["already_absent"] = True
     monkeypatch.setattr(main, "POD_DELETE_STEPS", [absent])
-    r = api.post("/delete-pod", json={"pod_name": "ailab-u-abc", "request_id": "3"})
+    r = api.delete("/pods/ailab-u-abc?request_id=3")
     assert r.status_code == 200
     assert r.get_json() == {"status": "deleted", "pod_name": "ailab-u-abc", "already_absent": True,
                             "progress": {"servicesDeleted": False, "nodeportsReleased": False,
@@ -74,5 +74,5 @@ def test_delete_pod_already_absent_body(api, monkeypatch):
 def test_delete_pod_passes_username_from_pod_name(api, monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "POD_DELETE_STEPS", [lambda ctx: seen.update(ctx)])
-    assert api.post("/delete-pod", json={"pod_name": "ailab-exp-np-001-7f3a9c21", "request_id": "3"}).status_code == 200
+    assert api.delete("/pods/ailab-exp-np-001-7f3a9c21?request_id=3").status_code == 200
     assert seen["username"] == "exp-np-001" and seen["request_id"] == "3"

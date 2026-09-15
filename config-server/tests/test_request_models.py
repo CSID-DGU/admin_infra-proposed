@@ -37,11 +37,13 @@ def _invalid(r):
                                        "account": {"passwd_base64": "cHc=", "supplementary_groups": [{"name": "g"}]}},
      "account.supplementary_groups.0.gid"),
     ("post", "/operations/revoke", {"request_id": "1", "pod_name": "other-pod"}, "pod_name"),
-    ("post", "/delete-pod", {"pod_name": "other-pod"}, "pod_name"),
-    ("post", "/migrate", {"username": "u", "nodes": []}, "nodes"),
-    ("post", "/migrate", {"username": "u", "nodes": ["farm1"], "min_improvement_ratio": 1.5}, "min_improvement_ratio"),
-    ("put", "/accounts/groups", {"name": "g", "gid": True}, "gid"),
-    ("put", "/accounts/users/u/groups", {"groups": []}, "groups"),
+    ("delete", "/pods/other-pod", {}, "pod_name"),
+    ("post", "/operations/migrate", {"request_id": "1", "username": "u", "nodes": []}, "nodes"),
+    ("post", "/operations/migrate", {"request_id": "1", "username": "u", "nodes": ["farm1"], "min_improvement_ratio": 1.5}, "min_improvement_ratio"),
+    ("post", "/operations/migrate", {"username": "u", "nodes": ["farm1"]}, "request_id"),
+    ("post", "/groups", {"gid": 1}, "name"),
+    ("post", "/users/u/groups", {"groups": []}, "groups"),
+    ("post", "/groups", {"name": "g", "gid": True}, "gid"),
 ])
 def test_invalid_bodies_share_one_error_shape(client, method, path, payload, field):
     body = _invalid(getattr(client, method)(path, json=payload))
@@ -55,7 +57,7 @@ def test_non_object_body_is_rejected(client):
 
 
 def test_missing_body_is_rejected(client):
-    _invalid(client.post("/delete-pod"))
+    _invalid(client.post("/operations/migrate"))
 
 
 def test_korean_value_error_message_is_kept_without_prefix(client):
@@ -98,8 +100,8 @@ def test_group_gid_rules():
 
 
 def test_migrate_dump_omits_absent_ratio_so_default_applies():
-    dumped = rm.MigrateRequest(username="u", nodes=["farm1"]).model_dump(exclude_none=True)
-    assert dumped == {"username": "u", "nodes": ["farm1"]}
+    dumped = rm.MigrateRequest(request_id=1, username="u", nodes=["farm1"]).model_dump(exclude_none=True)
+    assert dumped == {"request_id": "1", "username": "u", "nodes": ["farm1"]}
 
 
 def test_unknown_fields_are_ignored():
@@ -129,9 +131,9 @@ def test_apispec_serves_model_definitions(client):
 def test_migrate_rejects_negative_ratio_and_accepts_force():
     import pydantic
     try:
-        rm.MigrateRequest(username="u", nodes=["farm1"], min_improvement_ratio=-1000)
+        rm.MigrateRequest(request_id=1, username="u", nodes=["farm1"], min_improvement_ratio=-1000)
         raise AssertionError("음수 비율이 통과함")
     except pydantic.ValidationError:
         pass
-    dumped = rm.MigrateRequest(username="u", nodes=["farm1"], force=True, pod_name="p", request_id=3).model_dump(exclude_none=True)
-    assert dumped == {"username": "u", "nodes": ["farm1"], "force": True}
+    dumped = rm.MigrateRequest(username="u", nodes=["farm1"], force=True, pod_name="ailab-u-abc", request_id=3).model_dump(exclude_none=True)
+    assert dumped == {"request_id": "3", "pod_name": "ailab-u-abc", "username": "u", "nodes": ["farm1"], "force": True}

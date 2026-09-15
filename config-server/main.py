@@ -23,15 +23,15 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
-from request_models import (validate_body, swagger_definitions, ProvisionRequest, RevokeRequest,
+from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest)
 from adapters.pod_status import (
-    set_pod_creation_status, get_pod_creation_status,
+    set_pod_creation_status as _store_pod_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
     save_job_result, load_job_result,
 )
 from adapters.operation_log import (Action, Phase, log_operation, current_job_id,
-                                    current_attempt, write_failure_count)
+                                    current_attempt, current_username, write_failure_count)
 
 from adapters import job_control
 from adapters.job_control import LeaseLost
@@ -60,6 +60,27 @@ from utils import (
 )
 
 app = Flask(__name__)
+
+# 작업별 마지막으로 기록한 진행 단계. 같은 단계를 반복해서 쓰지 않는다(Ready 대기는 5초마다 같은 단계를 다시 쓴다).
+_last_progress = {}
+
+
+def set_pod_creation_status(key_value, stage, message=""):
+    """진행 상황을 Redis에 쓰고, 제어기가 작업을 실행하는 중이면 단계가 바뀔 때마다 작업 이력에도 남긴다.
+
+    Redis 진행 상황은 마지막 단계 하나만 1시간 보관한다. 작업 이력에 남겨야 이미지 다운로드·마운트 재시도 같은
+    중간 과정이 시각과 함께 남고, 신청 상세 타임라인에서 볼 수 있다.
+    """
+    _store_pod_status(key_value, stage, message)
+    job_id, username = current_job_id.get(), current_username.get()
+    if job_id is None or not username or _last_progress.get(job_id) == stage:
+        return
+    if len(_last_progress) > 1000:
+        _last_progress.clear()
+    _last_progress[job_id] = stage
+    log_operation(request_id=key_value, username=username, action=Action.PROGRESS, phase=Phase.INFO,
+                  resource_type=str(stage)[:32],
+                  error_detail=json.dumps({"stage": stage, "message": message}, ensure_ascii=False))
 
 # 로그 설정
 handler = logging.StreamHandler(sys.stdout)
@@ -133,15 +154,15 @@ def _enforce_account_prefix():
         names.append(request.view_args["username"])
     body = request.get_json(silent=True)
     if isinstance(body, dict):
-        if request.path in ("/migrate", "/operations/provision", "/operations/revoke"):
+        if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke"):
             names.append(body.get("username"))
         if request.path == "/operations/revoke" and str(body.get("pod_name") or "").startswith("ailab-"):
             names.append(_pod_username(body["pod_name"]))
     bad = [n for n in names if n is not None and not str(n).startswith(ACCOUNT_PREFIX)]
     if bad:
         app.logger.warning(f"[PREFIX] 접두어 없는 계정 거절: {bad} ({request.method} {request.path})")
-        return jsonify({"status": "error",
-                        "message": f"이 환경은 '{ACCOUNT_PREFIX}'로 시작하는 계정만 다룹니다"}), 403
+        return jsonify(infra_error("CHECK_ACCOUNT_PREFIX", "ACCOUNT_PREFIX_MISMATCH",
+                                   f"이 환경은 '{ACCOUNT_PREFIX}'로 시작하는 계정만 다룹니다")), 403
     return None
 app.config.from_mapping({
     # Namespace
@@ -414,54 +435,33 @@ def get_pod_status(request_id):
 
 
 
-@app.route("/delete-pod", methods=["POST"])
-@validate_body(DeletePodRequest)
-def delete_pod(body: DeletePodRequest):
+@app.route("/pods/<pod_name>", methods=["DELETE"])
+def delete_pod(pod_name):
     """
-    사용자 Pod 삭제 API
+    고아 Pod 삭제 API
 
-    특정 Pod를 삭제하고 다음 리소스를 정리합니다.
-
-    - Kubernetes Pod
+    신청 기록이 없는 사용자 Pod를 지우고 딸린 자원을 정리한다. 신청이 있는 Pod는 회수 작업
+    (POST /operations/revoke)으로 지운다.
     - NodePort Service
     - NodePort DB allocation
-
+    - Kubernetes Pod
     ---
     tags:
     - Pod
-
-    summary: 사용자 Pod 삭제
-
-    consumes:
-    - application/json
-
     parameters:
-
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/DeletePodRequest'
-
+      - {in: path, name: pod_name, required: true, type: string}
+      - {in: query, name: request_id, required: false, type: string, description: 이 Pod를 만든 신청 번호}
     responses:
-
       200:
-        description: Pod 삭제 성공
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-              example: deleted
+        description: 삭제됨(이미 없던 Pod는 already_absent)
       400:
-        description: 잘못된 요청
-        schema:
-          $ref: '#/definitions/ErrorResponse'
+        description: 잘못된 Pod 이름
       500:
         description: 삭제 실패
-        schema:
-          $ref: '#/definitions/ErrorResponse'
     """
+    body, error = check_values(DeletePodRequest, {"pod_name": pod_name, "request_id": request.args.get("request_id")})
+    if error is not None:
+        return error
     pod_name = body.pod_name
     app.logger.info(f"[DELETE POD] request received - pod_name={pod_name}")
     rollback = _new_delete_rollback()
@@ -508,264 +508,6 @@ def delete_pod(body: DeletePodRequest):
 def _pod_username(pod_name: str) -> str:
     """ailab-<username>-<suffix> 형식의 Pod 이름에서 username을 꺼낸다."""
     return pod_name[len("ailab-"):].rsplit("-", 1)[0]
-
-
-def _migrate_internal(data):
-
-    load_k8s()
-    v1 = client.CoreV1Api()
-
-    username = data.get("username")
-    nodes = data.get("nodes")  # resource group에 속한 node_id 목록
-    min_ratio = data.get("min_improvement_ratio", 0.2)
-    force = bool(data.get("force"))
-
-    ns = app.config["NAMESPACE"]
-
-    if nodes:
-        canon = []
-        for n in nodes:
-            c = resolve_k8s_node_name(n)
-            if not c:
-                return jsonify({"error": f"unknown kubernetes node: {n!r}"}), 400
-            canon.append(c)
-        nodes = canon
-
-    # 1. 현재 Pod 확인
-    old_pod_name = get_existing_pod(ns, username)
-    if not old_pod_name:
-        return jsonify({"error": "no running pod"}), 404
-
-    pod = v1.read_namespaced_pod(old_pod_name, ns)
-    current_node = pod.spec.node_name
-
-    if current_node not in nodes:
-        return jsonify({
-            "error": "current node is not in given nodes list"
-        }), 400
-
-    candidate_nodes = [n for n in nodes if n != current_node]
-    if not candidate_nodes:
-        return jsonify({
-            "status": "skipped",
-            "reason": "no_candidate_node"
-        }), 200
-
-    # 2. GPU score 계산
-    prom_url = app.config["PROM_URL"]
-    timeout = app.config["HTTP_TIMEOUT_SEC"]
-
-    current_score = get_node_gpu_score(current_node, prom_url, timeout)
-    scores = {
-        node: get_node_gpu_score(node, prom_url, timeout)
-        for node in candidate_nodes
-    }
-
-    best_node, best_score = min(scores.items(), key=lambda x: x[1])
-
-    # 3. 이전(migrate) 기준 판단 — 관리자가 강제 이전을 고르면 개선 비율을 보지 않는다.
-    if not force and best_score > current_score * (1 - min_ratio):
-        return jsonify({
-            "status": "skipped",
-            "reason": "no_significant_improvement",
-            "current_node": current_node,
-            "current_score": current_score,
-            "best_candidate": best_node,
-            "best_score": best_score
-        }), 200
-
-    # 4. WAS에서 사용자 정보 조회
-    was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-    resp = requests.get(
-        was_url,
-        timeout=app.config["HTTP_TIMEOUT_SEC"]
-    )
-
-    app.logger.info(f"[MIGRATE] WAS status={resp.status_code}")
-    app.logger.debug(f"[MIGRATE] WAS body={resp.text}")
-
-    user_info = resp.json()
-
-    # 5. 기존 Pod 이미지 저장
-    ok = commit_and_save_user_image(username, old_pod_name, ns)
-    if not ok:
-        return jsonify({
-            "error": "image_commit_failed"
-        }), 500
-
-    # 6. 새 Pod 이름 생성
-    new_pod_name = generate_pod_name(username)
-
-    # 7. 새 노드에서 Pod 재생성
-    try:
-        spec_wrapper, allocated_ports = build_pod_spec(
-            username,
-            user_info,
-            best_node,
-            new_pod_name
-        )
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-    pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
-
-    set_pod_creation_status(username, "creating_pod", f"마이그레이션: k8s pod 생성 중 (node={best_node})")
-    try:
-        # 신청의 비밀번호는 승인 완료 뒤 지워지므로 옛 Pod의 비밀번호 Secret을 이어받는다.
-        password_b64 = login_password_for_recreate(v1, ns, old_pod_name, user_info)
-    except LoginPasswordMissing as e:
-        set_pod_creation_status(username, "failed", "마이그레이션 실패: 로그인 비밀번호 없음")
-        release_nodeports(new_pod_name)
-        return jsonify(infra_error("MIGRATE", "LOGIN_PASSWORD_MISSING", str(e))), 422
-    try:
-        ensure_account_secret(v1, ns, new_pod_name, username, password_b64)
-        created = v1.create_namespaced_pod(namespace=ns, body=pod_spec)
-        own_account_secret(v1, ns, new_pod_name, created)
-    except Exception:
-        set_pod_creation_status(username, "failed", "마이그레이션 실패: pod 생성 실패")
-        release_nodeports(new_pod_name)
-        delete_account_secret(v1, ns, new_pod_name)
-        raise
-
-    # 8. Ready 대기 (생성 작업과 같은 POD_READY_MAX_WAIT_SEC를 쓴다 —
-    # 예전엔 60초로 하드코딩돼 있어서 이미지 pull이 오래 걸리는 이미지는
-    # 생성보다 훨씬 먼저 실패 처리되는 불일치가 있었다.)
-    migrate_failure_reason = None
-    max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
-    last_progress_stage = None
-    for i in range(max_wait):
-        pod = v1.read_namespaced_pod(new_pod_name, ns)
-        if is_pod_ready(pod):
-            set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
-            break
-        migrate_failure_reason = get_pod_failure_reason(pod)
-        if migrate_failure_reason:
-            break
-        if i % 5 == 0:
-            progress = get_pod_progress_stage(v1, ns, new_pod_name)
-            if progress and progress[0] != last_progress_stage:
-                last_progress_stage, progress_message = progress
-                set_pod_creation_status(username, last_progress_stage, progress_message)
-                app.logger.info(f"[MIGRATE] username={username} pod={new_pod_name} stage={last_progress_stage} {progress_message}")
-        time.sleep(1)
-    else:
-        migrate_failure_reason = migrate_failure_reason or f"pod not ready within {max_wait}s"
-
-    if migrate_failure_reason:
-        # 새 Pod 실패 -> 정리 후 종료
-        app.logger.error(f"[MIGRATE] new pod failed to start: {migrate_failure_reason}")
-        set_pod_creation_status(username, "failed", "마이그레이션 실패")
-        v1.delete_namespaced_pod(new_pod_name, ns)
-        release_nodeports(new_pod_name)
-        delete_account_secret(v1, ns, new_pod_name)
-        return jsonify({"error": "new pod failed to start", "detail": migrate_failure_reason}), 500
-
-    # 9. 새 Pod 성공 후 Service 생성
-    set_pod_creation_status(username, "creating_services", "마이그레이션: NodePort 서비스 생성 중")
-    try:
-        create_nodeport_services(
-            username,
-            ns,
-            new_pod_name,
-            allocated_ports
-        )
-    except Exception:
-        set_pod_creation_status(username, "failed", "마이그레이션 실패: 서비스 생성 실패")
-        v1.delete_namespaced_pod(new_pod_name, ns)
-        release_nodeports(new_pod_name)
-        delete_account_secret(v1, ns, new_pod_name)
-        return jsonify({"error": "service creation failed"}), 500
-
-    # 10. 기존 Pod 정리 — 새 Pod는 이미 정상 기동되어 서비스 중이므로, 여기서 실패해도
-    # 마이그레이션 자체는 성공으로 응답한다 (호출자가 실패로 오인해 재시도하면 중복 Pod가 생길 수 있음).
-    # 다만 실패 사실은 응답에 남겨서 수동 정리가 필요함을 알 수 있게 한다.
-    old_pod_cleanup_failed = False
-    try:
-        delete_nodeport_services(old_pod_name, ns)
-        release_nodeports(old_pod_name)
-        delete_pod_util(old_pod_name, ns)
-        delete_account_secret(v1, ns, old_pod_name)
-    except Exception:
-        app.logger.exception(f"[MIGRATE] 기존 Pod({old_pod_name}) 정리 실패 — 새 Pod는 정상 기동됨, 수동 정리 필요")
-        old_pod_cleanup_failed = True
-
-    set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
-
-    response = {
-        "status": "migrated",
-        "from": current_node,
-        "to": best_node,
-        "new_pod": new_pod_name,
-        "ports": allocated_ports
-    }
-    if old_pod_cleanup_failed:
-        response["old_pod_cleanup"] = "failed"
-    return jsonify(response), 200
-
-
-@app.route("/migrate", methods=["POST"])
-@validate_body(MigrateRequest)
-def migrate(body: MigrateRequest):
-    """
-    Pod GPU 노드 마이그레이션
-
-    현재 실행 중인 사용자 Pod를 더 성능이 좋은 GPU 노드로 이동합니다.
-
-    동작 순서
-
-    1. 현재 Pod 조회
-    2. GPU score 계산
-    3. 더 좋은 노드 존재 시 마이그레이션
-    4. 기존 Pod commit
-    5. 새로운 Pod 생성
-    6. 기존 Pod 삭제
-
-    ---
-    tags:
-    - Migration
-
-    summary: GPU 노드 마이그레이션
-
-    consumes:
-    - application/json
-
-    parameters:
-
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/MigrateRequest'
-
-    responses:
-
-      200:
-        description: 마이그레이션 성공 또는 skip
-      400:
-        description: 잘못된 요청
-      404:
-        description: 실행 중 Pod 없음
-      500:
-        description: 서버 오류
-    """
-    # _migrate_internal은 dict를 받고 비율이 없으면 기본값을 쓰므로 None인 값은 뺀다.
-    data = body.model_dump(exclude_none=True)
-    username = body.username
-
-    lock_path = f"/tmp/migrate-{username}.lock"
-
-    with LockedFile(lock_path, "w"):
-        try:
-            return _migrate_internal(data)
-        except Exception as e:
-            app.logger.exception("[MIGRATE] unexpected error")
-            set_pod_creation_status(username, "failed", "마이그레이션 실패: 예기치 않은 오류")
-            return jsonify(infra_error(
-                "MIGRATE",
-                "MIGRATE_FAILED",
-                str(e),
-            )), 500
-
 
 
 # ---- SSH 호스트 키 ----
@@ -1012,7 +754,7 @@ accounts_bp = Blueprint("accounts", __name__)
 
 
 # ----------- Group management -----------
-@accounts_bp.route("/groups", methods=["PUT"])
+@accounts_bp.route("/groups", methods=["POST"])
 @validate_body(AddGroupRequest)
 def add_group(body: AddGroupRequest):
     """
@@ -1071,21 +813,22 @@ def add_group(body: AddGroupRequest):
         existing_users = {parse_passwd_line(l)["name"] for l in passwd_lines if parse_passwd_line(l)}
         invalid_members = [m for m in members if m not in existing_users]
         if invalid_members:
-            return jsonify({"error": f"invalid members (users not found): {', '.join(invalid_members)}"}), 400
+            return jsonify(infra_error("ADD_GROUP", "INVALID_GROUP_MEMBER",
+                                       f"invalid members (users not found): {', '.join(invalid_members)}")), 400
 
     ensure_etc_layout()
     with LockedFile(app.config["GROUP_PATH"], "r+") as f:
         g_lines = f.read().splitlines()
 
         if any((parse_group_line(gl) or {}).get("name") == name for gl in g_lines):
-            return jsonify({"error": f"group already exists (name: {name})"}), 409
+            return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_EXISTS", f"group already exists (name: {name})")), 409
 
         if gid is None:
             gid = _allocate_next_gid(g_lines, min_gid=UID_MIN)
             if UID_MAX is not None and gid > UID_MAX:
-                return jsonify({"error": f"gid range {UID_MIN}~{UID_MAX} exhausted"}), 500
+                return jsonify(infra_error("ADD_GROUP", "GID_RANGE_EXHAUSTED", f"gid range {UID_MIN}~{UID_MAX} exhausted")), 500
         elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
-            return jsonify({"error": f"group already exists (gid: {gid})"}), 409
+            return jsonify(infra_error("ADD_GROUP", "GROUP_GID_EXISTS", f"group already exists (gid: {gid})")), 409
 
         new_group = {
             "name": name,
@@ -1102,7 +845,7 @@ def add_group(body: AddGroupRequest):
     return jsonify({"group": {"name": name, "gid": gid}}), 201
 
 # ----------- Add user to supplementary groups -----------
-@accounts_bp.route("/users/<username>/groups", methods=["PUT"])
+@accounts_bp.route("/users/<username>/groups", methods=["POST"])
 @validate_body(AddUserGroupsRequest)
 def add_user_groups(username: str, body: AddUserGroupsRequest):
     """
@@ -1148,7 +891,7 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
             user_found = True
             break
     if not user_found:
-        return jsonify({"error": "user not found"}), 404
+        return jsonify(infra_error("ADD_USER_GROUPS", "USER_NOT_FOUND", f"user not found: {username}")), 404
 
     # Update group file
     g_lines = read_group_lines()
@@ -1171,13 +914,13 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
     existing_group_names = {parse_group_line(gl)["name"] for gl in g_lines if parse_group_line(gl)}
     missing = [g for g in groups if g not in existing_group_names]
     if missing:
-        return jsonify({"error": f"groups not found: {', '.join(missing)}"}), 404
+        return jsonify(infra_error("ADD_USER_GROUPS", "GROUP_NOT_FOUND", f"groups not found: {', '.join(missing)}")), 404
 
     write_group_lines(new_lines)
     return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
 
 # Register the blueprint under /accounts
-app.register_blueprint(accounts_bp, url_prefix="/accounts")
+app.register_blueprint(accounts_bp)
 
 # ==========================================
 # Swagger 설정
@@ -1267,6 +1010,10 @@ from lifecycle_steps.revoke import (  # noqa: E402
     step_remove_krb5, ACCOUNT_DELETE_STEPS,
 )
 
+from lifecycle_steps.migrate import (  # noqa: E402
+    step_migrate_select_target, step_migrate_inherit_password, step_migrate_cleanup_old, MIGRATE_STEPS,
+)
+
 # 작업 실행 엔진은 application/jobs.py로 이동했다(얇은 이동). 아래 재수출은 기존 소비자
 # (라우트·제어기·테스트의 main.* 참조)를 무수정으로 유지한다.
 from application.jobs import (  # noqa: E402
@@ -1303,7 +1050,7 @@ def _register_job(kind, request_id, username, job):
         delete_job_input(action.value, request_id)
         return jsonify(infra_error("REGISTER_JOB", "JOB_LOG_UNAVAILABLE", str(e))), 503
 
-    if kind == "provision":
+    if kind in ("provision", "migrate"):
         set_pod_creation_status(request_id, "started", "요청 접수")
     app.logger.info(f"[JOB] registered {kind} request_id={request_id} job_id={job_id} username={username}")
     return jsonify({"request_id": request_id, "job_id": job_id, "status": "accepted"}), 202
@@ -1373,6 +1120,36 @@ def register_revoke(body: RevokeRequest):
     return _register_job("revoke", body.request_id, username, job)
 
 
+@app.route("/operations/migrate", methods=["POST"])
+@validate_body(MigrateRequest)
+def register_migrate(body: MigrateRequest):
+    """
+    마이그레이션 작업 등록 (v2.0)
+
+    사용자 Pod를 다른 노드로 옮기는 작업을 등록하고 바로 202를 돌려준다. 제어기가 옮길 노드를 고르고(force면
+    개선 비율을 보지 않음), 새 노드에 Pod를 만들어 준비되면 기존 Pod를 정리한다. 옮길 이유가 없으면 작업은
+    성공으로 끝나고 결과의 status가 skipped다. 결과는 GET /operations/migrate/<request_id>로 조회한다.
+    홈 디렉터리는 유지되고 컨테이너 안의 시스템 변경은 유지되지 않는다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/MigrateRequest'
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 신청의 마이그레이션 작업이 아직 끝나지 않음}
+    """
+    job = {"username": body.username, "pod_name": body.pod_name, "nodes": body.nodes, "force": bool(body.force)}
+    if body.min_improvement_ratio is not None:
+        job["min_improvement_ratio"] = body.min_improvement_ratio
+    return _register_job("migrate", body.request_id, body.username, job)
+
+
 @app.route("/operations/<kind>/<request_id>", methods=["GET"])
 def get_job_result(kind, request_id):
     """
@@ -1386,7 +1163,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}
@@ -1394,7 +1171,7 @@ def get_job_result(kind, request_id):
     """
     action = JOB_ACTIONS.get(kind)
     if action is None:
-        return jsonify({"error": f"unknown job kind {kind!r}"}), 404
+        return jsonify(infra_error("GET_JOB", "UNKNOWN_JOB_KIND", f"unknown job kind {kind!r}")), 404
     conn = get_log_db_connection()
     try:
         with conn.cursor() as cur:
@@ -1421,6 +1198,8 @@ JOB_STEPS_MAX_JOBS = 5
 _STEP_SUMMARY_KEYS = ("expected_uid", "requested", "visible", "node", "placed_in_candidates", "roundtrip",
                       "owner_uid", "connected", "reason", "likely_cause", "step", "compensation",
                       "interrupted_after", "unknown", "degraded", "rc",
+                      # 진행 상황 변화 행
+                      "stage", "message",
                       # 컨테이너 준비 대기: 이미지 새로 받음/노드에 있던 이미지, 받은 시간·크기, 재시도 횟수
                       "image_source", "image_pull_seconds", "image_size_mb", "mount_retries", "restarts")
 _INTERNAL_ADDRESS = re.compile(r"\d{1,3}(\.\d{1,3}){3}|:/")
@@ -1465,7 +1244,7 @@ def get_job_steps(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공 — 작업이 없으면 jobs가 빈 목록}
@@ -1473,7 +1252,7 @@ def get_job_steps(kind, request_id):
     """
     action = JOB_ACTIONS.get(kind)
     if action is None:
-        return jsonify({"error": f"unknown job kind {kind!r}"}), 404
+        return jsonify(infra_error("GET_JOB", "UNKNOWN_JOB_KIND", f"unknown job kind {kind!r}")), 404
     conn = get_log_db_connection()
     try:
         with conn.cursor() as cur:

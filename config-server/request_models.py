@@ -124,10 +124,28 @@ class DeletePodRequest(RequestBody):
 
 
 class MigrateRequest(RequestBody):
+    request_id: str = Field(description="admin_be 신청 번호(양의 정수)", examples=["4821"])
+    pod_name: Optional[str] = Field(default=None, description="옮길 Pod. 없으면 사용자의 실행 중인 Pod",
+                                    examples=["ailab-exp-np-001-7f3a9c21"])
     username: str = Field(min_length=1, examples=["exp-np-001"])
     nodes: List[str] = Field(min_length=1, description="후보 노드 목록(현재 노드 포함)", examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
     force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
+
+    @field_validator("pod_name", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value):
+        return _optional_text(value)
+
+    @field_validator("pod_name")
+    @classmethod
+    def _pod(cls, value):
+        return _pod_name(value)
 
 
 class AddGroupRequest(RequestBody):
@@ -162,21 +180,27 @@ def _errors(exc: ValidationError):
     return out
 
 
+def check_values(model, data):
+    """값을 model로 검증한다. (모델, None) 또는 (None, 400 응답)."""
+    if not isinstance(data, dict):
+        return None, (jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REQUEST",
+                                          "요청 본문은 JSON 객체여야 합니다", errors=[])), 400)
+    try:
+        return model.model_validate(data), None
+    except ValidationError as exc:
+        errors = _errors(exc)
+        first = f"{errors[0]['field']}: {errors[0]['message']}" if errors else "잘못된 요청"
+        return None, (jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REQUEST", first, errors=errors)), 400)
+
+
 def validate_body(model):
     """요청 본문을 model로 검증해 경로 함수에 body 인자로 넘긴다. 실패하면 경로 함수를 부르지 않고 400."""
     def decorate(view):
         @functools.wraps(view)
         def wrapper(*args, **kwargs):
-            data = request.get_json(silent=True)
-            if not isinstance(data, dict):
-                return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REQUEST",
-                                           "요청 본문은 JSON 객체여야 합니다", errors=[])), 400
-            try:
-                body = model.model_validate(data)
-            except ValidationError as exc:
-                errors = _errors(exc)
-                first = f"{errors[0]['field']}: {errors[0]['message']}" if errors else "잘못된 요청"
-                return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REQUEST", first, errors=errors)), 400
+            body, error = check_values(model, request.get_json(silent=True))
+            if error is not None:
+                return error
             return view(*args, body=body, **kwargs)
         return wrapper
     return decorate
