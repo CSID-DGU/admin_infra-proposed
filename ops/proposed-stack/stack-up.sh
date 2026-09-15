@@ -147,18 +147,23 @@ step "SSH 호스트 키"
 # config-server가 farm·AD·NAS에 접속할 때 상대 서버를 확인하도록, 배포 서버에서 호스트 키를 모아 Secret으로 넣는다.
 # 주소가 공개 로그에 남지 않게 개수만 출력한다. 하나라도 받지 못하면 넣지 않는다(확인을 켜면 그 호스트 접속이 막힌다).
 KH_CHANGED=0
-TARGETS=$(python3 "$HERE/ssh_targets.py" "$BASE")
+# 배포 서버에 PyYAML이 없어도 되도록 helm 값을 JSON으로 받아 표준 라이브러리로만 읽는다.
+# 목록을 못 만들면 배포를 멈추지 않고 이번에는 호스트 키 확인을 바꾸지 않는다.
 KH_FILE=$(mktemp); KH_OK=0; KH_ALL=0
+if ! TARGETS=$(helm -n "$PROD_NS" get values "$PROD_RELEASE" -o json | python3 "$HERE/ssh_targets.py" 2>/dev/null); then
+  echo "접속 대상 목록을 만들지 못함"; TARGETS=""
+fi
 while read -r host port; do
   [ -n "$host" ] || continue
   KH_ALL=$((KH_ALL + 1))
-  if ssh-keyscan -T 5 -p "$port" "$host" 2>/dev/null | grep -v '^#' > "$KH_FILE.part" && [ -s "$KH_FILE.part" ]; then
+  if { ssh-keyscan -T 5 -p "$port" "$host" 2>/dev/null || true; } | { grep -v '^#' || true; } > "$KH_FILE.part" && [ -s "$KH_FILE.part" ]; then
     cat "$KH_FILE.part" >> "$KH_FILE"; KH_OK=$((KH_OK + 1))
   fi
   rm -f "$KH_FILE.part"
 done <<< "$TARGETS"
 if [ "$KH_ALL" -gt 0 ] && [ "$KH_OK" = "$KH_ALL" ]; then
-  OLD=$(kubectl -n "$NS" get secret config-server-ssh-known-hosts -o jsonpath='{.data.known_hosts}' 2>/dev/null | base64 -d 2>/dev/null | sort | sha256sum)
+  # 첫 배포엔 Secret이 없어 kubectl이 실패한다(pipefail로 스크립트가 멈추지 않게 빈 값으로 둔다).
+  OLD=$({ kubectl -n "$NS" get secret config-server-ssh-known-hosts -o jsonpath='{.data.known_hosts}' 2>/dev/null || true; } | { base64 -d 2>/dev/null || true; } | sort | sha256sum)
   NEW=$(sort "$KH_FILE" | sha256sum)
   kubectl -n "$NS" create secret generic config-server-ssh-known-hosts --from-file=known_hosts="$KH_FILE" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
