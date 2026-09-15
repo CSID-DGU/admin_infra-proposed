@@ -22,6 +22,8 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
+from request_models import (validate_body, swagger_definitions, ProvisionRequest, RevokeRequest,
+                            DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -111,12 +113,10 @@ def _enforce_account_prefix():
         names.append(request.view_args["username"])
     body = request.get_json(silent=True)
     if isinstance(body, dict):
-        if request.path in ("/create-pod", "/migrate", "/operations/provision", "/operations/revoke"):
+        if request.path in ("/migrate", "/operations/provision", "/operations/revoke"):
             names.append(body.get("username"))
         if request.path == "/operations/revoke" and str(body.get("pod_name") or "").startswith("ailab-"):
             names.append(_pod_username(body["pod_name"]))
-        elif request.path == "/accounts/users" and request.method == "PUT":
-            names.append(body.get("name"))
     bad = [n for n in names if n is not None and not str(n).startswith(ACCOUNT_PREFIX)]
     if bad:
         app.logger.warning(f"[PREFIX] 접두어 없는 계정 거절: {bad} ({request.method} {request.path})")
@@ -248,9 +248,8 @@ class PodSpecBuildError(Exception):
         self.progress = progress or {}
 
 # ////////////////////// 단계 실행 (v2.0) //////////////////////
-# 생성·회수 흐름을 단계 함수로 나눈다. 동기 엔드포인트(/create-pod, /delete-pod, PUT·DELETE
-# /accounts/users)와 제어기(controller.py)가 같은 단계 함수를 차례로 부르므로, 두 경로의 차이는
-# 실행 구조(요청 안에서 끝까지 실행하는지, 작업만 등록하고 제어기가 실행하는지)뿐이다.
+# 생성·회수 흐름을 단계 함수로 나눈다. 제어기(controller.py)가 작업마다 단계 함수를 차례로 부른다.
+# 남아 있는 동기 경로(/delete-pod)도 같은 단계 함수를 요청 안에서 끝까지 실행한다.
 
 class StepFailed(Exception):
     """단계가 실패로 끝남. body·status는 동기 엔드포인트가 그대로 돌려주는 응답이다."""
@@ -291,9 +290,6 @@ _RECONCILE_INTERVAL_SEC: int = 300
 
 
 
-
-
-
     
 
 
@@ -303,141 +299,17 @@ _RECONCILE_INTERVAL_SEC: int = 300
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@app.route("/create-pod", methods=["POST"])
-def create_pod():
-    """
-    사용자 컨테이너 Pod 생성 API
-
-    이 API는 Kubernetes에 사용자 Pod를 생성합니다.
-
-    동작 과정
-
-    1. WAS 서버에서 사용자 설정 조회
-    2. GPU 노드 중 가장 적합한 노드 선택
-    3. NodePort 자동 할당
-    4. Pod 생성
-    5. Service 생성
-
-    ---
-    tags:
-    - Pod
-
-    summary: 사용자 Pod 생성
-
-    description: |
-        특정 사용자 환경을 Kubernetes Pod로 생성합니다.
-
-    consumes:
-    - application/json
-
-    produces:
-    - application/json
-
-    parameters:
-
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/CreatePodRequest'
-
-    responses:
-
-      201:
-        description: Pod 생성 성공
-        schema:
-          $ref: '#/definitions/CreatePodResponse'
-      400:
-        description: username 누락
-        schema:
-          $ref: '#/definitions/ErrorResponse'
-      409:
-        description: 동일 Pod 이미 존재
-        schema:
-          $ref: '#/definitions/ErrorResponse'
-      500:
-        description: 서버 내부 오류
-        schema:
-          $ref: '#/definitions/ErrorResponse'
-    """
-    data = request.get_json(force=True)
-    username = data.get("username")
-    # 진행 상황 조회 키. username만으로는 한 사용자가 Pod를 여러 개 동시에 생성할 때
-    # 서로 다른 시도의 진행 상황이 같은 키에서 덮어써져 구분이 안 된다 — request_id는
-    # 신청 하나당 하나로 고정이라 이걸로 키를 잡는다.
-    request_id = data.get("request_id")
-
-    app.logger.info(f"[CREATE POD] request received - username={username} request_id={request_id}")
-    if username:
-        set_pod_creation_status(request_id, "started", "요청 접수")
-
-    if not username:
-        app.logger.warning("[CREATE POD] username missing in request")
-        return jsonify(infra_error(
-            "VALIDATE_REQUEST",
-            "INVALID_CREATE_POD_REQUEST",
-            "username required",
-        )), 400
-
-    if not request_id:
-        app.logger.warning("[CREATE POD] request_id missing in request")
-        return jsonify(infra_error(
-            "VALIDATE_REQUEST",
-            "INVALID_CREATE_POD_REQUEST",
-            "request_id required",
-        )), 400
-
-    ctx = {"request_id": request_id, "username": username}
-    try:
-        for step in POD_CREATE_STEPS:
-            step(ctx)
-    except StepFailed as e:
-        return jsonify(e.body), e.status
-    except Exception as e:
-        app.logger.exception("[CREATE POD] unexpected error")
-        set_pod_creation_status(request_id, "failed", "예기치 않은 오류")
-        return jsonify(infra_error(
-            "CREATE_POD",
-            "CREATE_POD_FAILED",
-            str(e),
-        )), 500
-
-    return jsonify({
-        "status": "created",
-        "node": ctx["node"],
-        "pod_name": ctx["pod_name"],
-        "ports": ctx["allocated_ports"]
-    }), 201
-
-
 @app.route("/requests/<request_id>/status", methods=["GET"])
 def get_pod_status(request_id):
     """
     신청(request) 단위 Pod 생성 진행 상황 조회
 
-    /create-pod는 이미지 pull 등으로 오래(최대 POD_READY_MAX_WAIT_SEC초) 걸릴 수 있는
-    동기 API라서, 그 요청이 끝나기 전에 별도로 진행 상황만 가볍게 조회하기 위한 엔드포인트.
-    한 사용자가 Pod를 여러 개 동시에 생성할 수 있어 username이 아니라 request_id로 조회한다
-    (create-pod 호출 시 넘긴 request_id와 동일한 값).
+    생성 작업은 이미지 pull 등으로 오래(최대 POD_READY_MAX_WAIT_SEC초) 걸릴 수 있어, 작업이 끝나기 전에
+    진행 상황만 가볍게 조회하기 위한 엔드포인트. 한 사용자가 Pod를 여러 개 동시에 생성할 수 있어
+    username이 아니라 request_id로 조회한다(생성 작업을 등록할 때 넘긴 request_id와 같은 값).
 
     stage는 다음 순서로 진행되며, 최종 상태는 ready 또는 failed다:
-      - unknown            : 생성 이력 없음 (한 번도 /create-pod를 호출한 적 없음)
+      - unknown            : 생성 이력 없음 (생성 작업을 등록한 적 없음)
       - started             : 요청 접수
       - selecting_node      : GPU 노드 선택 중 (Prometheus 스코어링)
       - building_pod_spec   : pod spec 생성 시작 (바로 아래 두 단계로 넘어가는 과도 상태)
@@ -515,18 +387,6 @@ def get_pod_status(request_id):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # //////////////////////// Pod 삭제 //////////////////////
 
 # ---------- Pod 회수 단계 (v2.0) ----------
@@ -534,18 +394,9 @@ def get_pod_status(request_id):
 
 
 
-
-
-
-
-
-
-
-
-
-
 @app.route("/delete-pod", methods=["POST"])
-def delete_pod():
+@validate_body(DeletePodRequest)
+def delete_pod(body: DeletePodRequest):
     """
     사용자 Pod 삭제 API
 
@@ -591,36 +442,15 @@ def delete_pod():
         schema:
           $ref: '#/definitions/ErrorResponse'
     """
-    data = request.get_json(force=True)
-    pod_name = data.get("pod_name")
-
+    pod_name = body.pod_name
     app.logger.info(f"[DELETE POD] request received - pod_name={pod_name}")
-
-    if not pod_name:
-        app.logger.warning("[DELETE POD] pod_name missing")
-        return jsonify(infra_error(
-            "VALIDATE_REQUEST",
-            "INVALID_DELETE_POD_REQUEST",
-            "pod_name required",
-        )), 400
-
     rollback = _new_delete_rollback()
 
     try:
-        if not pod_name.startswith("ailab-"):
-            app.logger.warning(f"[DELETE POD] invalid pod_name format: {pod_name}")
-            return jsonify(infra_error(
-                "VALIDATE_REQUEST",
-                "INVALID_POD_NAME",
-                "invalid pod_name",
-                rollback=rollback,
-                pod_name=pod_name,
-            )), 400
-
         username = _pod_username(pod_name)
         # admin_be는 이 Pod를 만든 신청 PK를 request_id로 보낸다. 대응하는 신청이 없는
         # 고아 Pod 정리처럼 값이 없는 호출은 이 삭제 호출 하나만을 묶는 임시 키로 기록한다.
-        request_id = data.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+        request_id = body.request_id or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
         ctx = {"request_id": request_id, "username": username, "pod_name": pod_name, "rollback": rollback}
@@ -766,9 +596,9 @@ def _migrate_internal(data):
         release_nodeports(new_pod_name)
         raise
 
-    # 8. Ready 대기 (create-pod와 동일하게 POD_READY_MAX_WAIT_SEC를 쓴다 —
+    # 8. Ready 대기 (생성 작업과 같은 POD_READY_MAX_WAIT_SEC를 쓴다 —
     # 예전엔 60초로 하드코딩돼 있어서 이미지 pull이 오래 걸리는 이미지는
-    # create-pod보다 훨씬 먼저 실패 처리되는 불일치가 있었다.)
+    # 생성보다 훨씬 먼저 실패 처리되는 불일치가 있었다.)
     migrate_failure_reason = None
     max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
     last_progress_stage = None
@@ -840,7 +670,8 @@ def _migrate_internal(data):
 
 
 @app.route("/migrate", methods=["POST"])
-def migrate():
+@validate_body(MigrateRequest)
+def migrate(body: MigrateRequest):
     """
     Pod GPU 노드 마이그레이션
 
@@ -870,25 +701,7 @@ def migrate():
         name: body
         required: true
         schema:
-          type: object
-          required:
-            - username
-            - nodes
-          properties:
-            username:
-              type: string
-              description: 사용자 이름
-              example: alice
-            nodes:
-              type: array
-              items:
-                type: string
-              example:
-                - gpu-node-1
-                - gpu-node-2
-            min_improvement_ratio:
-              type: number
-              example: 0.2
+          $ref: '#/definitions/MigrateRequest'
 
     responses:
 
@@ -901,14 +714,9 @@ def migrate():
       500:
         description: 서버 오류
     """
-    data = request.get_json(force=True)
-    username = data.get("username")
-    nodes = data.get("nodes")
-
-    if not username or not nodes or not isinstance(nodes, list):
-        return jsonify({
-            "error": "username and nodes(list) are required"
-        }), 400
+    # _migrate_internal은 dict를 받고 비율이 없으면 기본값을 쓰므로 None인 값은 뺀다.
+    data = body.model_dump(exclude_none=True)
+    username = body.username
 
     lock_path = f"/tmp/migrate-{username}.lock"
 
@@ -923,7 +731,6 @@ def migrate():
                 "MIGRATE_FAILED",
                 str(e),
             )), 500
-
 
 
 
@@ -1141,472 +948,21 @@ def _remove_krb5_from_all_farms(username: str) -> None:
 
 accounts_bp = Blueprint("accounts", __name__)
 
-# ---------- /etc/passwd CRUD ----------
-@accounts_bp.route("/users", methods=["GET"])
-def list_users():
-    """
-    사용자 목록 조회
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 시스템 사용자 목록
-
-    responses:
-
-      200:
-        description: 사용자 목록 반환
-      500:
-        description: 서버 오류
-    """
-    try:
-        lines = read_passwd_lines()
-        users = []
-        for line in lines:
-            rec = parse_passwd_line(line)
-            if rec:
-                users.append({
-                    "name": rec["name"],
-                    "uid": rec["uid"],
-                    "gid": rec["gid"],
-                    "gecos": rec.get("gecos", ""),
-                    "home": rec["home"],
-                    "shell": rec["shell"]
-                })
-        return jsonify({"users": users}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@accounts_bp.route("/users/<username>", methods=["GET"])
-def get_user(username: str):
-    """
-    특정 사용자 상세 정보 조회
-
-    사용자의 기본 계정 정보와 소속 그룹 정보를 반환합니다.
-
-    조회 정보
-
-    - UID
-    - GID
-    - 홈 디렉토리
-    - 쉘
-    - primary group
-    - supplementary groups
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 사용자 상세 정보 조회
-
-    parameters:
-
-      - in: path
-        name: username
-        required: true
-        type: string
-        description: 조회할 사용자 이름
-        example: user2100
-
-    responses:
-
-      200:
-        description: 사용자 정보 반환
-        schema:
-          type: object
-          properties:
-            user:
-              type: object
-              properties:
-                name:
-                  type: string
-                  example: user2100
-                uid:
-                  type: integer
-                  example: 2100
-                gid:
-                  type: integer
-                  example: 2100
-                home:
-                  type: string
-                  example: /home/user2100
-                shell:
-                  type: string
-                  example: /bin/bash
-            groups:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: developers
-                  gid:
-                    type: integer
-                    example: 3001
-                  type:
-                    type: string
-                    example: supplementary
-      404:
-        description: 사용자 없음
-        schema:
-          $ref: '#/definitions/ErrorResponse'
-      500:
-        description: 서버 오류
-        schema:
-          $ref: '#/definitions/ErrorResponse'
-    """
-    try:
-        # Find user in passwd
-        lines = read_passwd_lines()
-        user_rec = None
-        for line in lines:
-            rec = parse_passwd_line(line)
-            if rec and rec["name"] == username:
-                user_rec = rec
-                break
-
-        if not user_rec:
-            return jsonify({"error": "user not found"}), 404
-
-        # Get group memberships
-        g_lines = read_group_lines()
-        groups = []
-
-        for gl in g_lines:
-            grec = parse_group_line(gl)
-            if not grec:
-                continue
-
-            # Primary group
-            if grec["gid"] == user_rec["gid"]:
-                groups.append({
-                    "name": grec["name"],
-                    "gid": grec["gid"],
-                    "type": "primary"
-                })
-            # Supplementary groups
-            elif username in grec.get("members", []):
-                groups.append({
-                    "name": grec["name"],
-                    "gid": grec["gid"],
-                    "type": "supplementary"
-                })
-
-        return jsonify({
-            "user": {
-                "name": user_rec["name"],
-                "uid": user_rec["uid"],
-                "gid": user_rec["gid"],
-                "gecos": user_rec.get("gecos", ""),
-                "home": user_rec["home"],
-                "shell": user_rec["shell"]
-            },
-            "groups": groups
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
-
-
 # ---------- 계정 생성 단계 (v2.0) ----------
 # 순서: 계정(passwd·group·shadow·sudoers) → NAS 홈 → Kerberos principal
 
 
 
-
-
-
-
-
-
-@accounts_bp.route("/users", methods=["PUT"])
-def create_user():
-    """
-    사용자 생성 API
-
-    시스템에 새로운 Linux 사용자를 생성합니다.
-
-    생성 대상 파일
-
-    - /etc/passwd
-    - /etc/shadow
-    - /etc/group
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 사용자 생성
-
-    consumes:
-    - application/json
-
-    parameters:
-
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required:
-            - name
-            - passwd_base64
-          properties:
-            name:
-              type: string
-              description: 사용자 이름
-              example: user2100
-            passwd_base64:
-              type: string
-              description: Base64 인코딩된 평문 패스워드
-              example: "cGFzc3dvcmQ="
-            gecos:
-              type: string
-              example: "GPU User"
-            primary_group_name:
-              type: string
-              example: user2100
-            supplementary_groups:
-              type: array
-              description: 추가 소속 그룹 목록 (없으면 생략 가능)
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: ailab
-                  gid:
-                    type: integer
-                    example: 2001
-
-    responses:
-
-      201:
-        description: 사용자 생성 성공
-      400:
-        description: 필수 필드 누락
-      409:
-        description: 사용자 이미 존재
-      500:
-        description: 서버 오류
-    """
-    data = request.get_json(force=True)
-    required = ["name", "passwd_base64"]
-    missing = [k for k in required if k not in data]
-    if missing:
-        return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
-
-    name = data["name"]
-    pg_name = data.get("primary_group_name", name)
-    supp_groups = data.get("supplementary_groups", [])
-
-    for sg in supp_groups:
-        if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
-            return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
-
-    try:
-        plaintext_pw = base64.b64decode(data["passwd_base64"], validate=True).decode("utf-8")
-    except Exception:
-        return jsonify({"error": "invalid passwd_base64"}), 400
-
-    # admin_be는 /create-pod와 같은 신청 PK를 request_id로 보낸다. 그래야 한 승인의 계정
-    # 생성 이력과 Pod 생성 이력이 하나의 request_id로 묶인다. 값이 없는 호출(직접 호출 등)은
-    # 이 계정생성 호출 하나만을 묶는 임시 키로 기록한다.
-    request_id = data.get("request_id") or f"{name}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-    ctx = {
-        "request_id": request_id,
-        "name": name,
-        "pg_name": pg_name,
-        "supp_groups": supp_groups,
-        "gecos": data.get("gecos", ""),
-        "plaintext_pw": plaintext_pw,
-    }
-    try:
-        for step in ACCOUNT_CREATE_STEPS:
-            step(ctx)
-    except StepFailed as e:
-        return jsonify(e.body), e.status
-
-    return jsonify({
-        "status": "created",
-        "user": ctx["entry"],
-        "group": {"name": pg_name, "gid": ctx["gid"]},
-        "supplementary_groups": ctx["added_supp"],
-        "sudoers": ctx["s_path"],
-    }), 201
-
-
 # ---------- 계정 회수 단계 (v2.0) ----------
 # 순서: 계정(passwd·shadow·group) → NAS 홈 → Kerberos principal·keytab
-# 동기 계정 삭제(DELETE /accounts/users)는 세 단계를 모두 거친다. 제어기의 회수 작업은 보존 대상인
-# 홈을 지우지 않으므로 홈 단계를 빼고 실행한다(논문 REVOKED 정의, 계획서 v2.0).
+# 제어기의 회수 작업은 보존 대상인 홈을 지우지 않으므로 홈 단계를 빼고 실행한다(논문 REVOKED 정의, 계획서 v2.0).
 
 
-
-
-
-
-
-
-
-
-
-@accounts_bp.route("/users/<username>", methods=["DELETE"])
-def delete_user(username: str):
-    """
-    사용자 삭제 API
-
-    다음 정보를 제거합니다.
-
-    - /etc/passwd
-    - /etc/shadow
-    - /etc/group
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 사용자 삭제
-
-    parameters:
-
-      - in: path
-        name: username
-        required: true
-        type: string
-        example: user2100
-      - in: query
-        name: node_name
-        required: false
-        type: string
-        description: >
-          이번 삭제가 실제로 정리해야 하는 farm 노드. 주면 그 노드만 KRB5 정리를 시도한다.
-          안 주면(하위 호환) 예전처럼 설정된 모든 farm 노드를 훑는데, 이러면 이번 계정과
-          무관한 farm에 살아있는 동일 이름 레거시 계정까지 잘못 건드릴 수 있으니, 어느
-          노드에 배포했는지 아는 호출자는 반드시 넘겨야 한다.
-        example: farm2
-      - in: query
-        name: request_id
-        required: false
-        type: string
-        description: >
-          이 회수를 유발한 승인 번호. 작업 이력을 승인 1건 단위로 묶는 키이므로,
-          아는 호출자는 반드시 넘겨야 한다. 안 주면 생성 쪽 이력과 조인할 수 없는
-          임시 키로 기록된다. 계정은 신청이 아니라 웹 계정에 귀속되어 있어
-          호출자가 승인 번호를 특정하지 못하는 경우가 있다.
-        example: "4821"
-
-    responses:
-
-      200:
-        description: 삭제 성공
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-              example: deleted
-      404:
-        description: 사용자 없음
-      500:
-        description: 서버 오류
-    """
-    node_name = request.args.get("node_name")
-    # 회수 이력도 생성 쪽(/create-pod, PUT /accounts/users)과 같은 키로 묶는다. 그래야 한
-    # 승인의 생성부터 회수까지가 하나의 request_id로 조회되고 회수 소요시간이 나온다.
-    # 계정은 신청이 아니라 웹 계정에 귀속되어 있어 호출자가 승인 번호를 특정하지 못하는
-    # 경우가 있는데, 그때는 생성 이력과 조인되지 않는 임시 키로 떨어진다.
-    request_id = request.args.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-    ctx = {"request_id": request_id, "username": username, "node_name": node_name}
-    try:
-        for step in ACCOUNT_DELETE_STEPS:
-            step(ctx)
-    except StepFailed as e:
-        return jsonify(e.body), e.status
-
-    return jsonify({"status": "deleted", "user": username})
-
-
-@accounts_bp.route("/groups/<groupname>", methods=["DELETE"])
-def delete_group(groupname: str):
-    """
-    그룹 삭제 API
-
-    특정 Linux 그룹을 삭제합니다.
-
-    주의
-
-    - 해당 그룹이 사용자 primary group이면 삭제 불가
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 그룹 삭제
-
-    parameters:
-
-      - in: path
-        name: groupname
-        required: true
-        type: string
-        example: developers
-
-    responses:
-
-      200:
-        description: 삭제 성공
-      400:
-        description: primary group 사용 중
-      404:
-        description: 그룹 없음
-    """
-    # Check if group exists
-    g_lines = read_group_lines()
-    group_found = None
-    new_lines = []
-    
-    for line in g_lines:
-        rec = parse_group_line(line)
-        if rec and rec["name"] == groupname:
-            group_found = rec
-            continue
-        new_lines.append(line)
-    
-    if not group_found:
-        return jsonify({"error": "group not found"}), 404
-    
-    # Check if this group is used as primary group by any user
-    passwd_lines = read_passwd_lines()
-    users_with_primary_gid = []
-    for line in passwd_lines:
-        user_rec = parse_passwd_line(line)
-        if user_rec and user_rec["gid"] == group_found["gid"]:
-            users_with_primary_gid.append(user_rec["name"])
-    
-    if users_with_primary_gid:
-        return jsonify({
-            "error": f"Cannot delete group {groupname}: it is the primary group for users: {', '.join(users_with_primary_gid)}"
-        }), 400
-    
-    # Remove group
-    write_group_lines(new_lines)
-    
-    return jsonify({
-        "status": "deleted", 
-        "group": groupname,
-        "gid": group_found["gid"]
-    })
 
 # ----------- Group management -----------
 @accounts_bp.route("/groups", methods=["PUT"])
-def add_group():
+@validate_body(AddGroupRequest)
+def add_group(body: AddGroupRequest):
     """
     그룹 생성 API
 
@@ -1627,28 +983,7 @@ def add_group():
         name: body
         required: true
         schema:
-          type: object
-          required:
-            - name
-          example:
-            name: developers
-            members:
-              - user2100
-              - user2101
-          properties:
-            name:
-              type: string
-              example: developers
-            gid:
-              type: integer
-              description: 생략 시 /kube_share/group 기준으로 자동 할당
-            members:
-              type: array
-              items:
-                type: string
-              example:
-                - user2100
-                - user2101
+          $ref: '#/definitions/AddGroupRequest'
 
     responses:
 
@@ -1676,32 +1011,7 @@ def add_group():
       409:
         description: 그룹 이미 존재
     """
-    data = request.get_json(force=True)
-    required = ["name"]
-    missing = [k for k in required if k not in data]
-    if missing:
-        return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
-
-    name = data["name"]
-    members = data.get("members", [])
-
-    gid = None
-    gid_raw = data.get("gid")
-    if gid_raw not in (None, ""):
-        if isinstance(gid_raw, bool):
-            return jsonify({"error": "gid must be an integer"}), 400
-        if isinstance(gid_raw, int):
-            gid = gid_raw
-        elif isinstance(gid_raw, str):
-            try:
-                gid = int(gid_raw)
-            except ValueError:
-                return jsonify({"error": "gid must be an integer"}), 400
-        else:
-            return jsonify({"error": "gid must be an integer"}), 400
-
-    if not isinstance(members, list):
-        return jsonify({"error": "members must be a list"}), 400
+    name, gid, members = body.name, body.gid, body.members
 
     # Validate that all members exist as users
     if members:
@@ -1741,7 +1051,8 @@ def add_group():
 
 # ----------- Add user to supplementary groups -----------
 @accounts_bp.route("/users/<username>/groups", methods=["PUT"])
-def add_user_groups(username: str):
+@validate_body(AddUserGroupsRequest)
+def add_user_groups(username: str, body: AddUserGroupsRequest):
     """
     사용자 보조 그룹 추가 API
 
@@ -1764,15 +1075,7 @@ def add_user_groups(username: str):
         name: body
         required: true
         schema:
-          type: object
-          properties:
-            groups:
-              type: array
-              items:
-                type: string
-              example:
-                - developers
-                - ai-lab
+          $ref: '#/definitions/AddUserGroupsRequest'
 
     responses:
 
@@ -1783,10 +1086,7 @@ def add_user_groups(username: str):
       400:
         description: groups 필드 누락
     """
-    data = request.get_json(force=True)
-    groups = data.get("groups") or []
-    if not groups:
-        return jsonify({"error": "'groups' list is required"}), 400
+    groups = body.groups
 
     # Verify user exists and capture their name
     user_found = False
@@ -1851,77 +1151,18 @@ swagger_template = {
         "description": "Kubernetes Pod 동적 할당 및 시스템 계정 관리 API",
         "version": "1.0.0"
     },
-    # "definitions": {}  # 정의가 없어도 에러 안 나도록 빈 객체 추가
+    # 요청 스키마는 request_models의 모델에서 만든다(경로 docstring은 $ref만 적는다).
     "definitions": {
-
-        "CreatePodRequest": {
-            "type": "object",
-            "required": ["username"],
-            "properties": {
-                "username": {
-                    "type": "string",
-                    "description": "Pod를 생성할 사용자 이름",
-                    "example": "user2100"
-                }
-            }
-        },
-
-        "CreatePodResponse": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "example": "created"
-                },
-                "node": {
-                    "type": "string",
-                    "example": "...RTX 3080..."
-                },
-                "pod_name": {
-                    "type": "string",
-                    "example": "ailab-user2100-1"
-                },
-                "ports": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "internal_port": {
-                                "type": "integer",
-                                "example": 22
-                            },
-                            "external_port": {
-                                "type": "integer",
-                                "example": 30001
-                            },
-                            "usage_purpose": {
-                                "type": "string",
-                                "example": "ssh"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-
-        "DeletePodRequest": {
-            "type": "object",
-            "required": ["pod_name"],
-            "properties": {
-                "pod_name": {
-                    "type": "string",
-                    "example": "ailab-user2100-1"
-                }
-            }
-        },
+        **swagger_definitions(),
 
         "ErrorResponse": {
             "type": "object",
             "properties": {
-                "error": {
-                    "type": "string",
-                    "example": "username required"
-                }
+                "step": {"type": "string", "example": "VALIDATE_REQUEST"},
+                "error": {"type": "string", "example": "INVALID_REQUEST"},
+                "detail": {"type": "string", "example": "request_id: request_id는 admin_be 신청 번호(양의 정수)여야 합니다"},
+                "errors": {"type": "array", "items": {"type": "object", "properties": {
+                    "field": {"type": "string"}, "message": {"type": "string"}}}}
             }
         }
     }
@@ -1943,17 +1184,6 @@ swagger = Swagger(app, config=swagger_config, template=swagger_template)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 # 홈 생성(mkdir -p)과 회수 경로 전 단계는 원래 멱등이라 재실행이 곧 관찰이다.
 
 # 재실행 전에 앞선 시도의 흔적을 걷어내 멱등하게 만드는 사전 정리. 첫 실행에 돌아도 해가 없다.
@@ -1964,15 +1194,6 @@ swagger = Swagger(app, config=swagger_config, template=swagger_template)
 # 막는다). Pod가 이미 만들어졌으면 spec이 필요 없으므로 건너뛴다.
 
 # 이어하기 때 복원하는 컨텍스트. JSON으로 남길 수 있는 값만.
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2002,12 +1223,6 @@ from application.jobs import (  # noqa: E402
     _record_job_result, _compensate_provision, run_job, _release_lease, _run_job,
     _observe_account_created, _observe_krb5_principal, _observe_pod_created,
 )
-
-
-def _job_request_id(value):
-    """작업 이력을 admin_be 신청 기록과 조인하는 키이자 사용자 설정 조회 키라 신청 PK(양의 정수)만 받는다."""
-    text = str(value).strip() if value is not None and not isinstance(value, bool) else ""
-    return str(int(text)) if text.isdigit() and int(text) > 0 else None
 
 
 def _register_job(kind, request_id, username, job):
@@ -2042,7 +1257,8 @@ def _register_job(kind, request_id, username, job):
 
 
 @app.route("/operations/provision", methods=["POST"])
-def register_provision():
+@validate_body(ProvisionRequest)
+def register_provision(body: ProvisionRequest):
     """
     생성 작업 등록 (v2.0)
 
@@ -2057,54 +1273,28 @@ def register_provision():
         name: body
         required: true
         schema:
-          type: object
-          required: [request_id, username]
-          properties:
-            request_id: {type: integer, example: 4821, description: admin_be 신청 번호}
-            username: {type: string, example: exp-np-001}
-            account:
-              type: object
-              description: PUT /accounts/users와 같은 필드(name 제외)
-              properties:
-                passwd_base64: {type: string}
-                gecos: {type: string}
-                primary_group_name: {type: string}
-                supplementary_groups: {type: array, items: {type: object}}
+          $ref: '#/definitions/ProvisionRequest'
     responses:
       202: {description: 등록됨}
       400: {description: 입력 오류}
       409: {description: 같은 신청의 생성 작업이 아직 끝나지 않음}
     """
-    data = request.get_json(force=True) or {}
-    request_id, username = _job_request_id(data.get("request_id")), data.get("username")
-    if not request_id or not username:
-        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_PROVISION_REQUEST",
-                                   "request_id(admin_be 신청 번호, 양의 정수) and username required")), 400
-
+    username = body.username
     job = {"username": username}
-    account = data.get("account")
-    if account is not None:
-        if not isinstance(account, dict) or "passwd_base64" not in account:
-            return jsonify({"error": "missing fields: account.passwd_base64"}), 400
-        supp_groups = account.get("supplementary_groups", [])
-        for sg in supp_groups:
-            if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
-                return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
-        try:
-            plaintext_pw = base64.b64decode(account["passwd_base64"], validate=True).decode("utf-8")
-        except Exception:
-            return jsonify({"error": "invalid passwd_base64"}), 400
+    if body.account is not None:
+        account = body.account
         job["account"] = {
-            "pg_name": account.get("primary_group_name", username),
-            "supp_groups": supp_groups,
-            "gecos": account.get("gecos", ""),
-            "passwd_hash": crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512)),
+            "pg_name": account.primary_group_name or username,
+            "supp_groups": [group.model_dump() for group in account.supplementary_groups],
+            "gecos": account.gecos,
+            "passwd_hash": crypt.crypt(account.plaintext_password(), crypt.mksalt(crypt.METHOD_SHA512)),
         }
-    return _register_job("provision", str(request_id), username, job)
+    return _register_job("provision", body.request_id, username, job)
 
 
 @app.route("/operations/revoke", methods=["POST"])
-def register_revoke():
+@validate_body(RevokeRequest)
+def register_revoke(body: RevokeRequest):
     """
     회수 작업 등록 (v2.0)
 
@@ -2118,34 +1308,16 @@ def register_revoke():
         name: body
         required: true
         schema:
-          type: object
-          required: [request_id]
-          properties:
-            request_id: {type: integer, example: 4821, description: admin_be 신청 번호}
-            pod_name: {type: string, example: ailab-exp-np-001-7f3a9c21}
-            username: {type: string, description: pod_name이 없을 때 필요}
-            node_name: {type: string, description: keytab을 지울 노드. 없으면 지운 Pod의 노드}
-            delete_account: {type: boolean, default: false}
+          $ref: '#/definitions/RevokeRequest'
     responses:
       202: {description: 등록됨}
       400: {description: 입력 오류}
       409: {description: 같은 신청의 회수 작업이 아직 끝나지 않음}
     """
-    data = request.get_json(force=True) or {}
-    request_id = _job_request_id(data.get("request_id"))
-    pod_name = data.get("pod_name")
-    delete_account = bool(data.get("delete_account"))
-    if pod_name and not str(pod_name).startswith("ailab-"):
-        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_POD_NAME", "invalid pod_name")), 400
-    username = data.get("username") or (_pod_username(pod_name) if pod_name else None)
-    if not request_id or not username or not (pod_name or delete_account):
-        return jsonify(infra_error("VALIDATE_REQUEST", "INVALID_REVOKE_REQUEST",
-                                   "request_id(admin_be 신청 번호, 양의 정수) and pod_name, "
-                                   "or username with delete_account, required")), 400
-
-    job = {"username": username, "pod_name": pod_name, "node_name": data.get("node_name"),
-           "delete_account": delete_account}
-    return _register_job("revoke", str(request_id), username, job)
+    username = body.username or _pod_username(body.pod_name)
+    job = {"username": username, "pod_name": body.pod_name, "node_name": body.node_name,
+           "delete_account": body.delete_account}
+    return _register_job("revoke", body.request_id, username, job)
 
 
 @app.route("/operations/<kind>/<request_id>", methods=["GET"])
@@ -2156,7 +1328,7 @@ def get_job_result(kind, request_id):
     phase: none(등록 이력 없음) / START(대기·실행 중) / SUCCESS / FAIL / UNKNOWN
 
     성공한 작업은 만든 자원을 result로 함께 돌려준다(생성: 계정 uid·gid, Pod 이름·노드, 외부 포트
-    목록 — 포트는 /create-pod 응답과 같은 형식). 하루가 지나면 result는 사라지고 phase만 남는다.
+    목록 — 포트는 internal_port·external_port·usage_purpose). 하루가 지나면 result는 사라지고 phase만 남는다.
     ---
     tags:
     - Operations
@@ -2293,19 +1465,6 @@ def get_job_steps(kind, request_id):
         })
     return jsonify({"request_id": str(request_id), "kind": kind,
                     "jobs": [jobs[job_id] for job_id in job_ids]}), 200
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -7,3 +7,4 @@ requests
 flasgger
 gunicorn
 paramiko
+pydantic>=2.7,<3
