@@ -760,6 +760,24 @@ def migrate(body: MigrateRequest):
 
 
 
+# ---- SSH 호스트 키 ----
+# farm·AD·NAS 접속은 배포 때 수집한 호스트 키(known_hosts, Secret)로 상대 서버를 확인한다. 확인하지 않으면
+# 중간에 끼어든 서버가 keytab(deploy 입력)이나 계정 명령을 받아 갈 수 있다. 파일이 없는 환경(수집 전)은
+# 예전처럼 확인하지 않고 경고만 남긴다.
+SSH_KNOWN_HOSTS_FILE = os.getenv("SSH_KNOWN_HOSTS_FILE", "/etc/ssh-known-hosts/known_hosts")
+
+
+def _known_hosts_available() -> bool:
+    return os.path.isfile(SSH_KNOWN_HOSTS_FILE) and os.path.getsize(SSH_KNOWN_HOSTS_FILE) > 0
+
+
+def _ssh_host_key_options() -> list:
+    if _known_hosts_available():
+        return ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE}"]
+    app.logger.warning(f"[SSH] 호스트 키 파일이 없어 상대 서버를 확인하지 않음: {SSH_KNOWN_HOSTS_FILE}")
+    return ["-o", "StrictHostKeyChecking=no"]
+
+
 # ---- Kerberos AD helpers ----
 
 def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
@@ -773,7 +791,7 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
     for node in nodes:
         cmd = ["ssh",
                "-i", app.config["FARM_AD_SSH_KEY_PATH"],
-               "-o", "StrictHostKeyChecking=no",
+               *_ssh_host_key_options(),
                "-o", "BatchMode=yes",
                "-o", "ConnectTimeout=10",
                "-p", str(node["port"]),
@@ -843,7 +861,7 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     cmd = ["ssh",
            "-v",
            "-i", app.config["FARM_SSH_KEY_PATH"],
-           "-o", "StrictHostKeyChecking=no",
+           *_ssh_host_key_options(),
            "-o", "BatchMode=yes",
            "-o", "GSSAPIAuthentication=no",
            "-o", "ConnectTimeout=10",
