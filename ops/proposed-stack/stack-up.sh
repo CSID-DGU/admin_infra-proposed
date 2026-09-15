@@ -143,6 +143,16 @@ kubectl -n "$NS" create secret generic log-mysql-secret \
   --from-literal=MYSQL_PASSWORD="$(getpw log_db_user)" --from-literal=MYSQL_ROOT_PASSWORD="$(getpw root)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
+step "config-server 내부 API 토큰"
+TOKEN_NEW=0
+if [ -z "$(kubectl -n "$NS" get secret stack-db -o jsonpath='{.data.config_api_token}')" ]; then
+  kubectl -n "$NS" patch secret stack-db -p "{\"data\":{\"config_api_token\":\"$(rnd 32 | base64 -w0)\"}}" >/dev/null
+  TOKEN_NEW=1
+fi
+kubectl -n "$NS" create secret generic config-server-api-token --from-literal=token="$(getpw config_api_token)" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+echo "$([ "$TOKEN_NEW" = 1 ] && echo 새로 생성 || echo 기존 값 유지)"
+
 step "MySQL"
 render "$HERE/mysql.yaml" | kubectl apply -f -
 kubectl -n "$NS" rollout status statefulset/mysql --timeout=10m
@@ -191,6 +201,12 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set imageStore.claimName= \
   --set controller.enabled=true \
   --wait --timeout 10m
+if [ "$TOKEN_NEW" = 1 ]; then
+  # 토큰 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.
+  kubectl -n "$NS" rollout restart deployment/"$RELEASE" deployment/"$RELEASE-controller" >/dev/null
+  kubectl -n "$NS" rollout status deployment/"$RELEASE" --timeout=10m
+  kubectl -n "$NS" rollout status deployment/"$RELEASE-controller" --timeout=10m
+fi
 
 step "admin_be"
 ADMIN_IMAGE=$BE_IMAGE
@@ -208,7 +224,7 @@ PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpat
 SINK=http://127.0.0.1:9/
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
@@ -293,6 +309,8 @@ step "검증 (admin_be·프론트엔드 연결, 접두어 제한)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
 kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" PREFIX="$PREFIX" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" FE="${FE_IMAGE:+http://ailab-frontend}" FE_HOST="$FE_HOST" python - <<'PY'
 import base64, json, os, sys, time, requests
+api = requests.Session()
+api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
 ok = True
@@ -313,7 +331,7 @@ for _ in range(12):
         time.sleep(5)
 check("admin_be(WAS) 응답", not err, err)
 # 접두어 없는 이름은 거절돼야 한다. 막히지 않더라도 request_id가 숫자가 아니어서 400으로 끝나 작업은 등록되지 않는다.
-r = requests.post(f"{base}/operations/revoke", timeout=30,
+r = api.post(f"{base}/operations/revoke", timeout=30,
                   json={"request_id": "not-a-number", "username": "guardprobe000", "delete_account": True})
 check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
 fe = os.environ.get("FE", "")
@@ -361,6 +379,8 @@ JOB_RID2=$((JOB_RID + 1))
 JOB_NODE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i '^farm' | head -1)
 kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" python - <<'PY'
 import base64, os, sys, time, requests
+api = requests.Session()
+api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 rid, rid2, node = os.environ["RID"], os.environ["RID2"], os.environ.get("NODE") or None
 ok = True
@@ -390,18 +410,18 @@ def wait(fn, times=24, gap=5):
     return None
 
 if account_status() == 200:  # 이전 실행에서 남은 시험 계정은 회수 작업으로 먼저 정리
-    requests.post(f"{base}/operations/revoke", timeout=30, json={
+    api.post(f"{base}/operations/revoke", timeout=30, json={
         "request_id": str(int(rid) - 1), "username": name, "node_name": node, "delete_account": True})
     wait(lambda: account_status() == 404)
 
 # 1) 생성 작업. 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal까지 만든 뒤 설정
 #    조회에서 실패한다. 거기서 끝나지 않고 이번 작업이 만든 계정을 제어기가 되돌리는 것까지가 정상이다.
-r = requests.post(f"{base}/operations/provision", timeout=30, json={
+r = api.post(f"{base}/operations/provision", timeout=30, json={
     "request_id": rid, "username": name, "account": {"passwd_base64": new_password()}})
 check("작업 등록 (provision) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
 
 def finished():
-    body = requests.get(f"{base}/operations/provision/{rid}", timeout=10).json()
+    body = api.get(f"{base}/operations/provision/{rid}", timeout=10).json()
     return body if body.get("phase") in ("SUCCESS", "FAIL", "UNKNOWN") else None
 
 body = wait(finished) or {}
@@ -419,7 +439,7 @@ check(f"UID가 대역 {lo}~{hi} 안", uid is not None and lo <= uid <= hi, uid)
 
 # 2) 회수 작업. 위에서 남은 계정을 회수 작업으로 지운다. 보류 조건에 걸리지 않게 노드를 실어 보낸다.
 check("회수에 쓸 farm 노드를 찾음", node is not None, "노드 목록이 비어 있음")
-r = requests.post(f"{base}/operations/revoke", timeout=30,
+r = api.post(f"{base}/operations/revoke", timeout=30,
                   json={"request_id": rid2, "username": name, "node_name": node, "delete_account": True})
 check("작업 등록 (revoke) 202", r.status_code == 202, f"{r.status_code} {r.text[:200]}")
 check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)",

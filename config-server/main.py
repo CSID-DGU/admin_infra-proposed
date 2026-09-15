@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import base64
+import hmac
 import crypt
 import json
 import subprocess
@@ -102,6 +103,25 @@ VERIFY_MODE = _resolve_run_mode()
 # 접두어를 주면 그 접두어로 시작하지 않는 이름은 받지 않아, 운영 계정을 덮어쓰거나 지우지 못하게 한다.
 # 비워 두면(운영) 제한 없음.
 ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "")
+
+
+# 내부 API 토큰. config-server에는 사용자 인증이 없으므로 admin_be만 부르도록 공유 토큰을 요구한다.
+# 비어 있으면 검사하지 않는다(로컬 개발·테스트). 상태 확인과 진행 상황 조회(화면이 nginx를 거쳐 GET으로 부름),
+# API 문서만 토큰 없이 연다.
+API_TOKEN = os.getenv("CONFIG_API_TOKEN", "")
+_TOKEN_FREE_GET = re.compile(r"^/(health|requests/[^/]+/status|apispec_1\.json|apidocs/.*|flasgger_static/.*)$")
+
+
+@app.before_request
+def _require_api_token():
+    if not API_TOKEN:
+        return None
+    if request.method == "GET" and _TOKEN_FREE_GET.match(request.path):
+        return None
+    if hmac.compare_digest(request.headers.get("X-Internal-Token", ""), API_TOKEN):
+        return None
+    app.logger.warning(f"[AUTH] 내부 API 토큰 없음 또는 불일치: {request.method} {request.path}")
+    return jsonify(infra_error("AUTHENTICATE", "UNAUTHORIZED", "내부 API 토큰이 없거나 틀립니다")), 401
 
 
 @app.before_request

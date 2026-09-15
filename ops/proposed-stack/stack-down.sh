@@ -32,6 +32,8 @@ if [ -n "$CS_POD" ]; then
   FARM_NODE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i '^farm' | head -1)
   kubectl -n "$NS" exec -i "$CS_POD" -- env PREFIX="$PREFIX" PODS="$PODS" NODE="$FARM_NODE" python - <<'PY'
 import os, time, requests
+api = requests.Session()
+api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
 base, prefix, node = "http://127.0.0.1:8000", os.environ["PREFIX"], os.environ.get("NODE") or None
 pods = [p for p in os.environ.get("PODS", "").split() if p]
 names = [l.split(":", 1)[0] for l in open("/kube_share/passwd") if l.startswith(prefix)]
@@ -41,7 +43,7 @@ jobs = []
 def register(body):
     global rid
     rid += 1
-    r = requests.post(f"{base}/operations/revoke", json={"request_id": rid, **body}, timeout=30)
+    r = api.post(f"{base}/operations/revoke", json={"request_id": rid, **body}, timeout=30)
     if r.status_code == 202:
         jobs.append(str(rid))
     else:
@@ -59,7 +61,7 @@ for name in names:
 deadline, results = time.time() + 900, {}
 while jobs and time.time() < deadline:
     for j in list(jobs):
-        phase = requests.get(f"{base}/operations/revoke/{j}", timeout=10).json().get("phase")
+        phase = api.get(f"{base}/operations/revoke/{j}", timeout=10).json().get("phase")
         if phase in ("SUCCESS", "FAIL", "UNKNOWN"):
             results[j] = phase
             jobs.remove(j)
