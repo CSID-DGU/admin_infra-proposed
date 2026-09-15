@@ -262,9 +262,39 @@ def account_secret_name(pod_name):
     return f"{pod_name}-account"
 
 
+class LoginPasswordMissing(ValueError):
+    """컨테이너에 줄 로그인 비밀번호가 없다. 이대로 만들면 시작 스크립트가 공개된 기본 비밀번호를 쓴다."""
+
+
+def decode_login_password(passwd_base64):
+    try:
+        password = base64.b64decode(passwd_base64 or "", validate=True).decode("utf-8")
+    except Exception as e:
+        raise LoginPasswordMissing("로그인 비밀번호 형식이 올바르지 않음") from e
+    if not password:
+        raise LoginPasswordMissing("로그인 비밀번호가 비어 있음(승인 완료 뒤 지워졌을 수 있음)")
+    return password
+
+
+def login_password_for_recreate(v1, ns, old_pod_name, user_info):
+    """다시 만드는 Pod(마이그레이션)의 비밀번호(base64). 옛 Pod의 Secret을 먼저 쓰고, 없으면 신청 설정 값을 쓴다."""
+    try:
+        secret = v1.read_namespaced_secret(account_secret_name(old_pod_name), ns)
+        value = (secret.data or {}).get("USER_PW")
+        if value:
+            decode_login_password(value)
+            return value
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+    fallback = (user_info or {}).get("passwd_base64")
+    decode_login_password(fallback)
+    return fallback
+
+
 def ensure_account_secret(v1, ns, pod_name, username, passwd_base64):
-    """Pod가 읽을 로그인 비밀번호 Secret을 만든다(있으면 새 값으로 바꾼다)."""
-    password = base64.b64decode(passwd_base64, validate=True).decode("utf-8")
+    """Pod가 읽을 로그인 비밀번호 Secret을 만든다(있으면 새 값으로 바꾼다). 비밀번호가 비면 만들지 않는다."""
+    password = decode_login_password(passwd_base64)
     body = client.V1Secret(
         metadata=client.V1ObjectMeta(name=account_secret_name(pod_name), namespace=ns,
                                      labels={"app": "ailab-account", "ailab.dgu/pod": pod_name, "username": username}),
@@ -605,6 +635,19 @@ def step_create_pod_k8s(ctx):
             pod_name=pod_name,
         ), 500)
     ctx["v1"] = v1
+
+    try:
+        decode_login_password(ctx["user_info"].get("passwd_base64"))
+    except LoginPasswordMissing as e:
+        _main.set_pod_creation_status(request_id, "failed", "로그인 비밀번호 없음")
+        rollback = _main._cleanup_create_failure(pod_name)
+        _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
+                      node_name=best_node, resource_type="pod",
+                      action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
+                      error_code="LOGIN_PASSWORD_MISSING", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_POD", "LOGIN_PASSWORD_MISSING", str(e), rollback=rollback, pod_name=pod_name,
+        ), 422)
 
     _main.app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
     _main.set_pod_creation_status(request_id, "creating_pod", f"k8s pod 생성 중 (node={best_node})")
