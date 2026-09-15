@@ -173,6 +173,57 @@ def get_pod_progress_stage(v1, namespace: str, pod_name: str):
     return stage, message
 
 
+_PULL_DURATION = re.compile(r"in ((?:\d+h)?(?:\d+m)?[\d.]+m?s)")
+_IMAGE_SIZE = re.compile(r"Image size: (\d+) bytes")
+
+
+def _go_duration_seconds(text):
+    """쿠버네티스 이벤트의 Go duration 문자열(1m2.345s, 4.2s, 850ms)을 초로 바꾼다."""
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)(ms|s))?", text or "")
+    if not m or not text:
+        return None
+    h, mnt, num, unit = m.groups()
+    seconds = int(h or 0) * 3600 + int(mnt or 0) * 60
+    if num:
+        seconds += float(num) / (1000 if unit == "ms" else 1)
+    return round(seconds, 1)
+
+
+def summarize_pod_start_events(v1, namespace: str, pod_name: str):
+    """컨테이너가 준비되기까지의 이벤트를 화면에 보일 요약으로 만든다.
+
+    이미지를 새로 받았는지(걸린 시간·크기) 노드에 있던 것을 썼는지, 볼륨 마운트·컨테이너 재시작을
+    몇 번 했는지만 담는다. 이벤트 메시지 원문(주소·경로가 섞일 수 있음)은 넣지 않는다.
+    이벤트 조회 실패는 부가 정보가 없는 것으로 보고 빈 요약을 돌려준다.
+    """
+    try:
+        events = v1.list_namespaced_event(
+            namespace=namespace, field_selector=f"involvedObject.name={pod_name}").items or []
+    except Exception as e:
+        app.logger.warning(f"[POD START SUMMARY] failed to list events for {pod_name}: {e}")
+        return {}
+    summary = {}
+    for e in events:
+        message = e.message or ""
+        count = e.count or 1
+        if e.reason == "Pulled":
+            if "already present on machine" in message:
+                summary.setdefault("image_source", "cached")
+            else:
+                summary["image_source"] = "pulled"
+                m = _PULL_DURATION.search(message)
+                if m:
+                    summary["image_pull_seconds"] = _go_duration_seconds(m.group(1))
+                size = _IMAGE_SIZE.search(message)
+                if size:
+                    summary["image_size_mb"] = round(int(size.group(1)) / 1024 / 1024)
+        elif e.reason == "FailedMount":
+            summary["mount_retries"] = summary.get("mount_retries", 0) + count
+        elif e.reason == "BackOff":
+            summary["restarts"] = summary.get("restarts", 0) + count
+    return summary
+
+
 def get_pod_failure_reason(pod):
     if pod.status.phase == "Failed":
         # pod.status.reason은 Evicted/NodeAffinity 같은 스케줄러 레벨 사유에만 채워지고,
