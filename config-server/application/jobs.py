@@ -172,7 +172,12 @@ _JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
 
 def _job_steps(kind, job):
     if kind == "migrate":
-        return list(_main.MIGRATE_STEPS)
+        steps = list(_main.MIGRATE_STEPS)
+        if _main.VERIFY_MODE == "full":
+            # 새 Pod가 실제로 쓸 수 있는지 시험한 뒤에 기존 Pod를 정리한다(마지막 단계가 기존 Pod 정리).
+            # 시험이 끝내 통과하지 못하면 두 Pod를 그대로 둔 채 관리자에게 넘긴다(DEGRADED).
+            steps = steps[:-1] + verify.VERIFY_ACCESS_STEPS + steps[-1:]
+        return steps
     if kind == "provision":
         steps = (_main.ACCOUNT_CREATE_STEPS if job.get("account") else []) + _main.POD_CREATE_STEPS
         if _main.VERIFY_MODE == "full":

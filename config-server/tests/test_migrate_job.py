@@ -2,7 +2,7 @@
 import base64
 
 import main
-from test_e2e_virtual import env, tick, result, PW  # noqa: F401  (env는 pytest fixture)
+from test_e2e_virtual import env, full, tick, result, rows, PW  # noqa: F401  (env·full은 pytest fixture)
 
 NODES = [{"node_name": "farm2", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"},
          {"node_name": "farm7", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"}]
@@ -38,6 +38,8 @@ def test_force_migration_moves_pod_and_inherits_password(env, monkeypatch):
     assert f"{old_pod}-account" not in e.v1.secrets
     assert e.v1.secrets[f"{new_pod}-account"]["data"]["USER_PW"] == base64.b64decode(PW).decode()
     assert out["old_pod_cleanup"] is None and out["ports"]
+    # 기존 노드의 keytab을 정리한다(그 노드에 같은 사용자의 다른 Pod가 없으므로)
+    assert ("krb5_remove", ("exp-np-mig", "farm2")) in e.calls
 
 
 def test_no_other_candidate_is_skipped_without_touching_pod(env, monkeypatch):
@@ -77,3 +79,43 @@ def test_same_migration_twice_is_409(env, monkeypatch):
     body = {"request_id": "1004", "username": "exp-np-mig4", "nodes": ["farm2", "farm7"]}
     assert e.api.post("/operations/migrate", json=body).status_code == 202
     assert e.api.post("/operations/migrate", json=body).status_code == 409
+
+
+def test_old_node_keytab_kept_when_another_pod_of_user_remains(env, monkeypatch):
+    e = env
+    old_pod = _provisioned(e, monkeypatch, rid="1005", user="exp-np-mig5")
+    assert e.api.post("/operations/provision", json={"request_id": "1006", "username": "exp-np-mig5"}).status_code == 202
+    tick(e)
+    assert result(e, "provision", "1006")["result"]["node"] == "farm2"
+    e.calls.clear()
+    e.api.post("/operations/migrate", json={"request_id": "1005", "username": "exp-np-mig5", "pod_name": old_pod,
+                                            "nodes": ["farm2", "farm7"], "force": True})
+    tick(e)
+    assert result(e, "migrate", "1005")["result"]["status"] == "migrated"
+    assert not [c for c in e.calls if c[0] == "krb5_remove"]   # 1006의 Pod가 farm2에 남아 있어 유지
+
+
+def test_full_mode_verifies_new_pod_before_cleaning_old(full, monkeypatch):
+    e = full
+    monkeypatch.setattr(main, "delete_pod_util", lambda name, ns: e.v1.delete_namespaced_pod(name, ns))
+    e.was = lambda url: e.Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW, "gpu_nodes": NODES})
+    e.api.post("/operations/provision", json={"request_id": "810", "username": "exp-np-fmig", "account": {"passwd_base64": PW}})
+    tick(e)
+    old_pod = result(e, "provision", "810")["result"]["pod_name"]
+    e.api.post("/operations/migrate", json={"request_id": "810", "username": "exp-np-fmig", "pod_name": old_pod,
+                                            "nodes": ["farm2", "farm7"], "force": True})
+    tick(e)
+    assert result(e, "migrate", "810")["phase"] == "SUCCESS"
+    seq = [a for a, p in rows(e, "810") if p == "SUCCESS"]
+    migrate_part = seq[seq.index("PROVISION") + 1:]
+    assert migrate_part.count("VERIFY_ACCESS") == 5
+    assert migrate_part.index("VERIFY_ACCESS") < len(migrate_part) - 1 - migrate_part[::-1].index("DELETE_POD_K8S")
+
+
+def test_migrate_steps_include_probes_only_in_full_mode(monkeypatch):
+    names = lambda: [s.__name__ for s in main._job_steps("migrate", {})]
+    monkeypatch.setattr(main, "VERIFY_MODE", "noprobe")
+    assert "step_verify_uid" not in names()
+    monkeypatch.setattr(main, "VERIFY_MODE", "full")
+    n = names()
+    assert n[-1] == "step_migrate_cleanup_old" and n.index("step_verify_endpoint") < n.index("step_migrate_cleanup_old")
