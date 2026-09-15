@@ -271,19 +271,34 @@ check("admin_be(WAS) 응답", not err, err)
 r = requests.delete(f"{base}/accounts/users/guardprobe000", timeout=30)
 check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
 fe = os.environ.get("FE", "")
+
+def settled(label, fn, ok):
+    """프론트엔드 이미지가 바뀐 배포는 새 Pod가 서비스·ingress에 붙기까지 잠시 연결 오류·502가 난다.
+    admin_be 응답 확인처럼 1분까지 다시 시도한 뒤 판정한다."""
+    detail = ""
+    for _ in range(12):
+        try:
+            code = fn().status_code
+            if ok(code):
+                check(label, True)
+                return
+            detail = code
+        except Exception as e:
+            detail = type(e).__name__
+        time.sleep(5)
+    check(label, False, detail)
+
 if fe:
-    try:
-        r = requests.get(f"{fe}/", timeout=10)
-        check("프론트엔드 응답", r.status_code == 200, r.status_code)
-        # /api/는 nginx가 이 스택의 admin_be로 넘긴다. 502·504면 대상이 틀렸거나 닿지 않는 것이다.
-        r = requests.get(f"{fe}/api/requests/config/{name}", timeout=10)
-        check("프론트엔드 /api/ → 스택 admin_be", r.status_code not in (502, 503, 504), r.status_code)
-        # 밖에서 들어오는 경로(ingress 컨트롤러, nodePort 30081)에 호스트 규칙이 붙었는지
-        r = requests.get("http://nginx-ailab-ingress-nginx-controller.ailab-frontend.svc.cluster.local/",
-                         headers={"Host": os.environ["FE_HOST"]}, timeout=10)
-        check("30081 호스트 규칙으로 스택 화면", r.status_code == 200, r.status_code)
-    except Exception as e:
-        check("프론트엔드 응답", False, type(e).__name__)
+    settled("프론트엔드 응답", lambda: requests.get(f"{fe}/", timeout=10), lambda c: c == 200)
+    # /api/는 nginx가 이 스택의 admin_be로 넘긴다. 502·504면 대상이 틀렸거나 닿지 않는 것이다.
+    settled("프론트엔드 /api/ → 스택 admin_be",
+            lambda: requests.get(f"{fe}/api/requests/config/{name}", timeout=10),
+            lambda c: c not in (502, 503, 504))
+    # 밖에서 들어오는 경로(ingress 컨트롤러, nodePort 30081)에 호스트 규칙이 붙었는지
+    settled("30081 호스트 규칙으로 스택 화면",
+            lambda: requests.get("http://nginx-ailab-ingress-nginx-controller.ailab-frontend.svc.cluster.local/",
+                                 headers={"Host": os.environ["FE_HOST"]}, timeout=10),
+            lambda c: c == 200)
 # 계정 삭제는 계정·홈을 먼저 지우고, 노드를 지정하지 않으면 모든 farm 노드를 차례로 돌며 Kerberos 키를 지운다.
 # 느린 노드가 있으면 이 뒷부분이 수 분 걸리므로 응답은 30초만 기다리고, 계정 대장에서 사라졌는지로 판정한다.
 # 이 테스트 계정은 Pod를 만들지 않아 farm 노드에 키가 배포되지 않는다.
