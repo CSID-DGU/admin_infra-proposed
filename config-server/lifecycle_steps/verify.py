@@ -21,7 +21,7 @@ from kubernetes import client
 from kubernetes.stream import stream
 
 from error import infra_error
-from adapters.operation_log import Action, Phase, log_operation
+from adapters.operation_log import Action, Phase, current_attempt, log_operation
 from utils import load_k8s, get_db_connection
 
 class _MainProxy:
@@ -39,6 +39,10 @@ VERIFY_EXEC_TIMEOUT_SEC = float(os.getenv("VERIFY_EXEC_TIMEOUT_SEC", "20"))
 VERIFY_TCP_TIMEOUT_SEC = float(os.getenv("VERIFY_TCP_TIMEOUT_SEC", "5"))
 # 생성 직후 kinit 타이머·NFS 전파 지연이 있어 일반 단계(3회)보다 여유 있게 재시도한다.
 VERIFY_MAX_ATTEMPTS = int(os.getenv("VERIFY_MAX_ATTEMPTS", "5"))
+
+# 화면의 "(현재 단계: …)"에 보일 생성 접근 시험 이름
+PROBE_LABELS = {"uid": "계정 권한", "krb5_ticket": "인증 티켓", "home_io": "홈 읽기·쓰기",
+                "gpu": "GPU", "endpoint": "외부 SSH 접속"}
 
 
 # ---------- 저수준 관찰 도구 (테스트가 이 둘만 대역으로 바꾼다) ----------
@@ -85,6 +89,15 @@ def _run_probe(ctx, action, probe, check):
     pod_name = ctx.get("pod_name")
     log_operation(request_id=request_id, username=username, action=action,
                   phase=Phase.START, resource_type=probe, pod_name=pod_name)
+    if action == Action.VERIFY_ACCESS:
+        # 계정~Service 생성은 수 초라 화면은 곧바로 마지막 생성 단계를 보게 되고, 시험·재시도 동안
+        # 그대로 멈춰 보인다. 시험마다 무엇을 몇 번째로 확인 중인지 남긴다. 표시용이라 실패해도 계속한다.
+        try:
+            _main.set_pod_creation_status(
+                request_id, "verifying",
+                f"접근 확인 중: {PROBE_LABELS.get(probe, probe)} (시도 {current_attempt.get()}/{VERIFY_MAX_ATTEMPTS})")
+        except Exception:
+            app.logger.warning("[VERIFY] pod status update failed", exc_info=True)
     try:
         ok, detail = check(ctx)
     except Exception as e:
@@ -110,10 +123,29 @@ def _run_probe(ctx, action, probe, check):
 
 # ---------- 생성 검증 5종 ----------
 
+def _account_uid(ctx):
+    """시험 대상 계정의 uid. 이번 작업이 계정을 만들었으면 문맥에 있고, 기존 계정을 재사용한 작업
+    (계정 단계 없음)은 계정 대장에서 읽는다. 대장에도 없으면 None."""
+    if ctx.get("uid") is not None:
+        return ctx["uid"]
+    for line in _main.read_passwd_lines():
+        entry = _main.parse_passwd_line(line)
+        if entry and entry["name"] == ctx["username"]:
+            ctx["uid"] = int(entry["uid"])
+            return ctx["uid"]
+    return None
+
+
+_NO_ACCOUNT = {"scope": "passwd", "reason": "계정 대장에 사용자가 없음"}
+
+
 def step_verify_uid(ctx):
     """① 발급된 계정 권한으로 명령이 실행되는가 — su 성공 + uid 일치."""
     def check(ctx):
-        expected = str(ctx["uid"])
+        uid = _account_uid(ctx)
+        if uid is None:
+            return False, _NO_ACCOUNT
+        expected = str(uid)
         out, rc = _sh(ctx["pod_name"], f"su -s /bin/sh {ctx['username']} -c 'id -u'")
         observed = out.splitlines()[-1].strip() if out else ""
         return (rc == 0 and observed == expected), {
@@ -149,7 +181,9 @@ def step_verify_krb5(ctx):
     """③ 인증 티켓 — keytab은 pod에 없고 호스트 타이머가 갱신한 TGT를 /run/user/<uid>로
     공유받으므로, 사용자 권한 klist로 유효 티켓 존재를 확인한다(원장·keytab·타이머·마운트 관통)."""
     def check(ctx):
-        u, uid = ctx["username"], ctx["uid"]
+        u, uid = ctx["username"], _account_uid(ctx)
+        if uid is None:
+            return False, _NO_ACCOUNT
         cmd = (f"su -s /bin/sh {u} -c 'klist -s"
                f" || KRB5CCNAME=FILE:$(ls /run/user/{uid}/krb5cc* 2>/dev/null | head -1) klist -s'")
         out, rc = _sh(ctx["pod_name"], cmd)
