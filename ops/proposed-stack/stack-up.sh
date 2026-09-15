@@ -328,6 +328,18 @@ done
 smy -e "DROP DATABASE refdata_src"
 fi
 
+step "사용자 컨테이너 이미지 태그"
+# 스택의 이미지 목록을 새로 빌드한 dguailab/decs 날짜 태그로 맞춘다(시작 스크립트 수정 반영). 새로 만들거나
+# 마이그레이션하는 컨테이너부터 적용되고, 떠 있는 컨테이너는 그대로다. 이미지 태그는 공개 정보라 출력한다.
+DECS_TAG=260915
+DECS_VARIANTS='cuda(11[.]8-tf2[.]13|12[.]2-tf2[.]15|12[.]3-tf2[.]16|12[.]5-tf2[.]20|12[.]8-tf2[.]20)'
+smy -e "UPDATE web_admin.container_image SET image_version = REGEXP_REPLACE(image_version, '-[0-9]{6}\$', '-$DECS_TAG')
+  WHERE image_name LIKE '%dguailab/decs' AND image_version REGEXP '^${DECS_VARIANTS}-ubuntu22[.]04-[0-9]{6}\$';
+  UPDATE web_admin.container_image SET image_version = CONCAT(image_version, '-ubuntu22.04-$DECS_TAG')
+  WHERE image_name LIKE '%dguailab/decs' AND image_version REGEXP '^${DECS_VARIANTS}\$'"
+smy -e "SELECT CONCAT(image_version, ' (', COUNT(*), ')') FROM web_admin.container_image
+  WHERE image_name LIKE '%dguailab/decs' GROUP BY image_version ORDER BY image_version" | sed 's/^/  /'
+
 step "프론트엔드"
 if [ -n "$FE_IMAGE" ]; then
   render "$HERE/admin-fe.yaml" | sed -e "s|__FE_IMAGE__|$FE_IMAGE|" -e "s|__FE_HOST__|$FE_HOST|" | kubectl apply -f -
