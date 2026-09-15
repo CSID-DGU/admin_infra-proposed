@@ -123,3 +123,7 @@ controller:
 # admin_be와 공유하는 내부 API 토큰 Secret(key: token). 없으면 토큰 검사를 하지 않는다.
 apiToken:
   secretName: config-server-api-token
+
+# farm·AD·NAS SSH 호스트 키 Secret(key: known_hosts). 없으면 호스트 키를 확인하지 않는다.
+sshKnownHosts:
+  secretName: config-server-ssh-known-hosts

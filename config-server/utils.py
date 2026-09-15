@@ -671,7 +671,13 @@ def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
 def _nas_ssh_client():
     import paramiko
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # 배포 때 수집한 호스트 키가 있으면 그것만 믿는다(모르는 키면 접속 거절). 없으면 예전처럼 받아들인다.
+    known_hosts = os.environ.get("SSH_KNOWN_HOSTS_FILE", "/etc/ssh-known-hosts/known_hosts")
+    if os.path.isfile(known_hosts) and os.path.getsize(known_hosts) > 0:
+        ssh.load_host_keys(known_hosts)
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(
         hostname=os.environ["NAS_SSH_HOST"],
         port=int(os.environ.get("NAS_SSH_PORT", "22")),

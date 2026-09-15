@@ -104,6 +104,9 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
 - name: farm-ad-ssh-key
   mountPath: /etc/farm-ad-ssh
   readOnly: true
+- name: ssh-known-hosts
+  mountPath: /etc/ssh-known-hosts
+  readOnly: true
 {{- end -}}
 
 {{- define "containerssh-config-server.volumes" -}}
@@ -119,6 +122,11 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   secret:
     secretName: farm-ad-ssh-key
     defaultMode: 0400
+# farm·AD·NAS 호스트 키(key: known_hosts). 없으면 호스트 키 확인이 꺼진다.
+- name: ssh-known-hosts
+  secret:
+    secretName: "{{ .Values.sshKnownHosts.secretName }}"
+    optional: true
 - name: image-store
   {{- if .Values.imageStore.claimName }}
   persistentVolumeClaim:

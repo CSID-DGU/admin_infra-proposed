@@ -143,6 +143,32 @@ kubectl -n "$NS" create secret generic log-mysql-secret \
   --from-literal=MYSQL_PASSWORD="$(getpw log_db_user)" --from-literal=MYSQL_ROOT_PASSWORD="$(getpw root)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
+step "SSH 호스트 키"
+# config-server가 farm·AD·NAS에 접속할 때 상대 서버를 확인하도록, 배포 서버에서 호스트 키를 모아 Secret으로 넣는다.
+# 주소가 공개 로그에 남지 않게 개수만 출력한다. 하나라도 받지 못하면 넣지 않는다(확인을 켜면 그 호스트 접속이 막힌다).
+KH_CHANGED=0
+TARGETS=$(python3 "$HERE/ssh_targets.py" "$BASE")
+KH_FILE=$(mktemp); KH_OK=0; KH_ALL=0
+while read -r host port; do
+  [ -n "$host" ] || continue
+  KH_ALL=$((KH_ALL + 1))
+  if ssh-keyscan -T 5 -p "$port" "$host" 2>/dev/null | grep -v '^#' > "$KH_FILE.part" && [ -s "$KH_FILE.part" ]; then
+    cat "$KH_FILE.part" >> "$KH_FILE"; KH_OK=$((KH_OK + 1))
+  fi
+  rm -f "$KH_FILE.part"
+done <<< "$TARGETS"
+if [ "$KH_ALL" -gt 0 ] && [ "$KH_OK" = "$KH_ALL" ]; then
+  OLD=$(kubectl -n "$NS" get secret config-server-ssh-known-hosts -o jsonpath='{.data.known_hosts}' 2>/dev/null | base64 -d 2>/dev/null | sort | sha256sum)
+  NEW=$(sort "$KH_FILE" | sha256sum)
+  kubectl -n "$NS" create secret generic config-server-ssh-known-hosts --from-file=known_hosts="$KH_FILE" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  [ "$OLD" = "$NEW" ] || KH_CHANGED=1
+  echo "호스트 ${KH_ALL}개 키 수집, 호스트 키 확인 켬$([ "$KH_CHANGED" = 1 ] && echo " (변경됨)")"
+else
+  echo "호스트 키를 ${KH_OK}/${KH_ALL}개만 받음 — 이번 배포에서는 호스트 키 확인을 바꾸지 않음"
+fi
+rm -f "$KH_FILE"
+
 step "config-server 내부 API 토큰"
 TOKEN_NEW=0
 if [ -z "$(kubectl -n "$NS" get secret stack-db -o jsonpath='{.data.config_api_token}')" ]; then
@@ -201,8 +227,8 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set imageStore.claimName= \
   --set controller.enabled=true \
   --wait --timeout 10m
-if [ "$TOKEN_NEW" = 1 ]; then
-  # 토큰 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.
+if [ "$TOKEN_NEW" = 1 ] || [ "$KH_CHANGED" = 1 ]; then
+  # 토큰·호스트 키 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.
   kubectl -n "$NS" rollout restart deployment/"$RELEASE" deployment/"$RELEASE-controller" >/dev/null
   kubectl -n "$NS" rollout status deployment/"$RELEASE" --timeout=10m
   kubectl -n "$NS" rollout status deployment/"$RELEASE-controller" --timeout=10m
