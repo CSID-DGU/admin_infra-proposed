@@ -39,6 +39,8 @@ def lease_env(monkeypatch):
     # macOS에서 *.svc.cluster.local이 mDNS로 풀려 실제 Redis 접속이 수십 초 멈춘다 — 부가 저장은 무시
     monkeypatch.setattr(main, "save_job_result", lambda a, r, d: None)
     monkeypatch.setattr(main, "load_job_result", lambda a, r: None)
+    # 끝 행 조회는 기본적으로 "없음" — 재선택 판정을 보는 시험만 대역을 바꿔 끼운다.
+    monkeypatch.setattr(main, "job_end_exists", lambda a, r, j: False)
     rows = {}
 
     def claim(job_id, request_id, action, owner=None, ttl_sec=None):
