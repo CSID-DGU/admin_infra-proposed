@@ -7,7 +7,11 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.ailab-infra.svc.cluster.lo
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+# 제한을 두는 이유는 pod_status.py와 같다 — 저장소가 멈춰도 서버는 응답해야 한다.
+REDIS_TIMEOUT_SEC = float(os.getenv("REDIS_TIMEOUT_SEC", "2"))
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
+                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC)
 
 # ----------------------------
 # 이미지 메타데이터 관리
