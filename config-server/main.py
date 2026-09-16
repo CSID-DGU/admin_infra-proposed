@@ -120,7 +120,10 @@ def _require_api_token():
         return None
     if request.method == "GET" and _TOKEN_FREE_GET.match(request.path):
         return None
-    if hmac.compare_digest(request.headers.get("X-Internal-Token", ""), API_TOKEN):
+    # 헤더 값과 토큰을 바이트로 맞춰 비교한다. 문자열끼리 비교하면 헤더에 비ASCII 문자가 섞였을 때
+    # 예외가 나서 401 대신 500이 나갔다 — 바깥에서 쉽게 유발할 수 있는 경로다.
+    sent = request.headers.get("X-Internal-Token", "").encode("utf-8", "surrogateescape")
+    if hmac.compare_digest(sent, API_TOKEN.encode("utf-8")):
         return None
     app.logger.warning(f"[AUTH] 내부 API 토큰 없음 또는 불일치: {request.method} {request.path}")
     return jsonify(infra_error("AUTHENTICATE", "UNAUTHORIZED", "내부 API 토큰이 없거나 틀립니다")), 401

@@ -37,10 +37,9 @@ def save_image_metadata(username, status="success", size_mb=0.0, version=None, p
 
 def get_image_metadata(username):
     """특정 유저의 이미지 상태 조회"""
-    key = f"img:{username}"
-    if not r.exists(key):
-        return None
-    return json.loads(r.get(key))
+    # 있는지 확인한 뒤 다시 읽으면 두 번 왕복하는 사이에 키가 사라져, 없는 값을 해석하려다 예외가 난다.
+    raw = r.get(f"img:{username}")
+    return json.loads(raw) if raw else None
 
 
 def get_all_images():

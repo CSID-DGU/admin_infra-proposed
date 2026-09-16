@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shlex
 import re
 import fcntl
 import time
@@ -748,22 +749,30 @@ def _ssh_run(ssh, cmd: str) -> None:
         )
 
 
+def _user_home_path(username: str) -> str:
+    """홈 경로를 만들기 전에 이름부터 검증한다. 이 경로는 원격 셸 명령에 그대로 들어가고 그중 하나는
+    되돌릴 수 없는 삭제다 — 이름에 공백이나 셸 특수문자가 섞이면 의도하지 않은 대상을 지울 수 있다.
+    이름은 admin_be가 만들고 내부 토큰으로 보호되지만, 지우는 쪽에 방어를 두는 편이 맞다."""
+    if not _VALID_USERNAME_RE.match(username):
+        raise ValueError(f"invalid username for home directory: {username!r}")
+    return f"{os.environ['NFS_USER_SHARE_PATH']}/{username}"
+
+
 def create_user_home_directory(username: str, uid: int, gid: int) -> None:
-    share_path = os.environ["NFS_USER_SHARE_PATH"]
-    path = f"{share_path}/{username}"
+    path = _user_home_path(username)
+    quoted = shlex.quote(path)
     app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
     with _nas_ssh_client() as ssh:
-        _ssh_run(ssh, f"sudo mkdir -p {path}")
-        _ssh_run(ssh, f"sudo chown {uid}:{gid} {path}")
-        _ssh_run(ssh, f"sudo chmod 700 {path}")
+        _ssh_run(ssh, f"sudo mkdir -p {quoted}")
+        _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
+        _ssh_run(ssh, f"sudo chmod 700 {quoted}")
 
 
 def delete_user_home_directory(username: str) -> None:
-    share_path = os.environ["NFS_USER_SHARE_PATH"]
-    path = f"{share_path}/{username}"
+    path = _user_home_path(username)
     app.logger.info(f"[NAS SSH] deleting home dir {path}")
     with _nas_ssh_client() as ssh:
-        _ssh_run(ssh, f"sudo rm -rf {path}")
+        _ssh_run(ssh, f"sudo rm -rf {shlex.quote(path)}")
 
 
 def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:

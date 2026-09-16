@@ -397,6 +397,10 @@ def step_fetch_user_config(ctx):
     try:
         resp = requests.get(was_url, timeout=_main.app.config["HTTP_TIMEOUT_SEC"])
         user_info = resp.json()
+        if not isinstance(user_info, dict):
+            # 아래 status 조회가 사전을 전제한다. 사전이 아니면 예상 못 한 예외로 빠지는 대신
+            # 이미 있는 "응답 형식 이상" 경로를 타게 한다.
+            raise ValueError(f"expected a JSON object, got {type(user_info).__name__}")
     except requests.RequestException as e:
         _main.app.logger.exception("[CREATE POD] WAS request failed")
         _main.log_operation(request_id=request_id, username=username,
