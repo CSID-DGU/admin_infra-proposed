@@ -7,7 +7,14 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.ailab-infra.svc.cluster.lo
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+# 이 저장소가 멈췄을 때 서버까지 함께 멈추지 않도록 짧은 제한을 둔다. 여기 담는 값은 같은 클러스터
+# 안에서 밀리초 단위로 오가므로, 이 시간을 넘긴다면 저장소 쪽 문제다. 제한이 없으면 저장소가 사라졌을
+# 때 연결 시도가 20초 넘게 매달리고, /health까지 그 시간을 물어 준비 상태 점검(5초)을 넘긴다 —
+# 실제로 그 때문에 배포가 10분을 기다린 뒤 실패했다.
+REDIS_TIMEOUT_SEC = float(os.getenv("REDIS_TIMEOUT_SEC", "2"))
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
+                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC)
 
 STATUS_TTL_SEC = 3600  # 완료/실패 후에도 조회 가능하도록 1시간 유지, 이후 자동 만료
 
