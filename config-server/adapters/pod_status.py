@@ -1,6 +1,8 @@
 import os
 import json
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from datetime import datetime, timezone
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.ailab-infra.svc.cluster.local")
@@ -14,7 +16,11 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_TIMEOUT_SEC = float(os.getenv("REDIS_TIMEOUT_SEC", "2"))
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
-                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC)
+                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC,
+                # 이 판(8.x)은 연결 오류를 기본 10회까지 다시 시도한다. 그러면 위 제한이 시도마다
+                # 곱해져 저장소가 사라졌을 때 한 번의 호출이 17초씩 걸렸다. 다시 시도해도 살아나지
+                # 않는 상황이므로 끄고, 제한 시간이 곧 최대 대기가 되게 한다.
+                retry=Retry(NoBackoff(), 0))
 
 STATUS_TTL_SEC = 3600  # 완료/실패 후에도 조회 가능하도록 1시간 유지, 이후 자동 만료
 

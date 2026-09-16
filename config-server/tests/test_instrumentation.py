@@ -88,17 +88,29 @@ def test_counter_failure_never_breaks_the_flow(monkeypatch):
 
 # ---------- /health 노출 ----------
 
-def test_health_reports_mode_and_loss_counter(monkeypatch):
+def test_health_details_reports_mode_and_loss_counter(monkeypatch):
     fake = FakeRedis(); fake.n = 3
     monkeypatch.setattr(operation_log, "_redis", fake)
-    body = main.app.test_client().get("/health").get_json()
+    body = main.app.test_client().get("/health/details").get_json()
     assert body["status"] == "OK"
     assert body["run_mode"] == main.VERIFY_MODE
     assert body["oplog_write_failures"] == 3
 
 
-def test_health_reports_null_when_counter_unreadable(monkeypatch):
+def test_health_details_reports_null_when_counter_unreadable(monkeypatch):
     """조회 불능을 0 으로 접으면 '유실 없음' 으로 오독된다 — null 로 구분한다."""
     monkeypatch.setattr(operation_log, "_redis", FakeRedis(broken=True))
-    body = main.app.test_client().get("/health").get_json()
+    body = main.app.test_client().get("/health/details").get_json()
     assert body["oplog_write_failures"] is None
+
+
+def test_health_does_not_touch_redis(monkeypatch):
+    """준비 상태 점검이 읽는 응답이다. 부가 저장소를 만지면 그 저장소가 멈출 때 서버가 통째로
+    트래픽에서 빠진다 — 실제로 그 때문에 설치가 대기 한도 10분을 채우고 중단됐다."""
+    def explode(*_a, **_k):
+        raise AssertionError("/health 는 부가 저장소를 조회하면 안 된다")
+    monkeypatch.setattr(operation_log, "_redis", type("Boom", (), {"get": explode, "incr": explode})())
+
+    body = main.app.test_client().get("/health").get_json()
+
+    assert body["status"] == "OK" and "oplog_write_failures" not in body
