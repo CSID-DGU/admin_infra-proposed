@@ -141,6 +141,9 @@ def _execute_step(step, ctx, kind, request_id, username):
 
         if baseline:
             raise err
+        if not getattr(err, "retry", True):
+            _main.app.logger.info(f"[JOB] {name} 다시 해도 같은 결과 — 재시도하지 않음")
+            raise err
         unknown = err.unknown if isinstance(err, _main.StepFailed) else _main._is_unknown_result(err)
         if unknown:
             observer = _main.STEP_OBSERVERS.get(name)

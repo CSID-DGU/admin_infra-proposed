@@ -506,6 +506,19 @@ def test_failed_provision_has_no_result(env):
     assert res["phase"] in ("FAIL", "UNKNOWN") and res["result"] is None
 
 
+def test_pod_env_carries_ticket_cache_path(env):
+    """홈은 인증이 필요한 NFS라 노드 쪽 준비 직후 한순간 쓸 수 없다. entrypoint는 그때 티켓 캐시
+    경로가 없으면 기동을 실패로 끝내므로, Pod에 그 경로를 넘긴다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "113", "username": "exp-np-krb5cc",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    pod = next(p for p in e.v1.pods.values() if "exp-np-krb5cc" in p.metadata.name)
+    env_map = {v["name"]: v.get("value") for v in pod.body["spec"]["containers"][0]["env"]}
+    assert env_map["KRB5CCNAME"] == f"FILE:/run/user/{env_map['UID']}/krb5cc_ailab"
+
+
 # ---------- Proposed-Full (VERIFY_MODE=full) ----------
 
 @pytest.fixture
