@@ -1026,8 +1026,7 @@ from lifecycle_steps.provision import (  # noqa: E402
 from lifecycle_steps.revoke import (  # noqa: E402
     step_delete_services, step_release_nodeports, step_delete_pod_k8s,
     step_cleanup_pod_node_krb5, _new_delete_rollback, POD_DELETE_STEPS,
-    step_check_account_revocable, step_delete_account, step_delete_home,
-    step_remove_krb5, ACCOUNT_DELETE_STEPS,
+    step_check_account_revocable, step_delete_account, step_remove_krb5,
 )
 
 from lifecycle_steps.migrate import (  # noqa: E402

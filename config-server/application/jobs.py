@@ -74,7 +74,7 @@ RERUN_SAFE = {
     "step_create_home", "step_wait_ready", "step_create_services",
     "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s",
     "step_cleanup_pod_node_krb5", "step_check_account_revocable",
-    "step_delete_account", "step_delete_home", "step_remove_krb5",
+    "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
 }
 
@@ -189,7 +189,7 @@ def _job_steps(kind, job):
         return steps
     steps = list(_main.POD_DELETE_STEPS) if job.get("pod_name") else []
     if job.get("delete_account"):
-        # 보존 대상인 홈은 지우지 않는다 — step_delete_home을 넣지 않는다.
+        # 계정을 회수해도 홈은 남긴다 — 지우는 단계를 넣지 않는다.
         steps += [_main.step_check_account_revocable, _main.step_delete_account, _main.step_remove_krb5]
     if _main.VERIFY_MODE == "full" and steps:
         # 검사 대상(노드·포트)은 삭제 전에 잡아 두고, 차단 확인은 삭제가 다 끝난 뒤 한다.
@@ -419,7 +419,9 @@ def _run_job(kind, request_id, username, job_id=None):
                 break  # 마이그레이션에서 옮길 이유가 없다고 판정되면 남은 단계를 돌리지 않는다
             name = step.__name__
             if name in _main.ALWAYS_RERUN:
-                step(ctx)
+                # 이어받기에서도 매번 다시 실행한다 — done에 넣지 않는다.
+                # 실행 자체는 공통 실행기를 거쳐야 재시도·사전 정리·결과 불명 처리가 똑같이 걸린다.
+                _execute_step(step, ctx, kind, request_id, username)
                 continue
             partner = _main.DEFER_DONE.get(name)
             if (partner in done) if partner else (name in done):

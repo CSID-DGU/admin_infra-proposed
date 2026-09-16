@@ -364,21 +364,6 @@ def step_delete_account(ctx):
     _main.log_operation(request_id=request_id, username=username, node_name=node_name,
                   resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
 
-def step_delete_home(ctx):
-    request_id, username, node_name = ctx["request_id"], ctx["username"], ctx.get("node_name")
-
-    _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                  resource_type="storage", action=Action.DELETE_HOME, phase=Phase.START)
-    try:
-        _main.delete_user_home_directory(username)
-        _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.SUCCESS)
-    except Exception as e:
-        _main.app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
-        _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="storage", action=Action.DELETE_HOME, phase=_main._fail_phase(e),
-                      error_code="HOME_DELETE_FAILED", error_detail=str(e))
-
 def step_remove_krb5(ctx):
     """keytab을 지울 노드: 호출자가 준 node_name, 없으면 같은 작업에서 지운 Pod가 떠 있던 노드."""
     request_id, username = ctx["request_id"], ctx["username"]
@@ -417,9 +402,3 @@ def step_remove_krb5(ctx):
         _main._remove_krb5_from_all_farms(username)
         _main.log_operation(request_id=request_id, username=username,
                       resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
-
-ACCOUNT_DELETE_STEPS = [
-    step_delete_account,
-    step_delete_home,
-    step_remove_krb5,
-]
