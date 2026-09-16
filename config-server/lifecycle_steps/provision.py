@@ -331,6 +331,11 @@ def delete_account_secret(v1, ns, pod_name):
         _main.app.logger.warning("[ACCOUNT SECRET] 삭제 실패: %s", pod_name, exc_info=True)
 
 
+# 기동에 실패한 컨테이너에서 남겨 둘 로그 분량. 실패 원인은 마지막 몇 줄에 나오므로 짧게 잡는다.
+POD_FAILURE_LOG_LINES = 30
+POD_FAILURE_LOG_CHARS = 2000
+
+
 def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
     ns = _main.app.config["NAMESPACE"]
     rollback = {
@@ -353,6 +358,15 @@ def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
         _main.app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
 
     if v1 is not None:
+        # Pod를 지우면 컨테이너 로그도 함께 사라진다. 기동에 실패한 이유는 그 로그에만 남으므로
+        # 지우기 전에 읽어 둔다. 읽지 못해도 정리는 그대로 진행한다.
+        try:
+            log_tail = v1.read_namespaced_pod_log(pod_name, ns, tail_lines=POD_FAILURE_LOG_LINES)
+            if log_tail and log_tail.strip():
+                rollback["podLogTail"] = log_tail.strip()[-POD_FAILURE_LOG_CHARS:]
+        except Exception:
+            _main.app.logger.warning("[CREATE POD] cleanup pod log read failed", exc_info=True)
+
         try:
             v1.delete_namespaced_pod(pod_name, ns)
             rollback["podDeleted"] = True
@@ -768,17 +782,23 @@ def step_wait_ready(ctx):
             _main.app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
             _main.set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
             rollback = _main._cleanup_create_failure(pod_name, v1)
+            # 컨테이너가 남긴 마지막 출력을 이 단계 행에 함께 남긴다. 작업 단위 행에도 실리지만,
+            # 단계별로 볼 때 먼저 보게 되는 것은 이 행이다.
+            log_tail = rollback.get("podLogTail")
             _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                           node_name=best_node, resource_type="pod",
                           action=Action.WAIT_READY, phase=Phase.FAIL,
-                          error_code="POD_READY_TIMEOUT", error_detail=failure_reason)
+                          error_code="POD_READY_TIMEOUT",
+                          error_detail=f"{failure_reason}\n{log_tail}" if log_tail else failure_reason)
+            # 위에서 Pod를 지웠다. 다시 기다려 봐야 "없는 Pod"만 보게 되고, 그 오류가 여기 담긴
+            # 진짜 원인(컨테이너가 왜 죽었는지)을 덮어쓴다. 그래서 재시도하지 않는다.
             raise _main.StepFailed(_main.infra_error(
                 "WAIT_POD_READY",
                 "POD_READY_TIMEOUT",
                 failure_reason,
                 rollback=rollback,
                 pod_name=pod_name,
-            ), 500)
+            ), 500, retry=False)
     except _main.StepFailed:
         raise
     except client.exceptions.ApiException as e:
@@ -1117,6 +1137,11 @@ def build_pod_spec(
                                                     *([
                                                         {"name": "KRB5_REALM",          "value": _main.app.config["KRB5_REALM"]},
                                                         {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{_main.app.config['KRB5_REALM']}"},
+                                                        # 호스트 타이머가 갱신하는 티켓 캐시 경로. 위 krb5-ccache 마운트로 Pod에 들어온다.
+                                                        # entrypoint.sh는 홈에 쓸 수 없을 때 이 값이 없으면 곧바로 종료한다. 홈은 인증이
+                                                        # 필요한 NFS라 노드 쪽 준비가 끝나기 전 잠깐 못 쓸 수 있으므로(특히 처음 쓰는 uid)
+                                                        # 그 순간을 컨테이너 기동 실패로 만들지 않는다.
+                                                        {"name": "KRB5CCNAME",          "value": f"FILE:/run/user/{uid}/krb5cc_ailab"},
                                                     ] if _main.app.config["KRB5_REALM"] else []),
                                                 ],
                                                 # readinessProbe가 없으면 k8s는 컨테이너 프로세스가 시작되기만 해도
