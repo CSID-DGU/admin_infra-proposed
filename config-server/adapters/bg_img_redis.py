@@ -1,6 +1,8 @@
 import os
 import json
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from datetime import datetime
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.ailab-infra.svc.cluster.local")
@@ -11,7 +13,9 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_TIMEOUT_SEC = float(os.getenv("REDIS_TIMEOUT_SEC", "2"))
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
-                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC)
+                socket_connect_timeout=REDIS_TIMEOUT_SEC, socket_timeout=REDIS_TIMEOUT_SEC,
+                # 재시도를 끄는 이유는 pod_status.py와 같다 — 제한 시간이 곧 최대 대기여야 한다.
+                retry=Retry(NoBackoff(), 0))
 
 # ----------------------------
 # 이미지 메타데이터 관리

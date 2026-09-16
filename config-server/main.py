@@ -228,12 +228,39 @@ def health():
     responses:
 
       200:
-        description: 서버 정상. run_mode 는 실행 중인 조건, oplog_write_failures 는
-          작업 이력 기록 실패 누적 건수(조회 불능이면 null — 0 과 구분).
+        description: 서버 정상. run_mode 는 실행 중인 조건.
+        schema:
+          type: object
+          example: {"status": "OK", "run_mode": "noprobe"}
+    """
+    # 이 응답은 준비 상태 점검(5초)이 읽는다. 그래서 이 프로세스가 요청을 받을 수 있는지만 답하고
+    # 바깥 자원은 건드리지 않는다. 예전에는 작업 이력 기록 실패 건수를 Redis에서 함께 읽었는데,
+    # Redis가 사라지자 그 조회가 17초씩 걸려 준비 상태 점검이 계속 실패했고, 설치가 대기 한도
+    # 10분을 채우고 중단됐다. 부가 정보는 /health/details 로 옮겼다.
+    return jsonify(status="OK", run_mode=VERIFY_MODE), 200
+
+
+@app.route("/health/details", methods=["GET"])
+def health_details():
+    """
+    서버 상태 + 운영 참고 값
+
+    ---
+    tags:
+    - System
+
+    summary: 서버 상태와 작업 이력 기록 실패 누적 건수
+
+    responses:
+
+      200:
+        description: oplog_write_failures 는 작업 이력 기록 실패 누적 건수
+          (조회 불능이면 null — 0 과 구분).
         schema:
           type: object
           example: {"status": "OK", "run_mode": "noprobe", "oplog_write_failures": 0}
     """
+    # 부가 저장소를 조회하므로 저장소가 멈추면 이 경로도 함께 느려진다. 준비 상태 점검에는 쓰지 않는다.
     return jsonify(status="OK", run_mode=VERIFY_MODE,
                    oplog_write_failures=write_failure_count()), 200
 
