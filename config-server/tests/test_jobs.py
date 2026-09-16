@@ -191,6 +191,16 @@ def test_run_job_without_input_fails(logs, store):
     assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "JOB_INPUT_MISSING"
 
 
+def test_finished_job_picked_up_again_is_skipped(logs, store, monkeypatch):
+    """제어기가 미완료 목록을 읽은 뒤 그 작업이 끝나면 같은 작업을 한 번 더 집는다. 입력도 lease도
+    이미 지워져 있지만, 끝 행이 있으므로 실패 행을 남기지 않고 물러나야 한다."""
+    monkeypatch.setattr(main, "job_end_exists", lambda a, r, j: True)
+
+    main.run_job("migrate", "17", "exp-fu-001", job_id=1925)
+
+    assert logs == []
+
+
 def test_restart_resumes_from_last_done_step(logs, store, lease_env, monkeypatch):
     """제어기 재시작: lease를 인수하고, 저널에 남은 단계는 건너뛰고 이어서 실행한다."""
     calls = []

@@ -228,6 +228,31 @@ def find_unfinished_jobs(limit=100):
     finally:
         conn.close()
 
+def job_end_exists(action, request_id, job_id):
+    """그 작업(START 행 id = job_id)의 끝 행이 이미 있는지. 제어기가 미완료 목록을 읽은 뒤 목록을 훑는
+    사이에 그 작업이 끝나면 같은 작업을 한 번 더 집을 수 있다. 끝난 작업은 lease 행도 지워져 선점이
+    다시 성공하므로, 입력이 없을 때 이 조회로 "이미 끝난 작업"과 "입력이 유실된 작업"을 가른다.
+    조회가 실패하면 판단을 미루지 않고 없는 것으로 본다(기존처럼 실패로 남겨 사람이 보게 한다)."""
+    try:
+        conn = _main.get_log_db_connection()
+    except Exception:
+        _main.app.logger.warning("[JOB] job end lookup failed", exc_info=True)
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM operation_log WHERE request_id = %s AND action = %s AND id > %s"
+                " AND phase IN (%s, %s, %s) LIMIT 1",
+                (str(request_id), action, job_id,
+                 Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        _main.app.logger.warning("[JOB] job end lookup failed", exc_info=True)
+        return False
+    finally:
+        conn.close()
+
 def _finish_job(kind, request_id, username, phase, error_code=None, error_detail=None, ctx=None):
     ctx = ctx or {}
     if kind in ("provision", "migrate") and phase != Phase.SUCCESS:
@@ -354,6 +379,12 @@ def _run_job(kind, request_id, username, job_id=None):
 
     stored = _main.load_job_input(action.value, request_id)
     if stored is None:
+        # 끝 행이 이미 있으면 방금 끝난 작업을 한 번 더 집은 것이다. 실패로 적으면 admin_be가 마지막 행만
+        # 보고 성공한 작업을 실패로 되돌린다(신청은 옛 Pod 이름을 가리킨 채 남고 새 Pod는 고아가 된다).
+        if job_id is not None and _main.job_end_exists(action.value, request_id, job_id):
+            _main.app.logger.info(f"[JOB] 이미 끝난 작업 재선택 — 건너뜀: {kind} request_id={request_id} job_id={job_id}")
+            _release_lease(job_id)
+            return
         _finish_job(kind, request_id, username, Phase.FAIL, "JOB_INPUT_MISSING",
                     "job input not found in Redis")
         _release_lease(job_id)
