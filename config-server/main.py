@@ -581,6 +581,9 @@ def _get_farm_node_info(node_name: str) -> dict:
     raise ValueError(f"unknown farm node: {node_name!r}")
 
 
+FARM_SSH_TIMEOUT_SEC = float(os.getenv("FARM_SSH_TIMEOUT_SEC", "150"))
+
+
 def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -> str:
     """전용 서비스 계정으로 접속한다. 계정 쪽에 forced-command가 걸려 있어
     remote_command는 그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
@@ -606,12 +609,12 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
         app.logger.info(f"[FARM SSH] {host}:{port} 접속 시도 {attempt+1}/2")
         start = time.monotonic()
         try:
-            # 원격 ailab-krb5-admin 스크립트는 자체적으로 kinit을 최대 30초(kinit_timeout)까지
-            # 기다린 뒤 응답한다. 클라이언트 타임아웃이 그것과 같은 30초면, 원격이 막 자기
-            # 한도를 다 채우고 정상적으로 응답하려는 순간 클라이언트가 먼저 끊어버리는 경합이
-            # 생긴다. 원격이 스스로 정리하고 응답할 시간을 확실히 벌어주기 위해 60초로 둔다.
+            # 원격 ailab-krb5-admin 스크립트는 systemd 호출을 최대 120초까지 기다린다(노드에
+            # 로그인이 생기면 소리 서버가 블루투스를 기다리는 동안 systemd 본체가 최대 90초
+            # 멈출 수 있다). 클라이언트가 그보다 먼저 끊으면 원격은 계속 일하는데 우리만
+            # 재시도해 같은 대기를 두 번 겪는다. 원격 한도보다 넉넉한 150초로 둔다.
             result = subprocess.run(
-                cmd, input=stdin_data, capture_output=True, text=True, timeout=60,
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=FARM_SSH_TIMEOUT_SEC,
             )
             app.logger.info(f"[FARM SSH] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
             break
