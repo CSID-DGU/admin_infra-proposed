@@ -16,6 +16,7 @@ spec:
       labels:
         app: ailab-frontend
     spec:
+      priorityClassName: ailab-stack-component
       automountServiceAccountToken: false
       containers:
         - name: ailab-frontend

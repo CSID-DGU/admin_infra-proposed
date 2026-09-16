@@ -18,6 +18,9 @@ spec:
         # 설정 시크릿이 바뀌면 다시 뜨도록
         ailab.dgu/config-hash: "__CONFIG_HASH__"
     spec:
+      # 디스크가 쪼들리는 노드에 걸리면 등급 없는 Pod부터 밀려난다. 백엔드가 밀려나면 스택 전체가
+      # 멈추므로 사용자 컨테이너보다 한 단계 위 등급을 준다(stack-up.sh에서 만든다).
+      priorityClassName: ailab-stack-component
       # 관리자 컨테이너 관리 화면이 Pod 상세·로그·이벤트를 쿠버네티스 API로 직접 읽는다. 권한은 아래 Role로
       # 이 스택 네임스페이스 안 읽기만 준다.
       serviceAccountName: admin-prod
