@@ -497,11 +497,14 @@ def test_provision_result_carries_created_resources(env):
 def test_failed_provision_has_no_result(env):
     """실패한 작업은 만든 자원이 없으므로 result가 비어 있다."""
     e = env
-    e.was = lambda url, timeout: e.Resp(404, {"error": "not found"})
+    e.was = lambda url: e.Resp(404, {"error": "not found"})
     e.api.post("/operations/provision", json={"request_id": "112", "username": "exp-np-res2",
                                               "account": {"passwd_base64": PW}})
     tick(e)
 
+    # 대역이 실제로 불렸는지 먼저 본다. 예전에는 인자 수가 달라 불리면 오류가 날 코드였는데,
+    # 불리지 않아 그냥 통과했다 — 의도한 404 경로가 검증되지 않고 있었다.
+    assert any(c[0] == "was" for c in e.calls)
     res = result(e, "provision", "112")
     assert res["phase"] in ("FAIL", "UNKNOWN") and res["result"] is None
 

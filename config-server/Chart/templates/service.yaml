@@ -12,5 +12,8 @@ spec:
       protocol: TCP
       port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.targetPort }}
+      {{- if or (eq .Values.service.type "NodePort") (eq .Values.service.type "LoadBalancer") }}
+      {{- /* ClusterIP 에 이 항목이 있으면 쿠버네티스가 적용 자체를 거부한다. */}}
       nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
 

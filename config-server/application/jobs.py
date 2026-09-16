@@ -343,8 +343,10 @@ def _interrupt_baseline_job(kind, request_id, username, job, ctx, done):
     _main.app.logger.warning(f"[JOB] baseline: {kind} request_id={request_id} 중단된 작업 — 이어하지 않고 종료")
     blind = {k: v for k, v in ctx.items() if k not in ("node", "pod_name", "pod_node_name")}
     detail = {"interrupted_after": done[-1], "compensation": _compensate_provision(kind, job, blind, done)}
+    # 노드·Pod를 뺀 blind를 넘긴다. 원본을 넘기면 운영에서 재현하려던 "어디에 배포하던 중이었는지
+    # 모르는 상태"가 깨져, 결과 행에 노드·Pod가 남는다.
     _finish_job(kind, request_id, username, Phase.FAIL, "INTERRUPTED",
-                json.dumps(detail, ensure_ascii=False, default=str), ctx)
+                json.dumps(detail, ensure_ascii=False, default=str), blind)
 
 def run_job(kind, request_id, username, job_id=None):
     """등록된 작업 하나를 단계 함수로 끝까지 실행하고 작업 단위 끝 행을 남긴다. 실행하는 동안의 모든

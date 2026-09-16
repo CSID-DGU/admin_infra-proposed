@@ -36,7 +36,13 @@ api = requests.Session()
 api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
 base, prefix, node = "http://127.0.0.1:8000", os.environ["PREFIX"], os.environ.get("NODE") or None
 pods = [p for p in os.environ.get("PODS", "").split() if p]
-names = [l.split(":", 1)[0] for l in open("/kube_share/passwd") if l.startswith(prefix)]
+# 계정 대장이 없으면(이미 정리됐거나 마운트가 안 붙은 상태) 지울 계정이 없는 것으로 보고 계속한다 —
+# 여기서 멈추면 Pod·네임스페이스 정리까지 함께 막힌다.
+try:
+    with open("/kube_share/passwd") as ledger:
+        names = [l.split(":", 1)[0] for l in ledger if l.startswith(prefix)]
+except FileNotFoundError:
+    names = []
 rid = int(time.time()) * 10   # 작업 신청 번호(양의 정수). admin_be 신청 번호(1부터)와 겹치지 않는다.
 jobs = []
 
@@ -61,7 +67,12 @@ for name in names:
 deadline, results = time.time() + 900, {}
 while jobs and time.time() < deadline:
     for j in list(jobs):
-        phase = api.get(f"{base}/operations/revoke/{j}", timeout=10).json().get("phase")
+        # 조회 한 번이 실패해도 그 작업만 다음 바퀴로 미룬다 — 여기서 예외가 나가면 반복문이 통째로
+        # 끝나 아래 정리 단계에 도달하지 못한다.
+        try:
+            phase = api.get(f"{base}/operations/revoke/{j}", timeout=10).json().get("phase")
+        except Exception:
+            continue
         if phase in ("SUCCESS", "FAIL", "UNKNOWN"):
             results[j] = phase
             jobs.remove(j)

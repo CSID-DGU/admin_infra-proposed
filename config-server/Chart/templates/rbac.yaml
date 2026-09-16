@@ -20,7 +20,10 @@ rules:
 # krb5 keytab Secret(krb5-keytab-<user>) 생성/조회/삭제 — #82 KRB5 계정 연동
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "list", "create", "delete"]
+  # patch: 계정 Secret의 소유자를 Pod로 지정해 Pod가 어떤 경로로 사라져도 Secret이 함께 지워지게 한다.
+  # 이 권한이 없어 그 지정이 매번 403으로 거부되고 경고만 남고 있었다.
+  # list는 쓰지 않는다 — 코드는 이름을 알고 하나씩 읽는다(read_namespaced_secret).
+  verbs: ["get", "create", "delete", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
