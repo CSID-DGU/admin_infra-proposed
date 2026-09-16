@@ -20,6 +20,7 @@ spec:
       labels:
         app: redis-bg
     spec:
+      priorityClassName: ailab-stack-component
       containers:
         - name: redis
           image: redis:7.4-alpine
@@ -72,6 +73,7 @@ spec:
       labels:
         app: admin-redis
     spec:
+      priorityClassName: ailab-stack-component
       containers:
         - name: redis
           image: redis:7.4-alpine

@@ -103,6 +103,11 @@ redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
   port: 6379
 
+# 축출 순서를 뒤로 미루기 위한 우선순위 등급. 비워 두면 지정하지 않는다.
+# 등급은 클러스터 전역 자원이라, 없는 이름을 적으면 Pod 생성 자체가 거부된다.
+# 그래서 기본값은 비워 두고, 등급을 만들어 두는 실험 스택에서만 stack-up.sh가 채운다.
+priorityClassName: ""
+
 # config-server를 배포할 노드 고정
 # csid-dgu-desktop은 control-plane 노드이므로 아래 tolerations와 함께 사용해야 한다.
 nodeSelector:

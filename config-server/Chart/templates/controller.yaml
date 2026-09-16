@@ -24,6 +24,9 @@ spec:
       # POD_READY_MAX_WAIT_SEC=500초)이 끝날 때까지 기다린다.
       terminationGracePeriodSeconds: 630
       serviceAccountName: config-server
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

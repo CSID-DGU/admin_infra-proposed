@@ -127,6 +127,24 @@ description: "사용자 컨테이너 — 자원 압박 시 시스템 구성요�
 YAML
 echo "ailab-user-workload 적용"
 
+step "스택 구성요소 우선순위 등급"
+# 사용자 컨테이너만 지켜서는 부족하다. 백엔드·프론트엔드·config-server·DB·Redis가 밀려나면
+# 사용자 컨테이너가 살아 있어도 신청·조회·작업이 전부 멈춘다. 실제로 백엔드가 한 노드에서
+# 19번 연속 축출됐다. 그래서 구성요소는 사용자 컨테이너보다 한 단계 위에 둔다 —
+# 둘 다 밀려날 상황이면 서비스를 굴리는 쪽을 남기는 편이 복구가 빠르다.
+# 선점은 여기서도 끈다. 자리를 빼앗지 않고 축출 순서만 뒤로 미룬다.
+cat <<YAML | kubectl apply -f - >/dev/null
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ailab-stack-component
+value: 200000
+globalDefault: false
+preemptionPolicy: Never
+description: "스택 구성요소 — 사용자 컨테이너보다도 늦게 축출된다"
+YAML
+echo "ailab-stack-component 적용"
+
 step "계정 대장 확인 (임시 도우미 Pod)"
 start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
 USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
@@ -250,6 +268,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set db.host=infra-mysql --set logDb.host=log-mysql \
   --set imageStore.claimName= \
   --set controller.enabled=true \
+  --set priorityClassName=ailab-stack-component \
   --wait --timeout 10m
 if [ "$TOKEN_NEW" = 1 ] || [ "$KH_CHANGED" = 1 ]; then
   # 토큰·호스트 키 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.

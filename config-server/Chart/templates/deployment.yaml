@@ -21,6 +21,9 @@ spec:
       # k8s Pod는 고아로 남는 문제가 있었다.
       terminationGracePeriodSeconds: 630
       serviceAccountName: config-server
+      {{- with .Values.priorityClassName }}{{/* 등급을 만들어 둔 환경에서만 지정한다 */}}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.nodeSelector }}{{/* nodeSelector 설정이 있으면 적용 */}}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

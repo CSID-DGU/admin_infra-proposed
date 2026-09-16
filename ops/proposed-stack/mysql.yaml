@@ -17,6 +17,7 @@ spec:
       labels:
         app: stack-mysql
     spec:
+      priorityClassName: ailab-stack-component
       # log-mysql과 같은 방식으로 farm2의 로컬 디스크에 고정한다.
       nodeSelector:
         kubernetes.io/hostname: farm2
