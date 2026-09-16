@@ -1103,6 +1103,12 @@ def build_pod_spec(
                                 },
                                 "spec": {
                                         "nodeName": target_node,
+                                        # 노드가 쪼들릴 때 kubelet이 Pod를 쫓아내는 순서는 우선순위로 갈린다.
+                                        # 비워 두면(0) 사용자 컨테이너가 가장 먼저 밀려난다 — 실제로 그렇게
+                                        # 축출돼 마이그레이션이 실패했다. 등급이 없는 환경에서는 설정을 비우면
+                                        # 이 항목을 넣지 않는다(없는 등급을 지정하면 Pod 생성이 거부된다).
+                                        **({"priorityClassName": _main.app.config["POD_PRIORITY_CLASS"]}
+                                           if _main.app.config["POD_PRIORITY_CLASS"] else {}),
                                         "containers": [
                                             {
                                                 "name": "shell",

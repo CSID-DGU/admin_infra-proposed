@@ -174,6 +174,9 @@ app.config.from_mapping({
     # 공평해진다. limit은 한 Pod가 노드 디스크를 독점하지 못하게 막는 안전장치다.
     "DEFAULT_EPHEMERAL_STORAGE_REQUEST": "5Gi",
     "DEFAULT_EPHEMERAL_STORAGE_LIMIT": "50Gi",
+    # 사용자 컨테이너에 붙일 우선순위 등급. 노드 디스크가 쪼들릴 때 축출 순서를 뒤로 미룬다.
+    # 설치 스크립트가 같은 이름으로 만든다. 등급이 없는 클러스터에서는 비워 두면 붙이지 않는다.
+    "POD_PRIORITY_CLASS": os.getenv("POD_PRIORITY_CLASS", "ailab-user-workload"),
 
     # NFS
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),

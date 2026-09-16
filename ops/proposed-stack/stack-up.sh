@@ -108,6 +108,25 @@ step "네임스페이스 $NS"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace "$NS" ailab.dgu/proposed-stack="$STACK" --overwrite >/dev/null
 
+step "사용자 컨테이너 우선순위 등급"
+# 노드 디스크가 쪼들리면 kubelet이 Pod를 쫓아낸다. 그 순서는 자원 요청 초과 여부와 우선순위로
+# 갈리는데, 우선순위를 비워 두면(0) 사용자 컨테이너가 이름 없는 다른 Pod들과 같은 취급을 받아
+# 먼저 밀려난다. 실제로 마이그레이션 중이던 사용자 컨테이너가 이렇게 축출돼 작업이 실패했다.
+# 시스템 등급(20억)보다 한참 낮게 두어 클러스터 운영에는 영향을 주지 않고, 선점은 끈다 —
+# 이 등급은 밀려나지 않기 위한 것이지 남을 밀어내기 위한 것이 아니다.
+# 클러스터 전역 자원이라 세 스택이 각각 적용해도 같은 내용이라 문제없다.
+cat <<YAML | kubectl apply -f - >/dev/null
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ailab-user-workload
+value: 100000
+globalDefault: false
+preemptionPolicy: Never
+description: "사용자 컨테이너 — 자원 압박 시 시스템 구성요소보다 늦게 축출된다"
+YAML
+echo "ailab-user-workload 적용"
+
 step "계정 대장 확인 (임시 도우미 Pod)"
 start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
 USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)

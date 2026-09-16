@@ -506,6 +506,18 @@ def test_failed_provision_has_no_result(env):
     assert res["phase"] in ("FAIL", "UNKNOWN") and res["result"] is None
 
 
+def test_pod_gets_priority_class(env):
+    """노드 디스크가 쪼들리면 kubelet이 Pod를 쫓아낸다. 우선순위가 비어 있으면 사용자 컨테이너가
+    가장 먼저 밀려난다 — 실제로 그렇게 축출돼 마이그레이션이 실패했다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "114", "username": "exp-np-prio",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    pod = next(p for p in e.v1.pods.values() if "exp-np-prio" in p.metadata.name)
+    assert pod.body["spec"]["priorityClassName"] == main.app.config["POD_PRIORITY_CLASS"]
+
+
 def test_pod_env_carries_ticket_cache_path(env):
     """홈은 인증이 필요한 NFS라 노드 쪽 준비 직후 한순간 쓸 수 없다. entrypoint는 그때 티켓 캐시
     경로가 없으면 기동을 실패로 끝내므로, Pod에 그 경로를 넘긴다."""
