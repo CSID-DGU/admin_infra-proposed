@@ -475,7 +475,13 @@ if fe:
 sys.exit(0 if ok else 1)
 PY
 
-step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 ${PREFIX}001)"
+# 시험 계정 이름은 리눅스 계정명 규칙(숫자로 시작 불가)을 지켜야 한다. 세 실험 스택은 접두어가
+# 글자로 시작해 문제없지만, 실운영(operation)은 접두어를 비워둬서(PREFIX=) 그대로 쓰면 "001"처럼
+# 숫자로 시작해 홈 디렉터리 생성 단계에서 (정당하게) 거부된다.
+PROBE_NAME="${PREFIX}001"
+[ -z "$PREFIX" ] && PROBE_NAME="guardprobe001"
+
+step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 $PROBE_NAME)"
 # v2.0 비동기 흐름(POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로
 # 도는지, 계정이 스택 UID 대역 안에서 만들어지고 회수되는지 확인한다.
 # 작업의 신청 번호는 admin_be 신청 PK와 같은 형식(양의 정수)만 받는다. 실제 신청과 겹치지 않도록
@@ -485,7 +491,7 @@ JOB_RID2=$((JOB_RID + 1))
 # 계정 회수는 keytab을 지울 farm 노드를 모르면 보류한다(baseline admin_be와 같은 조건). 회수 작업
 # 시험에는 그래서 노드를 하나 실어 보낸다. 공개 로그에 남지 않게 값은 출력하지 않고 넘기기만 한다.
 JOB_NODE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i '^farm' | head -1)
-kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}001" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" python - <<'PY'
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="$PROBE_NAME" RID="$JOB_RID" RID2="$JOB_RID2" NODE="$JOB_NODE" UID_MIN="$UID_MIN" UID_MAX="$UID_MAX" python - <<'PY'
 import base64, os, sys, time, requests
 api = requests.Session()
 api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
