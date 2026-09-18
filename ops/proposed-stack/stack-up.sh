@@ -41,7 +41,9 @@ case "$STACK" in
   # 남아 nodePort를 해제하지 않는다) 못 쓴다, 그래서 세 실험 스택과 같은 규칙으로 다음 빈 자리
   # (30482)를 쓴다. 접두어는 비워서(PREFIX=) ACCOUNT_PREFIX 강제 검사를 끈다 — 실사용자는
   # 원하는 이름을 그대로 쓴다.
-  operation) UID_MIN=20000; UID_MAX=49999; NP_MIN=33000; NP_MAX=34999; CONFIG_NODEPORT=30482; PREFIX= ;;
+  # 실측(2026-09-18): 구 운영 실계정이 20000~20017에 몰려 있다(직접 조회로 확인, 8개 —
+  # yoon6yo·csuhyeon 등 실사용자 포함). 21000부터 시작해 여유를 둔다.
+  operation) UID_MIN=21000; UID_MAX=49999; NP_MIN=33000; NP_MAX=34999; CONFIG_NODEPORT=30482; PREFIX= ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 NS=ailab-$STACK
