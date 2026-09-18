@@ -68,7 +68,18 @@ start_ledger_helper() {  # $1: NFS 서버, $2: 계정 대장 경로
   # NAS 마운트가 안 되는 노드가 있어, 이 스택 config-server가 이미 떠 있으면 같은 노드에 붙인다.
   local node pin=""
   node=$(kubectl -n "$NS" get pod -l "app=containerssh-config-server,!job-name" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
-  [ -n "$node" ] && pin="  nodeName: $node"
+  if [ -n "$node" ]; then
+    pin="  nodeName: $node"
+  else
+    # 고정할 기존 파드가 없는 첫 배포다. farm6은 idmapd.conf에 Domain이 없어 NFS 마운트가
+    # 그대로 멈춰버리는 게 알려져 있다(2026-09-15 확인) — 스케줄러가 거기로 보내지 않게 막는다.
+    pin='  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: kubernetes.io/hostname, operator: NotIn, values: [farm6]}'
+  fi
   cat <<YAML | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
