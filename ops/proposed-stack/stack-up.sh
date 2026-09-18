@@ -313,13 +313,19 @@ kubectl -n "$PROD_BE_NS" get secret admin-prod-config >/dev/null 2>&1 || { echo 
   kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o go-template='{{range $k, $v := .data}}  {{$k}}: {{$v}}{{"\n"}}{{end}}'
 } | kubectl -n "$NS" apply -f - >/dev/null
 PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpath='{.data}' | sha256sum | cut -c1-16)
-# 운영 설정 중 운영 자원을 가리키는 것은 모두 여기서 덮어쓴다. Slack은 닿지 않는 주소로 돌리고,
+# 운영 설정 중 운영 자원을 가리키는 것은 모두 여기서 덮어쓴다. 실험 스택 셋은 Slack을 닿지 않는
+# 주소로 돌려 실수로 진짜 채널에 보내지 못하게 막는다. 실운영(operation)은 그 자체가 진짜라 이
+# 안전장치를 끄고 admin-prod-config Secret(위에서 그대로 복사한 실제 파일 설정)의 진짜 webhook·
+# 봇 토큰이 그대로 쓰이게 둔다 — SPRING_APPLICATION_JSON(env)이 파일 설정보다 우선순위가 높으므로
+# 여기서 키 자체를 안 넣어야 파일 값이 이긴다(e2e 점검 중 이 안전장치가 실운영도 막고 있던 걸 발견).
 # 메일(가입 인증 코드, 만료 안내)은 운영 설정 그대로 보낸다. 서명키는 새로 줘서 운영에서 발급한 토큰이
 # 여기서 통하지 않게 한다.
 SINK=http://127.0.0.1:9/
+SLACK_OVERRIDE=",\"slack-webhook-url\":{\"error-log\":\"$SINK\",\"noti\":\"$SINK\",\"farm-admin\":\"$SINK\",\"lab-admin\":\"$SINK\"},\"slack\":{\"bot-token\":\"disabled\"}"
+[ "$STACK" = "operation" ] && SLACK_OVERRIDE=""
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"},"slack-webhook-url":{"error-log":"$SINK","noti":"$SINK","farm-admin":"$SINK","lab-admin":"$SINK"},"slack":{"bot-token":"disabled"},"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE,"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
