@@ -32,6 +32,12 @@ case "$STACK" in
   baseline) UID_MIN=60000; UID_MAX=64999; NP_MIN=32500; NP_MAX=32749; CONFIG_NODEPORT=30382; PREFIX=exp-bl- ;;
   noprobe) UID_MIN=50000; UID_MAX=54999; NP_MIN=32000; NP_MAX=32249; CONFIG_NODEPORT=30182; PREFIX=exp-np- ;;
   full)    UID_MIN=55000; UID_MAX=59999; NP_MIN=32250; NP_MAX=32499; CONFIG_NODEPORT=30282; PREFIX=exp-fu- ;;
+  # 실운영. 구 운영이 실제로 관리하던 계정 대역(UID 20000대, 코드 주석 근거)을 그대로 이어받는다 —
+  # 새로 파는 격리 대역이 아니라 계정 연속성이 목적이다. NodePort 30082/30083은 구 운영 Service
+  # 객체가 지금도 쥐고 있어(Pod는 내려가 있어도 Service는 남아 nodePort를 해제하지 않는다) 못 쓴다,
+  # 그래서 세 실험 스택과 같은 규칙으로 다음 빈 자리(30482)를 쓴다. 접두어는 비워서(PREFIX=)
+  # ACCOUNT_PREFIX 강제 검사를 끈다 — 실사용자는 원하는 이름을 그대로 쓴다.
+  operation) UID_MIN=20000; UID_MAX=99999; NP_MIN=33000; NP_MAX=34999; CONFIG_NODEPORT=30482; PREFIX= ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 NS=ailab-$STACK
@@ -147,13 +153,24 @@ echo "ailab-stack-component 적용"
 
 step "계정 대장 확인 (임시 도우미 Pod)"
 start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
-USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
-[ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
-# config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
-# 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
-# config-server가 처음 계정을 만들 때 기본 파일로 채운다.
-ledger mkdir -p "/kube_share/exp-$STACK"
-echo "UID $UID_MIN~$UID_MAX 비어 있음, 스택 계정 대장 /kube_share/exp-$STACK"
+if [ "$STACK" = operation ]; then
+  # 실운영은 격리된 하위 디렉터리를 새로 파지 않는다 — 구 운영이 쓰던 그 원장(passwd/group/shadow)을
+  # 그대로 이어받아야 기존 계정이 보이고 관리된다. 그래서 "대역이 비어 있어야 한다" 검사도 하지 않는다
+  # — 정반대로 그 대역에 기존 계정이 있는 것이 정상이고 목적이다. uid 할당은 "현재 최댓값+1"이라
+  # (_allocate_next_uid) 기존 계정과 저절로 안 겹친다.
+  STACK_KUBE_SHARE="$KUBE_SHARE"
+  EXISTING=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
+  echo "실운영 원장을 그대로 사용: $STACK_KUBE_SHARE (UID $UID_MIN~$UID_MAX 안 기존 계정 ${EXISTING}개, 이어받음)"
+else
+  USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
+  [ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
+  # config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
+  # 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
+  # config-server가 처음 계정을 만들 때 기본 파일로 채운다.
+  STACK_KUBE_SHARE="$KUBE_SHARE/exp-$STACK"
+  ledger mkdir -p "/kube_share/exp-$STACK"
+  echo "UID $UID_MIN~$UID_MAX 비어 있음, 스택 계정 대장 /kube_share/exp-$STACK"
+fi
 
 step "SSH 키 복사 ($PROD_NS → $NS)"
 for s in nas-ssh-key farm-ssh-key farm-ad-ssh-key; do
@@ -259,7 +276,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set namespace="$NS" --set config.namespace="$NS" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
   --set service.nodePort="$CONFIG_NODEPORT" \
-  --set nfs.kubeSharePath="$KUBE_SHARE/exp-$STACK" \
+  --set nfs.kubeSharePath="$STACK_KUBE_SHARE" \
   --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
   --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
   --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
