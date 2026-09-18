@@ -1,0 +1,25 @@
+# 스택별 UID·NodePort 대역 선언. stack-up.sh는 case문에 값을 하드코딩하는 대신 이 파일을 읽고,
+# 배포 전에 자기 대역이 다른 스택 대역과 겹치면 그 자리에서 막는다(git 파일끼리 비교하므로 형제
+# 스택이 지금 떠 있는지와 무관하게 검사할 수 있다). 새 스택을 추가하거나 대역을 바꿀 때는 여기만
+# 고치면 된다 — case문 주석에 손으로 적지 않는다. (admin_infra-proposed#118)
+#
+# 실제로 겪은 충돌 사고들:
+# - operation 추가 때 UID_MAX=99999로 잡았다가 noprobe/full/baseline(50000~64999)과 겹칠 뻔함
+#   (리뷰 중 발견, 배포 전 수정)
+# - 구 운영 실계정이 20000~20017에 몰려 있어(직접 조회로 확인) UID_MIN=20000도 충돌
+# - NodePort 33000~34999로 잡았는데 이 클러스터 쿠버네티스 API 서버의 실제 허용 범위가
+#   기본값인 30000~32767뿐이라 그 밖의 값은 서비스 생성이 422로 거부됨(2026-09-18 e2e 점검 중 발견)
+#
+# 필드:
+#   uid_min/uid_max       — Linux/AD 계정 UID 대역. 실제 계정은 같은 farm 노드 OS에 만들어지므로
+#                            스택마다 원장이 격리돼 있어도 겹치면 안 된다.
+#   np_min/np_max          — 사용자 컨테이너 NodePort 대역. 반드시 30000~32767 안이어야 한다
+#                            (이 클러스터 쿠버네티스 API 서버의 실제 허용 범위).
+#   config_nodeport         — config-server 자신의 NodePort. 구 운영이 30082/30083을 쥐고 있어
+#                            (Pod가 내려가 있어도 Service는 nodePort를 해제하지 않는다) 못 쓴다.
+#   prefix                  — 계정 이름 접두어. 실험 스택은 실제 계정과 안 섞이도록 접두어를 강제한다.
+#                            실운영은 접두어 없이("") 실사용자가 원하는 이름을 그대로 쓴다.
+- {stack: baseline,  uid_min: 60000, uid_max: 64999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
+- {stack: noprobe,   uid_min: 50000, uid_max: 54999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
+- {stack: full,      uid_min: 55000, uid_max: 59999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
+- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30500, np_max: 31999, config_nodeport: 30482, prefix: ""}

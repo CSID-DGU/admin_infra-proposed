@@ -26,30 +26,40 @@ PROD_BE_NS=default
 PROD_DB_NS=ailab-be      # 운영 admin_be의 DB (기준 데이터 복사용, 읽기만)
 PROD_DB_POD=my-mysql-0
 
-# 할당 값. 운영(UID 20000대, NodePort 30000~32767 전체, config-server 30082, admin_be 30083)과
-# 겹치지 않게 잡았다. 바꿀 때는 docs/환경 구축 가이드의 표도 같이 고친다.
-case "$STACK" in
-  baseline) UID_MIN=60000; UID_MAX=64999; NP_MIN=32500; NP_MAX=32749; CONFIG_NODEPORT=30382; PREFIX=exp-bl- ;;
-  noprobe) UID_MIN=50000; UID_MAX=54999; NP_MIN=32000; NP_MAX=32249; CONFIG_NODEPORT=30182; PREFIX=exp-np- ;;
-  full)    UID_MIN=55000; UID_MAX=59999; NP_MIN=32250; NP_MAX=32499; CONFIG_NODEPORT=30282; PREFIX=exp-fu- ;;
-  # 실운영. 구 운영 계정 대장(원본 kubeSharePath)을 직접 마운트하려 했으나 NAS가 그 경로만
-  # 거부해(mount.nfs: Operation not permitted, 하위 exp-* 경로는 항상 허용됨) 실험 스택과 같은
-  # 격리된 하위 디렉터리 방식으로 되돌렸다. UID_MAX는 반드시 50000 밑이어야 한다 — 원장은
-  # 스택마다 격리돼 있어도 실제 계정은 같은 farm 노드 OS에 만들어지므로, noprobe(50000~)·
-  # full(55000~)·baseline(60000~)과 겹치면 서로 다른 스택이 같은 uid로 실제 계정을 만들 수 있다.
-  # NodePort 30082/30083은 구 운영 Service 객체가 지금도 쥐고 있어(Pod는 내려가 있어도 Service는
-  # 남아 nodePort를 해제하지 않는다) 못 쓴다, 그래서 세 실험 스택과 같은 규칙으로 다음 빈 자리
-  # (30482)를 쓴다. 접두어는 비워서(PREFIX=) ACCOUNT_PREFIX 강제 검사를 끈다 — 실사용자는
-  # 원하는 이름을 그대로 쓴다.
-  # 실측(2026-09-18): 구 운영 실계정이 20000~20017에 몰려 있다(직접 조회로 확인, 8개 —
-  # yoon6yo·csuhyeon 등 실사용자 포함). 21000부터 시작해 여유를 둔다.
-  # NodePort 33000~34999는 처음에 세 실험 스택(32000~32749)과 안 겹치게 고른 값인데, 실측해 보니
-  # 이 클러스터의 쿠버네티스 API 서버가 실제로 받아주는 NodePort 범위는 기본값인 30000~32767뿐이라
-  # 그 밖의 값은 서비스 생성 자체가 422로 거부됐다(2026-09-18, e2e 점검 중 발견). 그 범위 안에서
-  # 구 운영(30000~30034, 30080~30084)·세 실험 스택(32000~32749)과 안 겹치는 30500~31999로 옮긴다.
-  operation) UID_MIN=21000; UID_MAX=49999; NP_MIN=30500; NP_MAX=31999; CONFIG_NODEPORT=30482; PREFIX= ;;
-  *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
-esac
+# 할당 값은 uid-ranges.yaml 한 곳에 선언돼 있다(admin_infra-proposed#118). case문에 손으로
+# 적지 않는 이유와 실제 겪은 충돌 사고들은 그 파일 머리말 주석 참고.
+RANGES_FILE="$HERE/uid-ranges.yaml"
+[ -f "$RANGES_FILE" ] || { echo "대역 선언 파일이 없음: $RANGES_FILE"; exit 1; }
+yaml_field() {  # $1: "- {stack: ..., ...}" 한 줄, $2: 필드명 → 값
+  echo "$1" | sed -n "s/.*[{ ]$2: \"\{0,1\}\([^,}\"]*\)\"\{0,1\}.*/\1/p"
+}
+STACK_LINE=$(grep -E "^- \{stack: $STACK, " "$RANGES_FILE") || true
+[ -n "$STACK_LINE" ] || { echo "알 수 없는 스택: $STACK ($RANGES_FILE에 선언 없음)"; exit 2; }
+UID_MIN=$(yaml_field "$STACK_LINE" uid_min)
+UID_MAX=$(yaml_field "$STACK_LINE" uid_max)
+NP_MIN=$(yaml_field "$STACK_LINE" np_min)
+NP_MAX=$(yaml_field "$STACK_LINE" np_max)
+CONFIG_NODEPORT=$(yaml_field "$STACK_LINE" config_nodeport)
+PREFIX=$(yaml_field "$STACK_LINE" prefix)
+# NodePort는 이 클러스터 쿠버네티스 API 서버의 기본 허용 범위(30000~32767) 밖이면 서비스 생성이
+# 422로 거부된다(2026-09-18 e2e 점검 중 실측으로 발견) — 배포가 한참 진행된 뒤에야 드러나므로
+# 여기서 미리 막는다.
+{ [ "$NP_MIN" -ge 30000 ] && [ "$NP_MAX" -le 32767 ]; } || { echo "NodePort 대역 $NP_MIN~$NP_MAX 이 쿠버네티스 허용 범위(30000~32767) 밖임"; exit 1; }
+# 다른 스택과 대역이 겹치는지 선언 파일 안에서만 비교한다(형제 스택이 지금 떠 있는지와 무관 —
+# 배포 상태에 의존하는 실시간 조회는 신뢰할 수 없어 기각했다, admin_infra-proposed#118).
+while IFS= read -r OTHER_LINE; do
+  case "$OTHER_LINE" in "- {stack:"*) ;; *) continue ;; esac
+  OTHER_STACK=$(yaml_field "$OTHER_LINE" stack)
+  [ "$OTHER_STACK" = "$STACK" ] && continue
+  O_UID_MIN=$(yaml_field "$OTHER_LINE" uid_min); O_UID_MAX=$(yaml_field "$OTHER_LINE" uid_max)
+  O_NP_MIN=$(yaml_field "$OTHER_LINE" np_min); O_NP_MAX=$(yaml_field "$OTHER_LINE" np_max)
+  if [ "$UID_MIN" -le "$O_UID_MAX" ] && [ "$UID_MAX" -ge "$O_UID_MIN" ]; then
+    echo "UID 대역이 $OTHER_STACK 과 겹침: $UID_MIN~$UID_MAX vs $O_UID_MIN~$O_UID_MAX"; exit 1
+  fi
+  if [ "$NP_MIN" -le "$O_NP_MAX" ] && [ "$NP_MAX" -ge "$O_NP_MIN" ]; then
+    echo "NodePort 대역이 $OTHER_STACK 과 겹침: $NP_MIN~$NP_MAX vs $O_NP_MIN~$O_NP_MAX"; exit 1
+  fi
+done < "$RANGES_FILE"
 # config-server의 RUN_MODE(구 이름 VERIFY_MODE)는 baseline/noprobe/full 셋만 허용한다 —
 # 재시도·복구·실접근 검증 여부를 가르는 동작 방식 값이지 네임스페이스 구분자가 아니다.
 # 실운영(operation)은 네임스페이스·UID대역·접두어로 이미 다른 스택과 구분되므로, 동작
