@@ -593,8 +593,14 @@ else
 fi
 echo "--- 스택 DB의 작업 이력"
 kubectl -n "$NS" exec mysql-0 -- sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT action, phase FROM operation_state_db.operation_log WHERE request_id IN ('smoke-${PREFIX}000','$JOB_RID','$JOB_RID2') ORDER BY id\" 2>/dev/null" | tail -20
-LEAK=$(ledger sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
-[ "$LEAK" = 0 ] && echo "OK  운영 계정 대장에 ${PREFIX} 계정 없음" || { echo "NG  운영 계정 대장에 ${PREFIX} 계정 ${LEAK}개"; exit 1; }
+# 실험 스택 접두어가 실운영 계정 대장(bare kube_share root)에 새어 들었는지 보는 확인이다.
+# 실운영(operation)은 접두어가 없어(PREFIX=) 빈 문자열이 모든 줄과 매칭돼 뜻이 없으므로 건너뛴다.
+if [ -n "$PREFIX" ]; then
+  LEAK=$(ledger sh -c "grep -c '^${PREFIX}' /kube_share/passwd || true")
+  [ "$LEAK" = 0 ] && echo "OK  운영 계정 대장에 ${PREFIX} 계정 없음" || { echo "NG  운영 계정 대장에 ${PREFIX} 계정 ${LEAK}개"; exit 1; }
+else
+  echo "OK  접두어 없음 (실운영, 누출 검사 대상 아님)"
+fi
 
 step "완료"
 echo "네임스페이스      $NS"
