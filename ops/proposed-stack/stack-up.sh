@@ -434,9 +434,14 @@ for _ in range(12):
         time.sleep(5)
 check("admin_be(WAS) 응답", not err, err)
 # 접두어 없는 이름은 거절돼야 한다. 막히지 않더라도 request_id가 숫자가 아니어서 400으로 끝나 작업은 등록되지 않는다.
-r = api.post(f"{base}/operations/revoke", timeout=30,
-                  json={"request_id": "not-a-number", "username": "guardprobe000", "delete_account": True})
-check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
+# 단, 실운영(operation)은 접두어 강제를 일부러 꺼둬서(PREFIX=) 실사용자가 원하는 이름을 그대로
+# 쓰게 했으므로 이 거절 자체가 일어나지 않는다 — 이 스택에서는 검증 대상이 아니다.
+if os.environ["PREFIX"]:
+    r = api.post(f"{base}/operations/revoke", timeout=30,
+                      json={"request_id": "not-a-number", "username": "guardprobe000", "delete_account": True})
+    check(f"접두어({os.environ['PREFIX']}) 없는 계정 거절", r.status_code == 403, r.status_code)
+else:
+    print("OK  접두어 제약 없음 (실사용자 이름 그대로 허용, 검증 대상 아님)")
 fe = os.environ.get("FE", "")
 
 def settled(label, fn, ok):
