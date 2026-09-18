@@ -43,7 +43,11 @@ case "$STACK" in
   # 원하는 이름을 그대로 쓴다.
   # 실측(2026-09-18): 구 운영 실계정이 20000~20017에 몰려 있다(직접 조회로 확인, 8개 —
   # yoon6yo·csuhyeon 등 실사용자 포함). 21000부터 시작해 여유를 둔다.
-  operation) UID_MIN=21000; UID_MAX=49999; NP_MIN=33000; NP_MAX=34999; CONFIG_NODEPORT=30482; PREFIX= ;;
+  # NodePort 33000~34999는 처음에 세 실험 스택(32000~32749)과 안 겹치게 고른 값인데, 실측해 보니
+  # 이 클러스터의 쿠버네티스 API 서버가 실제로 받아주는 NodePort 범위는 기본값인 30000~32767뿐이라
+  # 그 밖의 값은 서비스 생성 자체가 422로 거부됐다(2026-09-18, e2e 점검 중 발견). 그 범위 안에서
+  # 구 운영(30000~30034, 30080~30084)·세 실험 스택(32000~32749)과 안 겹치는 30500~31999로 옮긴다.
+  operation) UID_MIN=21000; UID_MAX=49999; NP_MIN=30500; NP_MAX=31999; CONFIG_NODEPORT=30482; PREFIX= ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 # config-server의 RUN_MODE(구 이름 VERIFY_MODE)는 baseline/noprobe/full 셋만 허용한다 —
