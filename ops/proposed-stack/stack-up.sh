@@ -349,6 +349,19 @@ for ip in $API_EP; do
         - protocol: TCP
           port: $API_EP_PORT"
 done
+# 실험 스택 셋은 실수로 진짜 Slack 채널에 알림을 보내지 않도록 443(HTTPS)을 막아 두는 게 맞지만,
+# 실운영(operation)은 그 자체가 진짜라 여기서 Slack 알림이 실제로 나가야 한다(e2e 점검 중 전부
+# ResourceAccessException으로 막혀 있던 걸 발견, 2026-09-18). Slack IP는 고정돼 있지 않아
+# ipBlock으로 좁힐 수 없으므로 443만 전체 허용한다.
+if [ "$STACK" = "operation" ]; then
+  API_EGRESS="$API_EGRESS
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443"
+fi
 render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__CONFIG_HASH__|$CONFIG_HASH|" \
   | API_EGRESS="$API_EGRESS" awk '{ if (index($0, "__API_EGRESS__")) print ENVIRON["API_EGRESS"]; else print }' \
   | kubectl apply -f -
@@ -575,10 +588,17 @@ PY
 
 echo "--- admin_be 나가는 연결 (메일만 허용)"
 BE_POD=$(running_pod "$NS" app=admin-prod)
+# 실험 스택 셋은 Slack(443)이 막혀 있어야 정상이지만, 실운영(operation)은 실제 알림을 보내야 하므로
+# 반대로 열려 있어야 정상이다.
+if [ "$STACK" = "operation" ]; then
+  SLACK_CHECK='t hooks.slack.com 443 && echo "OK  Slack(443) 연결됨" || echo "NG  Slack(443)이 막혀 있음"'
+else
+  SLACK_CHECK='t hooks.slack.com 443 && echo "NG  Slack(443) 연결이 열려 있음" || echo "OK  Slack(443) 차단"'
+fi
 NET=$(kubectl -n "$NS" exec "$BE_POD" -- bash -c '
   t() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
   t smtp.gmail.com 587 && echo "OK  메일(SMTP 587) 연결됨" || echo "NG  메일(SMTP 587) 연결 안 됨"
-  t hooks.slack.com 443 && echo "NG  Slack(443) 연결이 열려 있음" || echo "OK  Slack(443) 차단"
+  '"$SLACK_CHECK"'
   t my-mysql.ailab-be.svc.cluster.local 3306 && echo "NG  운영 DB 연결이 열려 있음" || echo "OK  운영 DB 차단"
   t kubernetes.default.svc.cluster.local 443 && echo "OK  쿠버네티스 API 연결됨(관리자 Pod 조회)" || echo "NG  쿠버네티스 API 연결 안 됨"')
 echo "$NET"
