@@ -48,10 +48,20 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
             failureThreshold: 60
+          # readiness보다 한참 느긋하게 잡는다 — 뜨는 중에 liveness가 먼저 죽이면 안 된다.
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m
               memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
       volumes:
         - name: app-config
           secret:

@@ -37,6 +37,11 @@ spec:
               command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
             initialDelaySeconds: 10
             periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
           resources:
             requests:
               cpu: 250m
@@ -89,3 +94,31 @@ spec:
     app: stack-mysql
   ports:
     - port: 3306
+---
+# admin_be·config-server 본체·제어기만 이 DB에 닿을 필요가 있다. 그 외(다른 네임스페이스,
+# 이 스택의 다른 컴포넌트)는 비밀번호가 있어도 연결 자체를 시도할 수 없게 막는다
+# (2026-09-18 실운영 점검 중 지적 — 그때까지 ingress 방향 제한이 전혀 없었다).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mysql-ingress
+  namespace: __NS__
+spec:
+  podSelector:
+    matchLabels:
+      app: stack-mysql
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin-prod
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-server
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-controller
+      ports:
+        - protocol: TCP
+          port: 3306

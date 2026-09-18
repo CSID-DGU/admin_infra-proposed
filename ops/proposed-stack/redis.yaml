@@ -1,7 +1,7 @@
 # config-server용(인증 없음, 운영 redis-bg와 같은 이름)과 admin_be용(비밀번호 있음, 운영 my-redis와 같은 방식)
-# 두 대. config-server 작업 대기열(redis-bg-master)은 제어기(controller.py)가 처리하기 전에 Redis가
-# 재시작돼도 남아야 해서 AOF+RDB로 영속화한다. admin-redis는 세션 등 재시작에도 남을 필요가 없는
-# 데이터라 그대로 디스크를 쓰지 않는다.
+# 두 대. 둘 다 재시작에도 데이터가 남아야 한다 — admin-redis에는 Slack 알림 대기열·이메일 인증
+# 코드가 쌓이는데, 재시작 한 번에 통째로 사라지면 실사용자가 인증 메일을 다시 받아야 하거나
+# 관리자 알림이 조용히 유실된다(2026-09-18 실운영 점검 중 지적). AOF+RDB로 영속화한다.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +27,23 @@ spec:
           args: ["--appendonly", "yes", "--aof-use-rdb-preamble", "yes", "--appendfsync", "everysec"]
           ports:
             - containerPort: 6379
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
           volumeMounts:
             - name: data
               mountPath: /data
@@ -58,6 +75,29 @@ spec:
   ports:
     - port: 6379
 ---
+# config-server 본체와 제어기만 이 대기열에 닿을 필요가 있다.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-bg-ingress
+  namespace: __NS__
+spec:
+  podSelector:
+    matchLabels:
+      app: redis-bg
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-server
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-controller
+      ports:
+        - protocol: TCP
+          port: 6379
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -65,6 +105,8 @@ metadata:
   namespace: __NS__
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: admin-redis
@@ -77,7 +119,7 @@ spec:
       containers:
         - name: redis
           image: redis:7.4-alpine
-          command: ["sh", "-c", "exec redis-server --requirepass \"$REDIS_PASSWORD\" --save '' --appendonly no"]
+          command: ["sh", "-c", "exec redis-server --requirepass \"$REDIS_PASSWORD\" --appendonly yes --aof-use-rdb-preamble yes --appendfsync everysec"]
           env:
             - name: REDIS_PASSWORD
               valueFrom:
@@ -86,6 +128,42 @@ spec:
                   key: admin_redis
           ports:
             - containerPort: 6379
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: admin-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: admin-redis-data
+  namespace: __NS__
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -97,3 +175,23 @@ spec:
     app: admin-redis
   ports:
     - port: 6379
+---
+# admin_be만 이 인스턴스(세션·알림 대기열·인증 코드)에 닿을 필요가 있다.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-redis-ingress
+  namespace: __NS__
+spec:
+  podSelector:
+    matchLabels:
+      app: admin-redis
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: admin-prod
+      ports:
+        - protocol: TCP
+          port: 6379
