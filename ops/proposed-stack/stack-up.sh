@@ -46,6 +46,12 @@ case "$STACK" in
   operation) UID_MIN=21000; UID_MAX=49999; NP_MIN=33000; NP_MAX=34999; CONFIG_NODEPORT=30482; PREFIX= ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
+# config-server의 RUN_MODE(구 이름 VERIFY_MODE)는 baseline/noprobe/full 셋만 허용한다 —
+# 재시도·복구·실접근 검증 여부를 가르는 동작 방식 값이지 네임스페이스 구분자가 아니다.
+# 실운영(operation)은 네임스페이스·UID대역·접두어로 이미 다른 스택과 구분되므로, 동작
+# 방식은 재시도·결과 확인 없이 뒷정리 후 종료하는 baseline(=기존 운영과 같은 동작)으로 맞춘다.
+VERIFY_MODE="$STACK"
+[ "$STACK" = "operation" ] && VERIFY_MODE=baseline
 NS=ailab-$STACK
 RELEASE=config-server-$STACK
 # 스택 화면은 운영 프론트엔드가 쓰는 ingress 컨트롤러(nodePort 30081, 방화벽 허용)에 호스트 규칙을 더해 연다.
@@ -279,7 +285,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
   --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
   --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
-  --set verifyMode="$STACK" \
+  --set verifyMode="$VERIFY_MODE" \
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
   --set db.host=infra-mysql --set logDb.host=log-mysql \
   --set imageStore.claimName= \
@@ -583,4 +589,4 @@ fi
 echo "UID 대역          $UID_MIN~$UID_MAX"
 echo "NodePort 대역     $NP_MIN~$NP_MAX"
 echo "테스트 계정 접두어 $PREFIX"
-echo "VERIFY_MODE       $STACK"
+echo "VERIFY_MODE       $VERIFY_MODE"
