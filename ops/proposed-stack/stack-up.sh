@@ -69,21 +69,11 @@ LEDGER_POD=ledger-helper
 ledger_cleanup() { kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
 start_ledger_helper() {  # $1: NFS 서버, $2: 계정 대장 경로
   kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
-  # NAS 마운트가 안 되는 노드가 있어, 이 스택 config-server가 이미 떠 있으면 같은 노드에 붙인다.
-  local node pin=""
-  node=$(kubectl -n "$NS" get pod -l "app=containerssh-config-server,!job-name" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
-  if [ -n "$node" ]; then
-    pin="  nodeName: $node"
-  else
-    # 고정할 기존 파드가 없는 첫 배포다. farm6은 idmapd.conf에 Domain이 없어 NFS 마운트가
-    # 그대로 멈춰버리는 게 알려져 있다(2026-09-15 확인) — 스케줄러가 거기로 보내지 않게 막는다.
-    pin='  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - {key: kubernetes.io/hostname, operator: NotIn, values: [farm6]}'
-  fi
+  # kube_share NFS 마운트를 NAS가 허용하는 노드는 csid-dgu-desktop 하나뿐이다 — config-server
+  # 자신도 항상 거기 고정 배포된다(Chart/values.yaml 참고). farm 노드는 이 경로 마운트 권한이
+  # 없어(mount.nfs: Operation not permitted) 스케줄러가 임의로 farm 노드를 고르면 실패한다.
+  # nodeName을 직접 주면 스케줄러의 테인트 검사를 건너뛰므로 control-plane toleration 없이도 뜬다.
+  local pin="  nodeName: csid-dgu-desktop"
   cat <<YAML | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
