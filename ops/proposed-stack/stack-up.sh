@@ -498,9 +498,14 @@ def check(label, cond, detail=""):
     ok = ok and cond
 
 def account_line():
-    """이 Pod가 쓰는 스택 계정 대장(/kube_share/passwd)에서 시험 계정 행을 찾는다."""
-    with open("/kube_share/passwd") as f:
-        return next((l for l in f if l.split(":", 1)[0] == name), None)
+    """이 Pod가 쓰는 스택 계정 대장(/kube_share/passwd)에서 시험 계정 행을 찾는다.
+    이 스택의 첫 배포라 아직 계정을 하나도 만든 적이 없으면 파일 자체가 없을 수 있다 —
+    그때는 당연히 시험 계정도 없는 것이다."""
+    try:
+        with open("/kube_share/passwd") as f:
+            return next((l for l in f if l.split(":", 1)[0] == name), None)
+    except FileNotFoundError:
+        return None
 
 def account_status():
     return 200 if account_line() else 404
