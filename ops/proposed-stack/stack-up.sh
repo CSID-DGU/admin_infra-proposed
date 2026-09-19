@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
-# 세 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE) 하나만 다르다.
+# 스택 하나를 통째로 띄운다. 여러 번 실행해도 결과가 같다. 스택은 넷이고 목적이 둘로 갈린다.
+#   - ailab-operation: 실사용자용 실운영. 접두어 없음, Slack 실제 발송, RUN_MODE는 baseline으로 강제.
+#   - ailab-baseline / ailab-noprobe / ailab-full: 논문 실험. 접두어 강제, Slack 차단.
+# 네 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE)과 uid-ranges.yaml의 대역만 다르다.
 #
-#   stack-up.sh <baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
+#   stack-up.sh <operation|baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
 #
-# admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
-# 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
+# 실험 스택 셋은 admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의
+# Actions 로그에 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은
+# 파이프로만 넘김). operation은 그 워크플로의 stack 입력에 아직 없어서(admin_infra 이슈 #117) 배포
+# 서버에서 이 스크립트를 직접 실행한다.
 set -euo pipefail
 
-STACK=${1:?"스택 이름(baseline|noprobe|full)"}
+STACK=${1:?"스택 이름(operation|baseline|noprobe|full)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
 FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
 # admin_be 브랜치에서 빌드한 스택 전용 이미지. 운영 admin_be 이미지는 작업 등록 인터페이스
@@ -514,6 +518,41 @@ PY
 # 숫자로 시작해 홈 디렉터리 생성 단계에서 (정당하게) 거부된다.
 PROBE_NAME="${PREFIX}001"
 [ -z "$PREFIX" ] && PROBE_NAME="guardprobe001"
+
+# 시험 계정의 홈은 회수해도 보존 정책대로 NAS에 남는다. 계정(passwd 행)은 지워지므로 다음 설치에서
+# 시험 계정이 대역의 다음 빈 uid를 새로 받는데, 남아 있는 홈의 소유자는 옛 uid라 홈 소유자 가드
+# (HOME_OWNER_MISMATCH, admin_infra-proposed#140)가 정당하게 멈춘다. 실사용자가 늘수록 시험 계정
+# uid가 밀리므로 실운영 스택에서는 설치할 때마다 실패한다(2026-09-19 guardprobe001: 홈 21000,
+# 배정 21002). 그래서 시험 전에 시험 계정의 홈만 지운다. 실사용자가 아니므로 지워도 되는 유일한 홈이다.
+step "시험 계정 홈 정리 ($PROBE_NAME)"
+kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="$PROBE_NAME" python - <<'PY'
+import os, re, sys, paramiko
+
+name = os.environ["NAME"]
+# 실사용자 홈을 절대 지우지 않도록 이름 모양을 먼저 못 박는다. 시험 계정만 이 모양이다.
+if not re.fullmatch(r"(guardprobe001|exp-(bl|np|fu)-001)", name):
+    print("NG  시험 계정 이름이 아님: " + repr(name))
+    sys.exit(1)
+
+root = os.environ.get("NFS_USER_SHARE_PATH", "/volume1/share/user")
+path = root + "/" + name
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(os.environ["NAS_SSH_HOST"], port=int(os.environ["NAS_SSH_PORT"]),
+            username=os.environ["NAS_SSH_USER"], key_filename="/etc/nas-ssh/id_rsa", timeout=15)
+_, out, _ = ssh.exec_command("stat -c %u '" + path + "' 2>/dev/null")
+owner = out.read().decode().strip()
+if not owner:
+    print("OK  남은 홈 없음")
+else:
+    _, out, err = ssh.exec_command("rm -rf -- '" + path + "'")
+    if out.channel.recv_exit_status() != 0:
+        print("NG  홈 삭제 실패: " + err.read().decode()[:200])
+        ssh.close()
+        sys.exit(1)
+    print("OK  남은 홈 정리 (옛 소유자 uid " + owner + ")")
+ssh.close()
+PY
 
 step "검증 (비동기 작업 큐 — 제어기, 테스트 계정 $PROBE_NAME)"
 # v2.0 비동기 흐름(POST /operations/provision·revoke가 작업만 등록 → 제어기가 뒤에서 실행)이 실제로
