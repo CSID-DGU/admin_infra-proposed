@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
-# 세 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE) 하나만 다르다.
+# 스택 하나를 통째로 띄운다. 여러 번 실행해도 결과가 같다. 스택은 넷이고 목적이 둘로 갈린다.
+#   - ailab-operation: 실사용자용 실운영. 접두어 없음, Slack 실제 발송, RUN_MODE는 baseline으로 강제.
+#   - ailab-baseline / ailab-noprobe / ailab-full: 논문 실험. 접두어 강제, Slack 차단.
+# 네 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE)과 uid-ranges.yaml의 대역만 다르다.
 #
-#   stack-up.sh <baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
+#   stack-up.sh <operation|baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
 #
-# admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
-# 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
+# 실험 스택 셋은 admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의
+# Actions 로그에 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은
+# 파이프로만 넘김). operation은 그 워크플로의 stack 입력에 아직 없어서(admin_infra 이슈 #117) 배포
+# 서버에서 이 스크립트를 직접 실행한다.
 set -euo pipefail
 
-STACK=${1:?"스택 이름(baseline|noprobe|full)"}
+STACK=${1:?"스택 이름(operation|baseline|noprobe|full)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
 FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
 # admin_be 브랜치에서 빌드한 스택 전용 이미지. 운영 admin_be 이미지는 작업 등록 인터페이스

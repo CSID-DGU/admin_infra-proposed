@@ -1,10 +1,12 @@
-# 실험 스택 설치
+# 스택 설치
 
-제안 시스템을 `ailab-baseline`, `ailab-noprobe`, `ailab-full` 네임스페이스에 띄우는 스크립트다. 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다.
+제안 시스템을 네임스페이스 하나에 통째로 띄우는 스크립트다. 스택은 넷이고 목적이 둘로 갈린다. `ailab-operation`은 실사용자가 쓰는 **실운영**이고, `ailab-baseline`·`ailab-noprobe`·`ailab-full`은 논문 **실험**이다. 네 스택 모두 같은 `stack-up.sh`를 쓴다.
+
+실험 스택 셋은 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다. 실운영은 그 워크플로로 못 돌린다(아래 "실운영 배포" 참고).
 
 | 입력 | 값 |
 | --- | --- |
-| stack | `baseline`, `noprobe`, `full` |
+| stack | `baseline`, `noprobe`, `full` (`operation`은 아직 없다. admin_infra 이슈 #117) |
 | ref | 이 레포의 브랜치·태그·커밋 |
 | fe_ref / be_ref | admin_fe / admin_be의 브랜치·태그·커밋 (be 기본 `develop`) |
 | action | `up`(띄우기, 이미 있으면 재배포) / `down`(테스트 계정 정리 후 내리기) |
@@ -13,20 +15,24 @@
 gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=baseline -f ref=develop
 ```
 
-세 스택에는 같은 커밋(`ref`, `fe_ref`, `be_ref` 모두)을 올린다. 세 스택의 차이는 config-server의 실행 방식(`VERIFY_MODE`) 하나여야 한다.
+실험 스택 셋에는 같은 커밋(`ref`, `fe_ref`, `be_ref` 모두)을 올린다. 세 스택의 차이는 config-server의 실행 방식(`VERIFY_MODE`) 하나여야 한다.
 
 ## 스택별 할당 값
 
-| 항목 | `ailab-baseline` | `ailab-noprobe` | `ailab-full` |
-| --- | --- | --- | --- |
-| config-server 릴리스 | `config-server-baseline` | `config-server-noprobe` | `config-server-full` |
-| config-server nodePort | 30382 | 30182 | 30282 |
-| 화면 주소 | `http://baseline.210.94.179.18.nip.io:30081` | `http://noprobe.210.94.179.18.nip.io:30081` | `http://full.210.94.179.18.nip.io:30081` |
-| 실행 방식(`VERIFY_MODE`) | `baseline` | `noprobe` | `full` |
-| UID/GID 대역 | 60000~64999 | 50000~54999 | 55000~59999 |
-| 사용자 Pod NodePort 대역 | 32500~32749 | 32000~32249 | 32250~32499 |
-| 테스트 계정 접두어 | `exp-bl-` | `exp-np-` | `exp-fu-` |
-| 계정 대장 경로 | 운영 `kubeSharePath`/`exp-baseline` | 운영 `kubeSharePath`/`exp-noprobe` | 운영 `kubeSharePath`/`exp-full` |
+대역과 포트의 정본은 `uid-ranges.yaml`이다. 이 표는 그 파일을 읽어 옮긴 것이고, 값을 고칠 때는 그 파일만 고친다.
+
+| 항목 | `ailab-operation` | `ailab-baseline` | `ailab-noprobe` | `ailab-full` |
+| --- | --- | --- | --- | --- |
+| 목적 | 실운영 | 논문 실험 | 논문 실험 | 논문 실험 |
+| config-server 릴리스 | `config-server-operation` | `config-server-baseline` | `config-server-noprobe` | `config-server-full` |
+| config-server nodePort | 30482 | 30382 | 30182 | 30282 |
+| 화면 주소 | `http://operation.210.94.179.18.nip.io:30081` | `http://baseline.210.94.179.18.nip.io:30081` | `http://noprobe.210.94.179.18.nip.io:30081` | `http://full.210.94.179.18.nip.io:30081` |
+| 실행 방식(`VERIFY_MODE`) | `baseline` (강제) | `baseline` | `noprobe` | `full` |
+| UID/GID 대역 | 21000~49999 | 60000~64999 | 50000~54999 | 55000~59999 |
+| 사용자 Pod NodePort 대역 | 30000~30079 | 32500~32749 | 32000~32249 | 32250~32499 |
+| 계정 접두어 | 없음 | `exp-bl-` | `exp-np-` | `exp-fu-` |
+| Slack 알림 | 실제로 보냄 | 차단 | 차단 | 차단 |
+| 계정 대장 경로 | 운영 `kubeSharePath`/`exp-operation` | 운영 `kubeSharePath`/`exp-baseline` | 운영 `kubeSharePath`/`exp-noprobe` | 운영 `kubeSharePath`/`exp-full` |
 
 | 실행 방식 | 단계 실패 | 결과 불명 | 제어기 재시작 | 접근 시험 |
 | --- | --- | --- | --- | --- |
@@ -34,7 +40,20 @@ gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=base
 | `noprobe` | 재시도, 한도 넘으면 DEGRADED | 먼저 실제 상태 조회 | 멈춘 단계부터 이어서 | 없음 |
 | `full` | noprobe와 같음 | noprobe와 같음 | noprobe와 같음 | 있음 |
 
-운영은 UID 20000대, NodePort 30000~32767 전체, config-server 30082, admin_be 30083을 쓴다.
+`operation`은 `RUN_MODE`가 `baseline`으로 강제된다. `RUN_MODE`는 재시도·복구·실접근 검증 여부를 가르는 동작 방식 값이지 네임스페이스 구분자가 아니고, 실운영은 기존 운영과 같은 동작이어야 하기 때문이다. 스택 구분은 네임스페이스와 UID 대역과 접두어가 이미 하고 있다.
+
+구 운영(`ailab-infra` + `default`의 `admin-prod`)은 UID 20000대, config-server 30082, admin_be 30083을 썼다. 2026-09-19 기준으로 전부 0으로 내려가 있고 실사용자는 `ailab-operation`을 쓴다. 구 운영이 남긴 사용자 Service(30021~30034 등)는 아직 클러스터에 있으며, config-server의 `get_cluster_reserved_nodeports()`가 실조회로 건너뛰므로 대역 선언에서 뺄 필요가 없다.
+
+## 실운영 배포
+
+`deploy-proposed-stack.yaml`의 `stack` 입력에 `operation`이 없어서 워크플로로는 못 돌린다(admin_infra 이슈 #117). 이미지 셋을 미리 빌드해 두고 배포 서버에서 직접 실행한다.
+
+```bash
+bash ops/proposed-stack/stack-up.sh operation \
+  dguailab/config-server-exp:<sha> dguailab/ailab-frontend-exp:<sha>-operation dguailab/admin-prod-exp:<sha>
+```
+
+`stack-down.sh`는 `operation`을 일부러 받지 않는다. 접두어가 비어 있어 정리 단계가 모든 계정을 대상으로 잡고, 네임스페이스를 지우면 실사용자 컨테이너가 통째로 사라지기 때문이다. 관리자 지정(`make-admin.sh`)도 아직 실험 스택 셋만 받는다.
 
 ## `stack-up.sh`가 하는 일
 
@@ -67,7 +86,7 @@ admin_infra는 공개 레포라 Actions 로그를 누구나 볼 수 있다. 스�
 
 방화벽이 새 포트를 막고 있어, 화면은 운영 프론트엔드가 쓰는 30081에 호스트 이름 규칙으로 연다. 위 표의 주소로 접속한다.
 
-가입은 운영과 같이 메일 인증을 거친다. **우분투 사용자명은 반드시 스택 접두어(`exp-bl-`, `exp-np-`, `exp-fu-`)로 시작해야 한다.** AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이름으로 구분하기 때문에, config-server가 접두어 없는 이름을 거절한다. 스택 admin_be는 운영 메일 설정으로 인증 코드를 보내고, Slack 알림은 보내지 않는다. 가입한 계정을 관리자로 지정하려면 배포 서버에서 실행한다(이메일이 공개 로그에 남지 않도록 워크플로로 돌리지 않는다).
+가입은 운영과 같이 메일 인증을 거친다. **실험 스택에서는 우분투 사용자명이 반드시 스택 접두어(`exp-bl-`, `exp-np-`, `exp-fu-`)로 시작해야 한다.** 실운영(`operation`)은 접두어를 일부러 비워 두어서 실사용자가 원하는 이름을 그대로 쓴다. AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이름으로 구분하기 때문에, config-server가 접두어 없는 이름을 거절한다. 스택 admin_be는 운영 메일 설정으로 인증 코드를 보내고, Slack 알림은 보내지 않는다. 가입한 계정을 관리자로 지정하려면 배포 서버에서 실행한다(이메일이 공개 로그에 남지 않도록 워크플로로 돌리지 않는다).
 
 ```bash
 bash ops/proposed-stack/make-admin.sh noprobe <가입한 이메일>
@@ -87,7 +106,7 @@ kubectl -n ailab-noprobe get pods -o wide
 
 ## 스택 admin_be (브랜치 빌드)
 
-admin_be는 세 스택 모두 작업 등록 인터페이스(`POST /operations/provision`·`revoke`, `GET /operations/{kind}/{신청번호}`)만 쓴다. baseline도 같은 be를 쓰고, 방식 차이는 config-server 제어기에서만 난다(9/14 결정). 옛 동기 경로는 admin_be `legacy-sync` 태그에 남아 있다.
+admin_be는 네 스택 모두 작업 등록 인터페이스(`POST /operations/provision`·`revoke`, `GET /operations/{kind}/{신청번호}`)만 쓴다. baseline도 같은 be를 쓰고, 방식 차이는 config-server 제어기에서만 난다(9/14 결정). 옛 동기 경로는 admin_be `legacy-sync` 태그에 남아 있다.
 
 워크플로의 `be_ref`(기본 `develop`)로 `admin-prod-exp:<sha>` 이미지를 빌드해 올린다. 운영 admin_be 이미지는 이 인터페이스를 모르므로 쓰지 않는다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 올려도 운영에는 닿지 않는다.
 
