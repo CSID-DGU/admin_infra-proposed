@@ -18,10 +18,6 @@ trial 의 식별자는 대상 시스템 바깥에서 붙인다. 계측을 하네
 """
 import json
 
-_COLUMNS = ("trial_id", "scenario_id", "method", "server_group", "operation",
-            "request_id", "horizon_sec", "repetition", "revisions", "started_at", "ended_at")
-
-
 class TrialStateError(Exception):
     """trial 행이 없거나, 이미 정해진 값을 다시 정하려고 했다."""
 
