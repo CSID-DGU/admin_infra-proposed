@@ -1496,12 +1496,20 @@ def step_create_home(ctx):
     try:
         _main.create_user_home_directory(name, ctx["uid"], ctx["gid"])
     except Exception as e:
-        _main.app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        # 소유자 불일치는 NAS 장애가 아니라 사람이 uid 를 맞춰 줘야 하는 상황이다. 재시도해도
+        # 같은 결과이므로 오류 코드를 갈라서, 감수자가 저널만 보고 원인을 알 수 있게 한다.
+        mismatch = isinstance(e, _main.HomeOwnerMismatch)
+        code = "HOME_OWNER_MISMATCH" if mismatch else "NAS_SSH_FAILED"
+        if mismatch:
+            _main.app.logger.error("[ACCOUNTS] home owner mismatch for user=%s, rolling back: %s", name, e)
+        else:
+            _main.app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="storage",
                       action=Action.CREATE_HOME, phase=_main._fail_phase(e),
-                      error_code="NAS_SSH_FAILED", error_detail=str(e))
+                      error_code=code, error_detail=str(e))
         _main._rollback_user(name)
-        raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}"), 500, cause=e)
+        detail = str(e) if mismatch else f"failed to create home directory for {name}"
+        raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", code, detail), 500, cause=e)
     _main.log_operation(request_id=request_id, username=name, resource_type="storage",
                   action=Action.CREATE_HOME, phase=Phase.SUCCESS)
 
