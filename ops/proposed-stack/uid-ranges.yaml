@@ -9,17 +9,29 @@
 # - 구 운영 실계정이 20000~20017에 몰려 있어(직접 조회로 확인) UID_MIN=20000도 충돌
 # - NodePort 33000~34999로 잡았는데 이 클러스터 쿠버네티스 API 서버의 실제 허용 범위가
 #   기본값인 30000~32767뿐이라 그 밖의 값은 서비스 생성이 422로 거부됨(2026-09-18 e2e 점검 중 발견)
+# - operation 대역을 30500~31999로 잡았는데 pfSense가 외부로 여는 구간은 30000~30097뿐이라
+#   (210.94.179.19:9300-9397 → farm6:30000-30097) 안내한 주소로 접속이 되지 않음. admin_be의
+#   toFarmPublicPort도 offset<98일 때만 공인 포트로 바꾸므로 변환 없이 NodePort 번호가 그대로
+#   안내됐다. 내부는 정상이라 실패가 드러나지 않는다(2026-09-19 외부망 실측으로 확인)
 #
 # 필드:
 #   uid_min/uid_max       — Linux/AD 계정 UID 대역. 실제 계정은 같은 farm 노드 OS에 만들어지므로
 #                            스택마다 원장이 격리돼 있어도 겹치면 안 된다.
-#   np_min/np_max          — 사용자 컨테이너 NodePort 대역. 반드시 30000~32767 안이어야 한다
-#                            (이 클러스터 쿠버네티스 API 서버의 실제 허용 범위).
+#   np_min/np_max          — 사용자 컨테이너 NodePort 대역. 반드시 30000~32767 안이어야 하고
+#                            (이 클러스터 쿠버네티스 API 서버의 실제 허용 범위), 사용자가 외부에서
+#                            접속해야 하는 스택은 pfSense 개방 구간 30000~30097 안이어야 한다.
+#                            실험 스택은 외부 접속을 쓰지 않으므로 32000번대를 그대로 둔다.
 #   config_nodeport         — config-server 자신의 NodePort. 구 운영이 30082/30083을 쥐고 있어
 #                            (Pod가 내려가 있어도 Service는 nodePort를 해제하지 않는다) 못 쓴다.
+#                            admin_be가 클러스터 안에서 ClusterIP로 부르므로 외부 개방 구간 밖이어도 된다.
 #   prefix                  — 계정 이름 접두어. 실험 스택은 실제 계정과 안 섞이도록 접두어를 강제한다.
 #                            실운영은 접두어 없이("") 실사용자가 원하는 이름을 그대로 쓴다.
+#
+# operation의 30035~30079는 개방 구간 안에서 고른 연속 빈 구간이다. 30000~30034는 내려간 구 운영
+# (ailab-infra)의 Service가 아직 물고 있고, 30080~30083은 Grafana·프런트·config-server·admin_be가
+# 쓴다. 구 운영 Service를 정리하면 30000까지 넓힐 수 있다. 대역 안의 점유 포트는 config-server의
+# get_cluster_reserved_nodeports()가 클러스터를 실조회해 자동으로 건너뛰므로 여기서 뺄 필요가 없다.
 - {stack: baseline,  uid_min: 60000, uid_max: 64999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
 - {stack: noprobe,   uid_min: 50000, uid_max: 54999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
 - {stack: full,      uid_min: 55000, uid_max: 59999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
-- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30500, np_max: 31999, config_nodeport: 30482, prefix: ""}
+- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30035, np_max: 30079, config_nodeport: 30482, prefix: ""}
