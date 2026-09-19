@@ -27,11 +27,12 @@
 #   prefix                  — 계정 이름 접두어. 실험 스택은 실제 계정과 안 섞이도록 접두어를 강제한다.
 #                            실운영은 접두어 없이("") 실사용자가 원하는 이름을 그대로 쓴다.
 #
-# operation의 30035~30079는 개방 구간 안에서 고른 연속 빈 구간이다. 30000~30034는 내려간 구 운영
-# (ailab-infra)의 Service가 아직 물고 있고, 30080~30083은 Grafana·프런트·config-server·admin_be가
-# 쓴다. 구 운영 Service를 정리하면 30000까지 넓힐 수 있다. 대역 안의 점유 포트는 config-server의
+# operation의 30000~30079는 pfSense 개방 구간(30000~30097)에서 인프라 고정 포트(30080~30083)를
+# 뺀 앞자락이다. 내려간 구 운영(ailab-infra)의 시험 계정 Service 23개가 이 구간을 물고 있었는데,
+# 엔드포인트가 하나도 없고 참조하는 Pod도 모두 사라진 것을 확인한 뒤 2026-09-19에 회수했다.
+# 아직 남아 있는 구 운영 Service(30021~30030, 30033, 30034)와 인프라 고정 포트는 config-server의
 # get_cluster_reserved_nodeports()가 클러스터를 실조회해 자동으로 건너뛰므로 여기서 뺄 필요가 없다.
 - {stack: baseline,  uid_min: 60000, uid_max: 64999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
 - {stack: noprobe,   uid_min: 50000, uid_max: 54999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
 - {stack: full,      uid_min: 55000, uid_max: 59999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
-- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30035, np_max: 30079, config_nodeport: 30482, prefix: ""}
+- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30000, np_max: 30079, config_nodeport: 30482, prefix: ""}
