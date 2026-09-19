@@ -13,6 +13,18 @@ system_declaration 도 access_state 도 Probe 결과도 받는 자리를 두지 
 평가자 자신의 고장은 FAIL 이 아니라 UNKNOWN 이다. collect 가 예외를 던지거나 알 수 없는
 값을 돌려주면 그 검사는 UNKNOWN 이 되고 예외 내용이 증거로 남는다. 못 물어본 것을 위반으로
 세면 실제로는 없는 위반을 만들어 내기 때문이다.
+
+실스택 수집기를 붙일 다음 사람이 읽을 자리를 여기에 둔다. 두 가지가 정해져 있다.
+
+첫째, 실스택 수집기는 harness/system.py 의 server-state 경로를 쓴다. 대상 시스템은
+kubectl exec 로 자기 자신을 확인하고 이쪽은 Ansible SSH 로 확인하므로, 두 판단이 같은
+고장에 함께 빠지지 않는다.
+
+둘째, 평가 전용 테스트 계정의 자격증명을 어떻게 전달할지는 아직 정해지지 않았다. 공개
+레포의 실행 로그에 노출되면 안 된다는 조건만 정해져 있다. 가상 계층은 자격증명이 필요
+없으므로 지금 당장 막히지는 않지만, 실스택 수집기를 붙이기 전에 사람이 결정해야 한다.
+
+이 규칙들이 지켜지는지는 harness/test_evaluator_independence.py 가 ast 로 계속 확인한다.
 """
 
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
