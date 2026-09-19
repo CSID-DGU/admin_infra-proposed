@@ -749,6 +749,18 @@ def _ssh_run(ssh, cmd: str) -> None:
         )
 
 
+def _ssh_capture(ssh, cmd: str) -> tuple:
+    """실패를 예외로 올리지 않고 (종료코드, 표준출력)을 그대로 돌려준다. 대상이 없을 때의
+    0이 아닌 종료코드를 정상 흐름으로 다뤄야 하는 조회에 쓴다."""
+    _, stdout, _ = ssh.exec_command(cmd)
+    exit_code = stdout.channel.recv_exit_status()
+    return exit_code, stdout.read().decode(errors="replace").strip()
+
+
+class HomeOwnerMismatch(RuntimeError):
+    """이미 있는 홈의 소유자가 배정하려는 uid 와 달라서 덮어쓰지 않고 멈춘 경우."""
+
+
 def _user_home_path(username: str) -> str:
     """홈 경로를 만들기 전에 이름부터 검증한다. 이 경로는 원격 셸 명령에 그대로 들어가고 그중 하나는
     되돌릴 수 없는 삭제다 — 이름에 공백이나 셸 특수문자가 섞이면 의도하지 않은 대상을 지울 수 있다.
@@ -759,10 +771,32 @@ def _user_home_path(username: str) -> str:
 
 
 def create_user_home_directory(username: str, uid: int, gid: int) -> None:
+    """홈을 만들고 소유권을 배정한다. 이미 있는 홈의 소유자가 배정하려는 uid 와 다르면
+    덮어쓰지 않고 HomeOwnerMismatch 로 멈춘다.
+
+    NAS 가 Kerberos 주체를 푸는 값이 계정 대장의 uid 와 다를 수 있다. 실제로 구 운영에서
+    넘어온 계정은 NAS 캐시에 옛 uid 가 남아 있어서, 대장이 준 새 uid 로 chown 하면
+    NAS 판정 기준으로는 소유자가 아닌 상태가 되어 사용자가 자기 홈을 통째로 잃는다
+    (2026-09-19 yoon6yo 사례: NAS 는 20016, 대장은 21000). 그 경우 Pod 는 Running 이고
+    sshd 도 뜨기 때문에 내부 점검으로는 드러나지 않는다.
+
+    NAS 가 쓰는 값은 NAS 에서 `id -u 'FARM\\<사용자명>'` 으로 확인한다."""
     path = _user_home_path(username)
     quoted = shlex.quote(path)
     app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
     with _nas_ssh_client() as ssh:
+        # 상위 디렉터리가 755 라 홈이 700 이어도 조회는 된다. 없으면 0 이 아닌 코드가 온다.
+        code, current = _ssh_capture(ssh, f"stat -c %u {quoted}")
+        if code == 0 and current.isdigit() and int(current) != int(uid):
+            app.logger.error(
+                f"[NAS SSH] home owner mismatch {path}: nas={current} requested={uid}"
+            )
+            raise HomeOwnerMismatch(
+                f"{username} 의 홈이 이미 uid {current} 소유인데 {uid} 로 배정하려 했습니다. "
+                f"덮어쓰면 이 사용자가 홈에 접근하지 못합니다. "
+                f"NAS 에서 id -u 'FARM\\{username}' 으로 실제 값을 확인한 뒤, "
+                f"계정 대장의 uid 를 그 값으로 맞추거나 홈을 옮기고 다시 시도하십시오."
+            )
         _ssh_run(ssh, f"sudo mkdir -p {quoted}")
         _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
         _ssh_run(ssh, f"sudo chmod 700 {quoted}")

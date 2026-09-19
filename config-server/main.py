@@ -50,6 +50,7 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
     create_user_home_directory,
     delete_user_home_directory,
+    HomeOwnerMismatch,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
