@@ -1083,7 +1083,8 @@ def register_provision(body: ProvisionRequest):
     생성 작업 등록 (v2.0)
 
     계정(선택)과 Pod 생성을 작업으로 등록하고 바로 202를 돌려준다. 실행은 제어기가 한다.
-    계정이 이미 있으면 account를 빼고 보낸다. 진행 상황은 GET /requests/<request_id>/status,
+    계정이 이미 있으면 account를 빼고 보낸다. supplementary_groups은 account 여부와
+    무관하게 pod 생성 후 추가된다(기존 계정 재사용 경로). 진행 상황은 GET /requests/<request_id>/status,
     작업 결과는 GET /operations/provision/<request_id>로 조회한다.
     ---
     tags:
@@ -1109,6 +1110,11 @@ def register_provision(body: ProvisionRequest):
             "gecos": account.gecos,
             "passwd_hash": crypt.crypt(account.plaintext_password(), crypt.mksalt(crypt.METHOD_SHA512)),
         }
+    
+    # supplementary_groups는 account가 없을 때도 처리 (기존 계정 재사용 경로)
+    if body.supplementary_groups:
+        job["supp_groups_only"] = [group.model_dump() for group in body.supplementary_groups]
+    
     return _register_job("provision", body.request_id, username, job)
 
 

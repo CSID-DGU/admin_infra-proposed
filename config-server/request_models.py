@@ -72,6 +72,10 @@ class ProvisionRequest(RequestBody):
     request_id: str = Field(description="admin_be 신청 번호(양의 정수)", examples=["4821"])
     username: str = Field(min_length=1, examples=["exp-np-001"])
     account: Optional[ProvisionAccount] = None
+    supplementary_groups: List[SupplementaryGroup] = Field(
+        default_factory=list,
+        description="Pod 생성 후 사용자를 추가할 보조 그룹들. account가 없을 때도 사용 가능(기존 계정 재사용)"
+    )
 
     @field_validator("request_id", mode="before")
     @classmethod
