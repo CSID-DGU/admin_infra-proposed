@@ -1022,6 +1022,7 @@ from lifecycle_steps.provision import (  # noqa: E402
     _resolve_primary_group, _build_user_groups_env, _get_sudo_allowed_commands,
     _build_sudoers_policy, _rollback_user, _allocate_next_uid, _allocate_next_gid,
     step_create_account, step_create_home, step_create_krb5_principal, ACCOUNT_CREATE_STEPS,
+    step_add_user_groups, SUPP_GROUPS_ONLY_STEPS,
     account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret,
     LoginPasswordMissing, decode_login_password, login_password_for_recreate)
 from lifecycle_steps.revoke import (  # noqa: E402

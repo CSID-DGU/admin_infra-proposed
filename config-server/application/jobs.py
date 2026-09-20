@@ -76,6 +76,7 @@ RERUN_SAFE = {
     "step_cleanup_pod_node_krb5", "step_check_account_revocable",
     "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
+    "step_add_user_groups",
 }
 
 PRE_STEP = {
@@ -182,7 +183,13 @@ def _job_steps(kind, job):
             steps = steps[:-1] + verify.VERIFY_ACCESS_STEPS + steps[-1:]
         return steps
     if kind == "provision":
-        steps = (_main.ACCOUNT_CREATE_STEPS if job.get("account") else []) + _main.POD_CREATE_STEPS
+        if job.get("account"):
+            steps = _main.ACCOUNT_CREATE_STEPS + _main.POD_CREATE_STEPS
+        elif job.get("supp_groups_only"):
+            # 기존 계정 재사용 시 그룹만 추가
+            steps = _main.SUPP_GROUPS_ONLY_STEPS + _main.POD_CREATE_STEPS
+        else:
+            steps = _main.POD_CREATE_STEPS
         if _main.VERIFY_MODE == "full":
             # 다섯 시험을 모두 통과해야 작업 SUCCESS 행이 남는다 — 통과 전엔 완료로 기록되지 않는다.
             steps = steps + verify.VERIFY_ACCESS_STEPS
@@ -204,6 +211,9 @@ def _job_ctx(kind, request_id, job):
         ctx["config_by_request"] = True
         if job.get("account"):
             ctx.update(name=job["username"], **job["account"])
+        elif job.get("supp_groups_only"):
+            # 기존 계정 재사용 시 그룹만 추가하는 경우
+            ctx["supp_groups"] = job["supp_groups_only"]
     if kind == "revoke":
         ctx.update(pod_name=job.get("pod_name"), node_name=job.get("node_name"),
                    rollback=_main._new_delete_rollback())
