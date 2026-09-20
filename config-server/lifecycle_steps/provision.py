@@ -1545,8 +1545,67 @@ def step_create_krb5_principal(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
                   action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
 
+def step_add_user_groups(ctx):
+    """기존 사용자에게 보충 그룹을 추가하는 단계 (Pod 재사용 시에만 호출).
+    
+    계정 생성 단계의 그룹 처리 부분(lines 1393~1427)과 유사하지만,
+    사용자가 이미 존재한다고 가정하고 그룹만 추가한다."""
+    request_id, username = ctx["request_id"], ctx["username"]
+    supp_groups = ctx.get("supp_groups", [])
+    
+    if not supp_groups:
+        return  # 추가할 그룹이 없으면 실행 안함
+    
+    _main.log_operation(request_id=request_id, username=username, resource_type="groups",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.START)
+    
+    try:
+        added_supp = []
+        with _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
+            content = f.read()
+            g_lines = content.splitlines()
+            
+            # supplementary groups — 기존 그룹에 사용자 추가 또는 새 그룹 생성
+            for sg in supp_groups:
+                sg_gid = int(sg["gid"])
+                sg_name = sg["name"]
+                found = False
+                updated = []
+                for gl in g_lines:
+                    rec = _main.parse_group_line(gl)
+                    if rec and rec["gid"] == sg_gid:
+                        if username not in rec["members"]:
+                            rec["members"].append(username)
+                        updated.append(_main.format_group_entry(rec))
+                        found = True
+                    else:
+                        updated.append(gl)
+                g_lines = updated
+                if not found:
+                    g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [username]}))
+                added_supp.append({"name": sg_name, "gid": sg_gid})
+            
+            new_content = "\n".join(g_lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+        
+        _main.log_operation(request_id=request_id, username=username, resource_type="groups",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
+        ctx.setdefault("added_supp", []).extend(added_supp)
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] supplementary group write failed for user=%s", username)
+        _main.log_operation(request_id=request_id, username=username, resource_type="groups",
+                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="GROUP_WRITE_FAILED", error_detail=str(e))
+        raise _main.StepFailed({"error": "failed to add supplementary groups"}, 500)
+
 ACCOUNT_CREATE_STEPS = [
     step_create_account,
     step_create_home,
     step_create_krb5_principal,
+]
+
+SUPP_GROUPS_ONLY_STEPS = [
+    step_add_user_groups,
 ]
