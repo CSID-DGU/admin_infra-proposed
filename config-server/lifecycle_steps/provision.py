@@ -1638,6 +1638,9 @@ def step_sync_ad_groups(ctx):
         for sg in supp_groups:
             _main._create_ad_group(sg["name"], int(sg["gid"]))
             _main._add_ad_group_member(sg["name"], name)
+        # 이 사용자의 Pod 가 이미 떠 있으면 그 노드 티켓을 다시 받아야 새 그룹이 PAC 에
+        # 실린다. 이번 작업이 만들 Pod 는 뒤에 오는 deploy 가 알아서 새로 받는다(#153).
+        _main._refresh_krb5_after_group_change(name)
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 반영 실패: user=%s", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="groups",

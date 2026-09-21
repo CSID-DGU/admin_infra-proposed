@@ -640,6 +640,44 @@ def _add_ad_group_member(groupname: str, username: str) -> None:
     _farm_ad_ssh(f"group-addmember {groupname} {username}")
 
 
+def _nodes_running_user_pods(username: str) -> list:
+    """이 사용자의 Pod 가 떠 있는 노드 목록. 티켓을 다시 발급할 대상을 고르는 데 쓴다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT node_name FROM nodeport_allocations WHERE username=%s",
+                        (username,))
+            return [row[0] for row in cur.fetchall() if row[0]]
+    finally:
+        conn.close()
+
+
+def _refresh_krb5_after_group_change(username: str) -> list:
+    """그룹이 바뀐 사용자의 티켓을 그 사용자 Pod 가 떠 있는 모든 노드에서 다시 발급한다.
+
+    그룹은 티켓 PAC 에 실려 오고 갱신 타이머는 kinit -R 을 선호한다. -R 은 옛 PAC 을
+    그대로 들고 오므로, 이 호출이 없으면 AD 를 고쳐도 최대 약 6일 반영되지 않는다(#153).
+
+    실패는 경고만 남기고 넘어간다 — 그룹 변경 자체는 이미 끝났고, 티켓은 다음 갱신
+    주기나 Pod 재생성 때 따라잡는다. 여기서 전체를 실패시키면 이미 반영된 AD 변경을
+    되돌릴 방법이 없으면서 호출자만 재시도하게 된다."""
+    if not _ad_enabled():
+        return []
+    refreshed = []
+    for node_name in _nodes_running_user_pods(username):
+        try:
+            node = _get_farm_node_info(node_name)
+            _farm_ssh(node["host"], node["port"], f"refresh {username}")
+            refreshed.append(node_name)
+        except Exception:
+            app.logger.exception(
+                "[KRB5] 그룹 변경 후 티켓 재발급 실패(다음 주기에 따라잡음): %s @ %s",
+                username, node_name)
+    if refreshed:
+        app.logger.info("[KRB5] 그룹 변경 반영을 위해 티켓 재발급: %s @ %s", username, refreshed)
+    return refreshed
+
+
 def _remove_group_line(name: str) -> None:
     """그룹 파일에서 한 줄을 지운다. AD 반영 실패 시 방금 쓴 줄을 되돌리는 용도."""
     write_group_lines([l for l in read_group_lines()
@@ -910,6 +948,8 @@ def add_group(body: AddGroupRequest):
     # 안 먹는 그룹이 남으므로, 방금 쓴 줄을 되돌리고 실패로 답한다.
     try:
         _create_ad_group(name, gid)
+        for m in sorted(members):
+            _add_ad_group_member(name, m)
     except Exception as e:
         app.logger.exception("[ACCOUNTS] AD 그룹 생성 실패, group 파일 롤백: %s(%s)", name, gid)
         try:
@@ -918,6 +958,11 @@ def add_group(body: AddGroupRequest):
             app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
         return jsonify(infra_error("ADD_GROUP", "AD_GROUP_CREATE_FAILED",
                                    f"failed to create group in AD: {name}")), 500
+
+    # 멤버로 들어간 사용자는 이미 떠 있는 Pod 가 있을 수 있다 — 티켓을 다시 받아야
+    # 새 그룹이 PAC 에 실린다(#153).
+    for m in sorted(members):
+        _refresh_krb5_after_group_change(m)
 
     return jsonify({"group": {"name": name, "gid": gid}}), 201
 
@@ -1004,7 +1049,9 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
                                    f"failed to add {username} to groups in AD")), 500
 
     write_group_lines(new_lines)
-    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
+    refreshed = _refresh_krb5_after_group_change(username)
+    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names)),
+                    "krb5_refreshed_nodes": refreshed})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)
