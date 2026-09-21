@@ -14,9 +14,6 @@ case "$STACK" in
   baseline) PREFIX=exp-bl- ;;
   noprobe) PREFIX=exp-np- ;;
   full)    PREFIX=exp-fu- ;;
-  # operation은 실사용자가 쓰는 실운영이라 일부러 받지 않는다. 접두어가 비어 있어(PREFIX=) 아래 정리
-  # 단계가 모든 계정을 대상으로 잡게 되고, 네임스페이스를 지우면 실사용자 컨테이너가 통째로 사라진다.
-  operation) echo "operation은 실운영 스택이라 이 스크립트로 내리지 않는다"; exit 2 ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 NS=ailab-$STACK
