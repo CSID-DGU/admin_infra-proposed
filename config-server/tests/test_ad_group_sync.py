@@ -187,3 +187,46 @@ def test_step_reissues_after_syncing_groups(etc, farm, logs):
         provision.step_sync_ad_groups(ctx)
     assert sent == ["group-create teamx 70000", "group-addmember teamx alice"]
     assert farm == ["refresh alice", "refresh alice"]
+
+
+# ---------- DC 폴백: 접속 실패와 거절을 구분한다 ----------
+
+def _fake_ssh_runs(results):
+    """subprocess.run 대역. results 는 (returncode, stdout, stderr) 목록."""
+    import types
+    seq = list(results)
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append(cmd[-1])
+        rc, out, err = seq.pop(0)
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+    return run, seen
+
+
+def test_transport_failure_falls_through_to_the_next_dc(monkeypatch):
+    monkeypatch.setitem(main.app.config, "FARM_AD_DC_NODES",
+                        [{"name": "farm2", "host": "h2", "port": "22"},
+                         {"name": "farm6", "host": "h6", "port": "22"}])
+    run, seen = _fake_ssh_runs([(255, "", "ssh: connect failed"), (0, "ok", "")])
+    monkeypatch.setattr(main.subprocess, "run", run)
+    with main.app.app_context():
+        assert main._farm_ad_ssh("group-create teamx 70000") == "ok"
+    assert len(seen) == 2          # farm2 접속 실패 → farm6 으로 넘어갔다
+
+
+def test_remote_rejection_stops_immediately_and_keeps_the_real_reason(monkeypatch):
+    """DC 들은 같은 samdb 를 복제한다. 거절을 다음 DC 로 넘기면 왕복만 늘고,
+    마지막 DC 의 메시지가 진짜 이유를 덮어쓴다."""
+    monkeypatch.setitem(main.app.config, "FARM_AD_DC_NODES",
+                        [{"name": "farm2", "host": "h2", "port": "22"},
+                         {"name": "farm6", "host": "h6", "port": "22"}])
+    run, seen = _fake_ssh_runs([(1, "", "refusing to change gidNumber of teamx: 70000 -> 70002"),
+                                (0, "ok", "")])
+    monkeypatch.setattr(main.subprocess, "run", run)
+    with main.app.app_context():
+        with pytest.raises(RuntimeError) as e:
+            main._farm_ad_ssh("group-create teamx 70002")
+    assert len(seen) == 1                                  # farm6 으로 넘어가지 않았다
+    assert "refusing to change gidNumber" in str(e.value)  # 진짜 이유가 남았다
+    assert "farm2" in str(e.value)

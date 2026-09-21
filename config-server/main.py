@@ -553,6 +553,11 @@ def _ssh_host_key_options() -> list:
 
 # ---- Kerberos AD helpers ----
 
+# ssh 가 원격 명령이 아니라 자기 문제(연결·인증·호스트 키)로 끝낼 때 쓰는 코드.
+# 그 외의 0 아닌 코드는 원격 명령이 돌려준 값이다.
+SSH_TRANSPORT_ERROR = 255
+
+
 def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
     """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
     그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
@@ -576,10 +581,17 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
             last_error = e
             app.logger.warning(f"[FARM AD SSH] {node['name']} 타임아웃")
             continue
-        if result.returncode != 0:
-            last_error = RuntimeError(f"AD DC SSH 실패 ({node['name']}): {result.stderr.strip()}")
-            app.logger.warning(f"[FARM AD SSH] {node['name']} 실패: {result.stderr.strip()}")
+        if result.returncode == SSH_TRANSPORT_ERROR:
+            # ssh 가 자기 문제(연결·인증·호스트 키)로 실패한 경우다. 이 DC 만의 사정이므로
+            # 다음 DC 로 넘어간다.
+            last_error = RuntimeError(f"AD DC 접속 실패 ({node['name']}): {result.stderr.strip()}")
+            app.logger.warning(f"[FARM AD SSH] {node['name']} 접속 실패: {result.stderr.strip()}")
             continue
+        if result.returncode != 0:
+            # 원격 스크립트가 요청을 평가해서 거절했다. DC 들은 같은 samdb 를 복제하므로
+            # 다른 DC 도 같은 판단을 한다 — 넘어가 봐야 왕복만 늘고, 마지막 DC 의 메시지가
+            # 진짜 이유를 덮어쓴다(#146 에서 실측으로 드러났다). 즉시 실패시킨다.
+            raise RuntimeError(f"AD DC 거절 ({node['name']}): {result.stderr.strip()}")
         return result.stdout
     raise last_error or RuntimeError("모든 AD DC 접속 실패")
 
