@@ -668,3 +668,25 @@ def test_failed_pod_creation_removes_password_secret(env, monkeypatch):
     tick(e)
     assert e.v1.secrets == {}
 
+
+
+def test_pod_env_carries_supplementary_groups_under_the_name_the_image_reads(env):
+    """이미지 entrypoint.sh 의 ensure_supplemental_groups()가 읽는 이름은 DECS_SUPPLEMENTAL_GROUPS 다.
+    USER_GROUPS 로 보내면 아무도 읽지 않아 보조 그룹이 컨테이너 안에 만들어지지 않는다(#145)."""
+    e = env
+    with main.app.app_context():
+        main.write_group_lines(main.read_group_lines() + ["teamx:x:53000:"])
+    e.was = lambda url: e.Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW,
+                                     "groups": [{"gid": 53000}],
+                                     "gpu_nodes": [{"node_name": "farm2", "num_gpu": 1,
+                                                    "cpu_limit": "4", "memory_limit": "16Gi"}]})
+    e.api.post("/operations/provision", json={"request_id": "150", "username": "exp-np-e2e",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    assert result(e, "provision", "150")["phase"] == "SUCCESS"
+
+    body = e.v1.pods[next(iter(e.v1.pods))].body
+    env_list = body["spec"]["containers"][0]["env"]
+    by_name = {v["name"]: v.get("value") for v in env_list}
+    assert "USER_GROUPS" not in by_name
+    assert by_name["DECS_SUPPLEMENTAL_GROUPS"].split(",")[1:] == ["teamx:53000"]
