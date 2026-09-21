@@ -9,6 +9,9 @@
 # - 구 운영 실계정이 20000~20017에 몰려 있어(직접 조회로 확인) UID_MIN=20000도 충돌
 # - NodePort 33000~34999로 잡았는데 이 클러스터 쿠버네티스 API 서버의 실제 허용 범위가
 #   기본값인 30000~32767뿐이라 그 밖의 값은 서비스 생성이 422로 거부됨(2026-09-18 e2e 점검 중 발견)
+# - 공용 그룹 gid를 uid와 같은 할당기·같은 대역에서 뽑아 운영 원장에 testgroup:21003 이 생겼고,
+#   다음 배정될 uid도 21003이었다. 그 상태로 계정 하나만 더 승인했으면 그 사용자의 primary 그룹이
+#   testgroup이 됐다(2026-09-21 운영 원장 실조회로 발견, #148 — 공용 gid 대역 분리로 수정)
 # - operation 대역을 30500~31999로 잡았는데 pfSense가 외부로 여는 구간은 30000~30097뿐이라
 #   (210.94.179.19:9300-9397 → farm6:30000-30097) 안내한 주소로 접속이 되지 않음. admin_be의
 #   toFarmPublicPort도 offset<98일 때만 공인 포트로 바꾸므로 변환 없이 NodePort 번호가 그대로
@@ -16,7 +19,12 @@
 #
 # 필드:
 #   uid_min/uid_max       — Linux/AD 계정 UID 대역. 실제 계정은 같은 farm 노드 OS에 만들어지므로
-#                            스택마다 원장이 격리돼 있어도 겹치면 안 된다.
+#                            스택마다 원장이 격리돼 있어도 겹치면 안 된다. 개인 그룹은 gid=uid이므로
+#                            이 대역은 개인 그룹 gid 대역이기도 하다.
+#   shared_gid_min/max     — 공용(팀) 그룹 gid 대역. uid 대역과 떼어 놓는다 — 한 대역을 두 할당기가
+#                            나눠 쓰면 공용 그룹이 다음 uid 번호를 선점해 그 계정의 primary 그룹이
+#                            남의 팀 그룹이 된다. AD·NAS 공유는 uid와 같으므로 스택별로도 나눈다.
+#                            전 구간이 farm smb.conf 의 idmap range(1000-299999) 안이어야 한다.
 #   np_min/np_max          — 사용자 컨테이너 NodePort 대역. 반드시 30000~32767 안이어야 하고
 #                            (이 클러스터 쿠버네티스 API 서버의 실제 허용 범위), 사용자가 외부에서
 #                            접속해야 하는 스택은 pfSense 개방 구간 30000~30097 안이어야 한다.
@@ -32,7 +40,7 @@
 # 엔드포인트가 하나도 없고 참조하는 Pod도 모두 사라진 것을 확인한 뒤 2026-09-19에 회수했다.
 # 아직 남아 있는 구 운영 Service(30021~30030, 30033, 30034)와 인프라 고정 포트는 config-server의
 # get_cluster_reserved_nodeports()가 클러스터를 실조회해 자동으로 건너뛰므로 여기서 뺄 필요가 없다.
-- {stack: baseline,  uid_min: 60000, uid_max: 64999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
-- {stack: noprobe,   uid_min: 50000, uid_max: 54999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
-- {stack: full,      uid_min: 55000, uid_max: 59999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
-- {stack: operation, uid_min: 21000, uid_max: 49999, np_min: 30000, np_max: 30079, config_nodeport: 30482, prefix: ""}
+- {stack: baseline,  uid_min: 60000, uid_max: 64999, shared_gid_min: 90000, shared_gid_max: 94999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
+- {stack: noprobe,   uid_min: 50000, uid_max: 54999, shared_gid_min: 80000, shared_gid_max: 84999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
+- {stack: full,      uid_min: 55000, uid_max: 59999, shared_gid_min: 85000, shared_gid_max: 89999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
+- {stack: operation, uid_min: 21000, uid_max: 49999, shared_gid_min: 70000, shared_gid_max: 79999, np_min: 30000, np_max: 30079, config_nodeport: 30482, prefix: ""}

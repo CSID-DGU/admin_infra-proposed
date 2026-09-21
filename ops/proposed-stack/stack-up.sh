@@ -37,6 +37,8 @@ STACK_LINE=$(grep -E "^- \{stack: $STACK, " "$RANGES_FILE") || true
 [ -n "$STACK_LINE" ] || { echo "알 수 없는 스택: $STACK ($RANGES_FILE에 선언 없음)"; exit 2; }
 UID_MIN=$(yaml_field "$STACK_LINE" uid_min)
 UID_MAX=$(yaml_field "$STACK_LINE" uid_max)
+SHARED_GID_MIN=$(yaml_field "$STACK_LINE" shared_gid_min)
+SHARED_GID_MAX=$(yaml_field "$STACK_LINE" shared_gid_max)
 NP_MIN=$(yaml_field "$STACK_LINE" np_min)
 NP_MAX=$(yaml_field "$STACK_LINE" np_max)
 CONFIG_NODEPORT=$(yaml_field "$STACK_LINE" config_nodeport)
@@ -45,6 +47,9 @@ PREFIX=$(yaml_field "$STACK_LINE" prefix)
 # 422로 거부된다(2026-09-18 e2e 점검 중 실측으로 발견) — 배포가 한참 진행된 뒤에야 드러나므로
 # 여기서 미리 막는다.
 { [ "$NP_MIN" -ge 30000 ] && [ "$NP_MAX" -le 32767 ]; } || { echo "NodePort 대역 $NP_MIN~$NP_MAX 이 쿠버네티스 허용 범위(30000~32767) 밖임"; exit 1; }
+# 개인 그룹은 gid=uid라 uid 대역이 곧 개인 그룹 gid 대역이다 — 자기 스택 안에서 둘이 겹치면
+# 공용 그룹이 다음 uid 번호를 선점할 수 있다(#148).
+{ [ "$SHARED_GID_MIN" -gt "$UID_MAX" ] || [ "$SHARED_GID_MAX" -lt "$UID_MIN" ]; } || { echo "공용 GID 대역 $SHARED_GID_MIN~$SHARED_GID_MAX 이 자기 UID 대역 $UID_MIN~$UID_MAX 과 겹침"; exit 1; }
 # 다른 스택과 대역이 겹치는지 선언 파일 안에서만 비교한다(형제 스택이 지금 떠 있는지와 무관 —
 # 배포 상태에 의존하는 실시간 조회는 신뢰할 수 없어 기각했다, admin_infra-proposed#118).
 while IFS= read -r OTHER_LINE; do
@@ -52,9 +57,16 @@ while IFS= read -r OTHER_LINE; do
   OTHER_STACK=$(yaml_field "$OTHER_LINE" stack)
   [ "$OTHER_STACK" = "$STACK" ] && continue
   O_UID_MIN=$(yaml_field "$OTHER_LINE" uid_min); O_UID_MAX=$(yaml_field "$OTHER_LINE" uid_max)
+  O_SG_MIN=$(yaml_field "$OTHER_LINE" shared_gid_min); O_SG_MAX=$(yaml_field "$OTHER_LINE" shared_gid_max)
   O_NP_MIN=$(yaml_field "$OTHER_LINE" np_min); O_NP_MAX=$(yaml_field "$OTHER_LINE" np_max)
   if [ "$UID_MIN" -le "$O_UID_MAX" ] && [ "$UID_MAX" -ge "$O_UID_MIN" ]; then
     echo "UID 대역이 $OTHER_STACK 과 겹침: $UID_MIN~$UID_MAX vs $O_UID_MIN~$O_UID_MAX"; exit 1
+  fi
+  if [ "$SHARED_GID_MIN" -le "$O_SG_MAX" ] && [ "$SHARED_GID_MAX" -ge "$O_SG_MIN" ]; then
+    echo "공용 GID 대역이 $OTHER_STACK 과 겹침: $SHARED_GID_MIN~$SHARED_GID_MAX vs $O_SG_MIN~$O_SG_MAX"; exit 1
+  fi
+  if [ "$SHARED_GID_MIN" -le "$O_UID_MAX" ] && [ "$SHARED_GID_MAX" -ge "$O_UID_MIN" ]; then
+    echo "공용 GID 대역이 $OTHER_STACK 의 UID 대역과 겹침: $SHARED_GID_MIN~$SHARED_GID_MAX vs $O_UID_MIN~$O_UID_MAX"; exit 1
   fi
   if [ "$NP_MIN" -le "$O_NP_MAX" ] && [ "$NP_MAX" -ge "$O_NP_MIN" ]; then
     echo "NodePort 대역이 $OTHER_STACK 과 겹침: $NP_MIN~$NP_MAX vs $O_NP_MIN~$O_NP_MAX"; exit 1
@@ -299,6 +311,7 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set nfs.kubeSharePath="$STACK_KUBE_SHARE" \
   --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
   --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
+  --set accounts.sharedGidMin="$SHARED_GID_MIN" --set accounts.sharedGidMax="$SHARED_GID_MAX" \
   --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
   --set verifyMode="$VERIFY_MODE" \
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
@@ -650,6 +663,7 @@ if [ -n "$FE_IMAGE" ]; then
   echo "화면              http://$FE_HOST:30081"
 fi
 echo "UID 대역          $UID_MIN~$UID_MAX"
+echo "공용 GID 대역     $SHARED_GID_MIN~$SHARED_GID_MAX"
 echo "NodePort 대역     $NP_MIN~$NP_MAX"
 echo "테스트 계정 접두어 $PREFIX"
 echo "VERIFY_MODE       $VERIFY_MODE"
