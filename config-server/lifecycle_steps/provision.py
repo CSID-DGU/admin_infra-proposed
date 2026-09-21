@@ -1614,12 +1614,49 @@ def step_add_user_groups(ctx):
                       error_code="GROUP_WRITE_FAILED", error_detail=str(e))
         raise _main.StepFailed({"error": "failed to add supplementary groups"}, 500)
 
+def step_sync_ad_groups(ctx):
+    """보조 그룹을 AD 에 반영한다 — 없으면 그룹을 만들고, 사용자를 멤버로 넣는다.
+
+    홈은 sec=krb5 로 마운트되어 그룹 권한을 NAS 가 AD 기준으로 판정한다. 그룹 파일에만
+    써 두면 컨테이너 안에서만 보이고 NFS 에는 아무 효력이 없다(#146).
+
+    계정 생성 단계에 넣지 않고 따로 뺀 이유: AD 사용자는 step_create_krb5_principal 이
+    만든다. 그 전에는 멤버로 넣을 대상 자체가 없다. 그래서 이 단계는 반드시 그 뒤에 온다.
+
+    주의: 이미 떠 있는 Pod 에는 이것만으로 반영되지 않는다. 그룹은 티켓 PAC 에 실려 오고
+    갱신 타이머가 kinit -R 을 선호해 옛 PAC 이 최대 약 6일 유지된다(#153).
+    """
+    request_id = ctx["request_id"]
+    name = ctx.get("name") or ctx["username"]
+    supp_groups = ctx.get("supp_groups") or []
+    if not supp_groups or not _main._ad_enabled():
+        return
+
+    _main.log_operation(request_id=request_id, username=name, resource_type="groups",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.START)
+    try:
+        for sg in supp_groups:
+            _main._create_ad_group(sg["name"], int(sg["gid"]))
+            _main._add_ad_group_member(sg["name"], name)
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] AD 그룹 반영 실패: user=%s", name)
+        _main.log_operation(request_id=request_id, username=name, resource_type="groups",
+                      action=Action.CREATE_ACCOUNT, phase=_main._fail_phase(e),
+                      error_code="AD_GROUP_SYNC_FAILED", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "SYNC_AD_GROUPS", "AD_GROUP_SYNC_FAILED",
+            f"failed to sync supplementary groups to AD for {name}"), 500, cause=e)
+    _main.log_operation(request_id=request_id, username=name, resource_type="groups",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
+
 ACCOUNT_CREATE_STEPS = [
     step_create_account,
     step_create_home,
     step_create_krb5_principal,
+    step_sync_ad_groups,
 ]
 
 SUPP_GROUPS_ONLY_STEPS = [
     step_add_user_groups,
+    step_sync_ad_groups,
 ]
