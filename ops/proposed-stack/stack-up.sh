@@ -556,6 +556,16 @@ if account_status() == 200:  # 이전 실행에서 남은 시험 계정은 회�
         "request_id": str(int(rid) - 1), "username": name, "node_name": node, "delete_account": True})
     wait(lambda: account_status() == 404)
 
+# 회수는 실사용자 홈은 보존하지만, 이 시험 계정은 매번 같은 이름을 재사용한다. 홈을 남겨 두면
+# 다음 배포가 다른(다시 계산된) uid를 배정할 때 NAS의 기존 소유자와 어긋나 HOME_OWNER_MISMATCH로
+# 막힌다(2026-09-22 실측). 이 계정은 시험 전용이라 매번 지우고 새로 만든다.
+import main as _main_mod
+with _main_mod.app.app_context():
+    try:
+        _main_mod.delete_user_home_directory(name)
+    except Exception as e:
+        print(f"시험 계정 홈 정리 실패(무시하고 계속): {e}")
+
 # 1) 생성 작업. 이 테스트 계정은 admin_be에 사용자 설정이 없어, 계정·홈·principal까지 만든 뒤 설정
 #    조회에서 실패한다. 거기서 끝나지 않고 이번 작업이 만든 계정을 제어기가 되돌리는 것까지가 정상이다.
 r = api.post(f"{base}/operations/provision", timeout=30, json={
