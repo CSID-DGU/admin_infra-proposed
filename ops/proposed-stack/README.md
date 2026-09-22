@@ -83,7 +83,7 @@ kubectl -n ailab-noprobe get pods -o wide
 
 ## 스택 admin DB의 기준 데이터
 
-설치 때마다 운영 admin DB에서 신청 화면에 필요한 기준 데이터만 복사한다: 자원 그룹(`resource_groups`), 노드(`nodes`), GPU(`gpus`), 이미지(`container_image`, `resource_group_images`), 메일 문구(`message_templates`). 사용자·신청·그룹은 복사하지 않는다. 운영 DB는 읽기만 하며, 재실행하면 운영 값으로 갱신된다.
+신청 화면에 필요한 기준 데이터(자원 그룹 `resource_groups`, 노드 `nodes`, GPU `gpus`, 이미지 `container_image`/`resource_group_images`, 메일 문구 `message_templates`)는 스택에 이미 있는 값을 그대로 쓴다. 운영은 평소 0대로 내려가 있는 게 정상이라(9/15~) 설치 때마다 운영 DB에서 새로 복사하지 않는다. 새 스택을 처음 띄워 기준 데이터가 하나도 없으면 다른 스택에서 옮기거나 운영을 잠시 띄워 수동으로 넣어야 한다.
 
 ## 스택 admin_be (브랜치 빌드)
 
