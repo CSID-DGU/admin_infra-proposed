@@ -86,22 +86,46 @@ def test_access_probe_records_progress_for_screen(probe_env):
 
 def test_home_io_fails_when_mount_is_local_disk(probe_env):
     """silent split: 왕복은 되는데 홈이 NFS가 아니라 노드 로컬 디스크인 경우."""
-    probe_env["sh"]["df -P"] = ("ok\n/dev/sda1 100 0 100 1% /home\n50000", 0)
+    probe_env["sh"]["df -P"] = ("ok\n__SU=0\n__DF\n/dev/sda1 100 0 100 1% /home\n__OWNER\n50000", 0)
+    with pytest.raises(StepFailed):
+        verify.step_verify_home_io(dict(CTX))
+    assert '"mount_src": "/dev/sda1"' in probe_env["logs"][-1]["error_detail"]
+
+
+def test_home_io_ignores_stderr_line_when_locating_mount_line(probe_env):
+    """#52: stderr(su: warning 등)이 stdout에 섞여 앞에 끼어도, __DF 마커 뒤의 df 줄만
+    마운트 소스로 본다 — 내용 추측(":" 포함 여부)으로 찾으면 stderr 줄을 df 줄로 오인해
+    로컬 디스크인데도 PASS로 오판한다."""
+    probe_env["sh"]["df -P"] = (
+        "su: warning: cannot change directory to /home/exp-np-001: No such file or directory\n"
+        "ok\n__SU=0\n__DF\n/dev/sda1 100 0 100 1% /home\n__OWNER\n50000", 0)
     with pytest.raises(StepFailed):
         verify.step_verify_home_io(dict(CTX))
     assert '"mount_src": "/dev/sda1"' in probe_env["logs"][-1]["error_detail"]
 
 
 def test_home_io_passes_on_nfs_roundtrip(probe_env):
-    probe_env["sh"]["df -P"] = ("ok\nnas:/volume1/share/user 100 0 100 1% /home\n50000", 0)
+    probe_env["sh"]["df -P"] = (
+        "ok\n__SU=0\n__DF\nnas:/volume1/share/user 100 0 100 1% /home\n__OWNER\n50000", 0)
     verify.step_verify_home_io(dict(CTX))
     assert probe_env["logs"][-1]["phase"] == Phase.SUCCESS
+
+
+def test_home_io_fails_when_token_cleanup_fails(probe_env):
+    """rm 실패(__SU!=0)를 왕복 실패로 잡는다 — 안 그러면 .verify-<request_id> 잔재가
+    홈에 쌓여 나중 잔재 검사에 걸린다."""
+    probe_env["sh"]["df -P"] = (
+        "ok\n__SU=1\n__DF\nnas:/volume1/share/user 100 0 100 1% /home\n__OWNER\n50000", 0)
+    with pytest.raises(StepFailed):
+        verify.step_verify_home_io(dict(CTX))
+    assert '"roundtrip": false' in probe_env["logs"][-1]["error_detail"]
 
 
 def test_home_io_names_krb5_as_likely_cause_when_owner_is_nobody(probe_env):
     """실측 사례: sec=krb5 마운트에서 티켓이 없으면 소유자가 nobody(65534)로 보이고 쓰기가 거부된다.
     권한 문제로 오인하지 않도록 근거에 원인 후보를 적는다."""
-    probe_env["sh"]["df -P"] = ("nas:/volume1/share/user 100 0 100 1% /home\n65534", 1)
+    probe_env["sh"]["df -P"] = (
+        "__SU=1\n__DF\nnas:/volume1/share/user 100 0 100 1% /home\n__OWNER\n65534", 1)
     with pytest.raises(StepFailed):
         verify.step_verify_home_io(dict(CTX))
     detail = probe_env["logs"][-1]["error_detail"]

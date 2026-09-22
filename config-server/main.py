@@ -1352,7 +1352,7 @@ JOB_STEPS_MAX_JOBS = 5
 # 명령 출력이 섞여 있어 그대로 내보내지 않는다(이 기록은 관리자 화면에 보인다).
 _STEP_SUMMARY_KEYS = ("expected_uid", "requested", "visible", "node", "placed_in_candidates", "roundtrip",
                       "owner_uid", "connected", "reason", "likely_cause", "step", "compensation",
-                      "interrupted_after", "unknown", "degraded", "rc",
+                      "interrupted_after", "unknown", "degraded", "rc", "stat_rc",
                       # 컨테이너 준비 대기: 이미지 새로 받음/노드에 있던 이미지, 받은 시간·크기, 재시도 횟수
                       "image_source", "image_pull_seconds", "image_size_mb", "mount_retries", "restarts")
 _INTERNAL_ADDRESS = re.compile(r"\d{1,3}(\.\d{1,3}){3}|:/")

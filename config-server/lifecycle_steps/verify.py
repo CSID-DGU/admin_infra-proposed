@@ -164,18 +164,21 @@ def step_verify_home_io(ctx):
         u, token = ctx["username"], f".verify-{ctx['request_id']}"
         # 소유권도 함께 관측한다 — sec=krb5 마운트에서 티켓이 없으면 NFS 클라이언트가 모든 파일을
         # nobody(65534)로 매핑하고 쓰기를 거부한다. 그 경우 "권한 문제"가 아니라 인증 문제다.
+        # 구분자로 자른다 — 내용(첫 토큰에 "/"나 ":" 포함)으로 df 줄을 찾으면, stderr가 stdout에
+        # 섞여 오는 _sh 특성상 "su: warning: ..." 같은 stderr 줄이 콜론 때문에 df 줄로 오인된다.
+        # __SU=$?로 rm 실패(잔재가 쌓이는 사고)도 왕복 실패로 잡는다.
         cmd = (f"su -s /bin/sh {u} -c 'echo ok > ~/{token} && cat ~/{token} && rm ~/{token}'"
-               f"; df -P /home/{u} | tail -1; stat -c %u /home/{u}")
+               f"; echo __SU=$?; echo __DF; df -P /home/{u} | tail -1; echo __OWNER; stat -c %u /home/{u}")
         out, rc = _sh(ctx["pod_name"], cmd)
-        lines = [l.strip() for l in out.splitlines() if l.strip()]
-        roundtrip = any(l == "ok" for l in lines)
-        mount_line = next((l for l in lines if "/" in l.split()[0] or ":" in l.split()[0]), "")
-        mount_src = mount_line.split()[0] if mount_line else ""
-        owner_uid = lines[-1] if lines and lines[-1].isdigit() else ""
+        head, _, rest = out.partition("__DF")
+        df_line, _, owner = rest.partition("__OWNER")
+        roundtrip = "ok" in head.split() and "__SU=0" in head
+        mount_src = (df_line.split() or [""])[0]
+        owner_uid = owner.strip()
         # NFS 마운트 소스는 host:/path 꼴이다. 로컬 디스크에 조용히 쓰이는 사고를 여기서 잡는다.
         on_nfs = ":" in mount_src
         detail = {"scope": "pod exec su + df + stat", "roundtrip": roundtrip,
-                  "mount_src": mount_src, "owner_uid": owner_uid, "rc": rc}
+                  "mount_src": mount_src, "owner_uid": owner_uid, "stat_rc": rc}
         if not roundtrip and owner_uid == "65534":
             detail["likely_cause"] = "NFS가 소유자를 nobody로 매핑 — 인증 티켓 없음(krb5) 의심"
         return (roundtrip and on_nfs), detail
