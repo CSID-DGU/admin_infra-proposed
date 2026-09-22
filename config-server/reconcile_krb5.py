@@ -1,5 +1,10 @@
-from main import app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh, _record_krb5_cleanup_pending
-from utils import get_db_connection
+import os
+
+from main import (app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh,
+                  _record_krb5_cleanup_pending, SHARED_GID_MIN, SHARED_GID_MAX)
+from utils import (get_db_connection, read_group_lines, parse_group_line,
+                   read_passwd_lines, parse_passwd_line,
+                   nas_shared_gids_for_users, nas_flush_gss_cache)
 
 
 def reconcile_krb5_cleanup_pending() -> None:
@@ -87,7 +92,85 @@ def reconcile_krb5_orphans() -> None:
             )
 
 
+def _ledger_shared_gids_by_user() -> dict:
+    """계정 대장이 말하는 {사용자: 공용 대역 gid 집합}. 이게 "이래야 하는" 값이다.
+
+    그룹 멤버만이 아니라 **대장의 모든 계정**을 빈 집합으로 깔아 둔다. 그래야 그룹에서 뺀
+    사용자도 대조 대상에 남는다 — 멤버만 보면 회수가 NAS 에 반영되기 전에 비워 버려서
+    그 사용자가 하루 더 접근한다."""
+    wanted = {p["name"]: set() for l in read_passwd_lines() if (p := parse_passwd_line(l))}
+    for line in read_group_lines():
+        g = parse_group_line(line)
+        if not g or g["gid"] < SHARED_GID_MIN:
+            continue
+        if SHARED_GID_MAX is not None and g["gid"] > SHARED_GID_MAX:
+            continue
+        for member in g["members"]:
+            wanted.setdefault(member, set()).add(g["gid"])
+    return wanted
+
+
+def reconcile_nas_gss_cache() -> None:
+    """공용 그룹이 바뀌었으면 NAS 의 GSS 컨텍스트 캐시를 비운다(#153).
+
+    NAS 는 컨텍스트를 맺을 때 그룹 목록을 한 번 풀어 고정하고 컨텍스트 수명(= 티켓 수명 24h)
+    동안 다시 보지 않는다. 비우지 않으면 AD 를 고쳐도 이미 떠 있는 Pod 에 최대 하루 반영되지
+    않는다. 클라이언트에서 티켓을 다시 받는 것으로는 풀리지 않는다 — 2026-09-22 실측.
+
+    **NAS 가 아직 모르는 상태에서 비우면 안 된다.** NAS winbind 가 새 멤버십을 알기까지 몇 분
+    걸리는데, 그 전에 비우면 다음 컨텍스트가 **옛 목록으로 다시 굳어** 하루가 또 간다. 그래서
+    고정된 대기 시간을 두지 않고 NAS 에 직접 물어 일치할 때만 비운다. 어긋나면 이번 주기는
+    건너뛰고 대장 mtime 을 남기지 않으므로 다음 주기가 다시 시도한다."""
+    group_path = app.config["GROUP_PATH"]
+    state_path = os.path.join(os.path.dirname(group_path), ".gss_flush_state")
+    try:
+        group_mtime = os.path.getmtime(group_path)
+    except OSError:
+        return                      # 아직 계정이 하나도 없는 스택
+    try:
+        with open(state_path) as f:
+            flushed_for = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        flushed_for = 0.0
+    if flushed_for >= group_mtime:
+        return
+
+    wanted = _ledger_shared_gids_by_user()
+    try:
+        actual = nas_shared_gids_for_users(wanted, SHARED_GID_MIN, SHARED_GID_MAX)
+    except Exception as e:
+        app.logger.warning(f"[NAS GSS] NAS 그룹 조회 실패(다음 주기 재시도): {e}")
+        return
+
+    # 더한 그룹뿐 아니라 뺀 그룹도 본다. 같아야만 비운다 — 한쪽만 보면 회수가 반영되지 않는다.
+    stale = {}
+    for username, gids in wanted.items():
+        got = actual.get(username)
+        if got is None:
+            # NAS 가 이 이름을 모른다(AD 에 없는 레거시 계정 등). 공용 그룹이 걸려 있지 않으면
+            # 판정 대상이 아니므로 넘어가고, 걸려 있다면 아직 반영 안 된 것으로 본다.
+            if gids:
+                stale[username] = (gids, None)
+            continue
+        if got != gids:
+            stale[username] = (gids, got)
+    if stale:
+        app.logger.info(f"[NAS GSS] NAS 가 아직 대장을 따라오지 못함(다음 주기 재시도): {stale}")
+        return
+
+    try:
+        nas_flush_gss_cache()
+    except Exception as e:
+        app.logger.warning(f"[NAS GSS] 캐시 비우기 실패(다음 주기 재시도): {e}")
+        return
+
+    with open(state_path, "w") as f:
+        f.write(f"{group_mtime}\n")
+    app.logger.info(f"[NAS GSS] 공용 그룹 변경 반영 완료 — 사용자 {len(wanted)}명, mtime={group_mtime}")
+
+
 if __name__ == "__main__":
     with app.app_context():
         reconcile_krb5_cleanup_pending()
         reconcile_krb5_orphans()
+        reconcile_nas_gss_cache()
