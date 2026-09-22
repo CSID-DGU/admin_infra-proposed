@@ -16,6 +16,18 @@ spec:
         spec:
           serviceAccountName: config-server
           restartPolicy: OnFailure
+          # 배포본(deployment.yaml)·제어기(controller.yaml)와 같은 노드에 고정한다. kube-share NFS가
+          # csid-dgu-desktop에서만 닿아서(LAB·FARM 네트워크 분리), 이게 없으면 스케줄러가 임의의 farm
+          # 노드에 올리고 거기서 mount.nfs가 실패한다(2026-09-22 발견 — #158이 이 CronJob에 kube-share
+          # 마운트를 새로 추가하면서 이 블록을 같이 안 옮겨서 생긴 회귀).
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
             - name: krb5-reconcile
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
