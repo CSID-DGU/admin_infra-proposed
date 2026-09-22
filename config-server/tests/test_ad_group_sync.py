@@ -19,9 +19,6 @@ def etc(tmp_path, monkeypatch):
 
     sent = []
     monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": sent.append(cmd) or "")
-    # 기본은 "떠 있는 Pod 없음" — 티켓 재발급 경로가 실제 DB 를 건드리지 않게 한다.
-    # 재발급을 보는 시험은 farm fixture 가 이걸 덮는다.
-    monkeypatch.setattr(main, "_nodes_running_user_pods", lambda u: [])
 
     with main.app.app_context():
         main.ensure_etc_layout()
@@ -129,64 +126,12 @@ def test_step_runs_after_the_ad_user_exists(etc):
     assert names.index("step_sync_ad_groups") > names.index("step_create_krb5_principal")
 
 
-# ---------- #153 그룹 변경 뒤 티켓 강제 재발급 ----------
-
-@pytest.fixture
-def farm(monkeypatch):
-    """사용자 Pod 가 떠 있는 노드와 farm SSH 를 대역으로 바꾼다."""
-    calls = []
-    monkeypatch.setattr(main, "_nodes_running_user_pods", lambda u: ["farm6", "farm9"])  # etc 의 기본값을 덮는다
-    monkeypatch.setattr(main, "_get_farm_node_info",
-                        lambda n: {"name": n, "host": f"10.0.0.{n[-1]}", "port": "22"})
-    monkeypatch.setattr(main, "_farm_ssh",
-                        lambda host, port, cmd, stdin_data="": calls.append(cmd) or "")
-    return calls
-
-
-def test_group_change_reissues_tickets_on_every_node_with_a_pod(etc, api, farm):
-    seed, sent = etc
-    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
-         group=["alice:x:21000:", "teamx:x:70000:"])
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 200
-    assert farm == ["refresh alice", "refresh alice"]        # farm6, farm9
-    assert r.get_json()["krb5_refreshed_nodes"] == ["farm6", "farm9"]
-
-
-def test_reissue_failure_does_not_undo_the_group_change(etc, api, farm, monkeypatch):
-    """티켓 재발급이 실패해도 그룹 변경은 이미 끝났다 — 되돌릴 방법이 없으면서
-    호출자만 재시도하게 만들면 안 된다. 다음 갱신 주기나 Pod 재생성이 따라잡는다."""
-    seed, sent = etc
-    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
-         group=["alice:x:21000:", "teamx:x:70000:"])
-
-    def boom(host, port, cmd, stdin_data=""):
-        raise RuntimeError("farm SSH 실패")
-    monkeypatch.setattr(main, "_farm_ssh", boom)
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 200
-    assert r.get_json()["krb5_refreshed_nodes"] == []
-    with main.app.app_context():
-        line = [l for l in main.read_group_lines() if l.startswith("teamx:")][0]
-        assert main.parse_group_line(line)["members"] == ["alice"]
-
-
-def test_new_group_with_members_reissues_their_tickets(etc, api, farm):
+def test_new_group_with_members_adds_them_in_ad(etc, api):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"])
     r = api.post("/groups", json={"name": "teamx", "gid": 70000, "members": ["alice"]})
     assert r.status_code == 201
     assert sent == ["group-create teamx 70000", "group-addmember teamx alice"]
-    assert farm == ["refresh alice", "refresh alice"]
-
-
-def test_step_reissues_after_syncing_groups(etc, farm, logs):
-    seed, sent = etc
-    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
-    with main.app.app_context():
-        provision.step_sync_ad_groups(ctx)
-    assert sent == ["group-create teamx 70000", "group-addmember teamx alice"]
-    assert farm == ["refresh alice", "refresh alice"]
 
 
 # ---------- DC 폴백: 접속 실패와 거절을 구분한다 ----------

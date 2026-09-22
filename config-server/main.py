@@ -645,49 +645,13 @@ def _create_ad_group(name: str, gid: int) -> None:
 def _add_ad_group_member(groupname: str, username: str) -> None:
     """AD 그룹에 사용자를 넣는다. 이미 멤버면 아무 일도 하지 않는다.
 
-    주의: 이것만으로는 이미 떠 있는 Pod 에 반영되지 않는다. 그룹은 티켓 PAC 에 실려 오고
-    갱신 타이머가 kinit -R 을 선호해 옛 PAC 이 최대 약 6일 유지된다(#153 에서 다룬다)."""
+    주의: 이것만으로는 이미 떠 있는 Pod 에 반영되지 않는다. NAS 는 GSS 컨텍스트를 맺을
+    때 winbind 로 그룹을 풀어 auth.rpcsec.context 에 고정하고, 컨텍스트 수명(= 티켓 수명
+    24h) 동안 다시 보지 않는다. 반영하려면 NAS 에서 그 캐시를 비워야 한다(#153). 티켓
+    PAC 은 쓰이지 않으므로 클라이언트에서 kinit 을 다시 해도 소용없다 — 2026-09-22 실측."""
     if not _ad_enabled():
         return
     _farm_ad_ssh(f"group-addmember {groupname} {username}")
-
-
-def _nodes_running_user_pods(username: str) -> list:
-    """이 사용자의 Pod 가 떠 있는 노드 목록. 티켓을 다시 발급할 대상을 고르는 데 쓴다."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT node_name FROM nodeport_allocations WHERE username=%s",
-                        (username,))
-            return [row[0] for row in cur.fetchall() if row[0]]
-    finally:
-        conn.close()
-
-
-def _refresh_krb5_after_group_change(username: str) -> list:
-    """그룹이 바뀐 사용자의 티켓을 그 사용자 Pod 가 떠 있는 모든 노드에서 다시 발급한다.
-
-    그룹은 티켓 PAC 에 실려 오고 갱신 타이머는 kinit -R 을 선호한다. -R 은 옛 PAC 을
-    그대로 들고 오므로, 이 호출이 없으면 AD 를 고쳐도 최대 약 6일 반영되지 않는다(#153).
-
-    실패는 경고만 남기고 넘어간다 — 그룹 변경 자체는 이미 끝났고, 티켓은 다음 갱신
-    주기나 Pod 재생성 때 따라잡는다. 여기서 전체를 실패시키면 이미 반영된 AD 변경을
-    되돌릴 방법이 없으면서 호출자만 재시도하게 된다."""
-    if not _ad_enabled():
-        return []
-    refreshed = []
-    for node_name in _nodes_running_user_pods(username):
-        try:
-            node = _get_farm_node_info(node_name)
-            _farm_ssh(node["host"], node["port"], f"refresh {username}")
-            refreshed.append(node_name)
-        except Exception:
-            app.logger.exception(
-                "[KRB5] 그룹 변경 후 티켓 재발급 실패(다음 주기에 따라잡음): %s @ %s",
-                username, node_name)
-    if refreshed:
-        app.logger.info("[KRB5] 그룹 변경 반영을 위해 티켓 재발급: %s @ %s", username, refreshed)
-    return refreshed
 
 
 def _remove_group_line(name: str) -> None:
@@ -971,11 +935,6 @@ def add_group(body: AddGroupRequest):
         return jsonify(infra_error("ADD_GROUP", "AD_GROUP_CREATE_FAILED",
                                    f"failed to create group in AD: {name}")), 500
 
-    # 멤버로 들어간 사용자는 이미 떠 있는 Pod 가 있을 수 있다 — 티켓을 다시 받아야
-    # 새 그룹이 PAC 에 실린다(#153).
-    for m in sorted(members):
-        _refresh_krb5_after_group_change(m)
-
     return jsonify({"group": {"name": name, "gid": gid}}), 201
 
 # ----------- Add user to supplementary groups -----------
@@ -1061,9 +1020,7 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
                                    f"failed to add {username} to groups in AD")), 500
 
     write_group_lines(new_lines)
-    refreshed = _refresh_krb5_after_group_change(username)
-    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names)),
-                    "krb5_refreshed_nodes": refreshed})
+    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)
