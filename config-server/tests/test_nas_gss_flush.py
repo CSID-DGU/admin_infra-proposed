@@ -232,8 +232,8 @@ class TestNasGssFlushOndemand:
         _nas_says(monkeypatch, {"alice": {70000}})   # 첫 시도부터 바로 통과
 
         released = []
-        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: True)
-        monkeypatch.setattr(rec, "release_flush_lock", lambda: released.append(1))
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: "tok-1")
+        monkeypatch.setattr(rec, "release_flush_lock", lambda token: released.append(token))
 
         with main.app.app_context():
             started = rec.trigger_nas_gss_flush_ondemand()
@@ -244,7 +244,7 @@ class TestNasGssFlushOndemand:
                     t.join(timeout=2)
 
         assert flushes == [1]
-        assert released == [1]     # 성공 후 락을 명시적으로 풀어준다
+        assert released == ["tok-1"]     # 성공 후 락을 자신이 받은 토큰으로 풀어준다
 
     def test_gives_up_after_timeout_without_crashing(self, ledger, monkeypatch):
         """NAS 가 끝까지 안 따라잡아도 예외 없이 조용히 포기해야 한다(30분 크론이 안전망)."""
@@ -253,8 +253,8 @@ class TestNasGssFlushOndemand:
         _nas_says(monkeypatch, {"alice": set()})     # 절대 안 통과
 
         released = []
-        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: True)
-        monkeypatch.setattr(rec, "release_flush_lock", lambda: released.append(1))
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: "tok-2")
+        monkeypatch.setattr(rec, "release_flush_lock", lambda token: released.append(token))
 
         with main.app.app_context():
             rec.trigger_nas_gss_flush_ondemand()
@@ -263,22 +263,47 @@ class TestNasGssFlushOndemand:
                     t.join(timeout=2)
 
         assert flushes == []
-        assert released == [1]     # 타임아웃으로 포기해도 락은 풀어야 다음 승인이 새로 시도할 수 있다
+        assert released == ["tok-2"]     # 타임아웃으로 포기해도 락은 풀어야 다음 승인이 새로 시도할 수 있다
 
     def test_does_not_start_a_second_loop_when_one_is_already_running(self, ledger, monkeypatch):
         """동시 승인 겹침 — 락을 이미 다른 쪽이 쥐고 있으면 새 루프를 안 띄운다."""
         write_group, flushes = ledger
         write_group("alice:x:21000:", "teamx:x:70000:alice")
 
-        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: False)  # 이미 누가 쥐고 있음
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: None)  # 이미 누가 쥐고 있음
         release_calls = []
-        monkeypatch.setattr(rec, "release_flush_lock", lambda: release_calls.append(1))
+        monkeypatch.setattr(rec, "release_flush_lock", lambda token: release_calls.append(token))
 
         with main.app.app_context():
             started = rec.trigger_nas_gss_flush_ondemand()
 
         assert started is False
         assert release_calls == []   # 애초에 스레드를 안 띄웠으니 해제할 것도 없다
+
+    def test_releases_lock_if_thread_start_itself_fails(self, ledger, monkeypatch):
+        """스레드 시작 자체가 실패하면(OS 자원 부족 등) 재시도 루프가 절대 못 돌아 스스로
+        release를 못 부른다 — 락을 영원히 붙든 채 다음 승인들이 전부 재시도를 못 띄우게
+        되면 안 되므로 호출부가 직접 풀어준다."""
+        write_group, flushes = ledger
+        write_group("alice:x:21000:", "teamx:x:70000:alice")
+
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: "tok-3")
+        released = []
+        monkeypatch.setattr(rec, "release_flush_lock", lambda token: released.append(token))
+
+        class _BoomThread:
+            def __init__(self, *a, **kw):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(rec.threading, "Thread", _BoomThread)
+
+        with main.app.app_context(), pytest.raises(RuntimeError):
+            rec.trigger_nas_gss_flush_ondemand()
+
+        assert released == ["tok-3"]
 
 
 def test_lock_uses_set_nx_ex(monkeypatch):
@@ -287,7 +312,39 @@ def test_lock_uses_set_nx_ex(monkeypatch):
 
     calls = []
     monkeypatch.setattr(lock_mod.r, "set", lambda *a, **kw: calls.append((a, kw)) or True)
-    assert lock_mod.try_acquire_flush_lock(600) is True
+    token = lock_mod.try_acquire_flush_lock(600)
+    assert isinstance(token, str) and token   # 획득 성공 시 소유자 토큰을 돌려줘야 한다
     (args, kwargs) = calls[0]
     assert kwargs.get("nx") is True
     assert kwargs.get("ex") == 600
+
+
+def test_lock_acquire_returns_none_when_already_held(monkeypatch):
+    from adapters import nas_gss_flush_lock as lock_mod
+
+    monkeypatch.setattr(lock_mod.r, "set", lambda *a, **kw: False)
+    assert lock_mod.try_acquire_flush_lock(600) is None
+
+
+def test_release_only_deletes_when_token_matches(monkeypatch):
+    """TTL 만료 후 다른 워커가 새로 잡은 락을, 뒤늦게 도착한 예전 소유자의 release가
+    지워버리면 안 된다(compare-and-delete). 실제 Redis 없이 저장소를 흉내 낸다 — 이 저장소
+    안 시험들도 전부 그렇게 하는 이유는 conftest.py 주석대로 실제 접속이 수십 초씩 멈출 수
+    있어서다."""
+    from adapters import nas_gss_flush_lock as lock_mod
+
+    store = {}
+    monkeypatch.setattr(lock_mod, "_RELEASE_IF_OWNER_SCRIPT",
+                        lambda keys, args: store.pop(keys[0], None) if store.get(keys[0]) == args[0] else 0)
+
+    own_token = "own-token"
+    store[lock_mod._LOCK_KEY] = own_token
+
+    # 다른 누군가(또는 미래의 자신)가 이미 새 토큰으로 락을 다시 잡았다고 가정
+    store[lock_mod._LOCK_KEY] = "someone-elses-token"
+
+    lock_mod.release_flush_lock(own_token)   # 내 옛 토큰으로는 지워지면 안 된다
+    assert store[lock_mod._LOCK_KEY] == "someone-elses-token"
+
+    lock_mod.release_flush_lock("someone-elses-token")
+    assert lock_mod._LOCK_KEY not in store
