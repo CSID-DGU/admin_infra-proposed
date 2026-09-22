@@ -5,6 +5,7 @@ NAS 는 컨텍스트를 맺을 때 그룹을 한 번 풀어 고정하고 하루 
 다음 컨텍스트가 옛 목록으로 다시 굳는다. 그래서 "바뀌었나"와 "NAS 가 아는가"를 둘 다 본다.
 """
 import os
+import threading
 
 import pytest
 
@@ -190,3 +191,103 @@ def test_missing_ledger_is_not_an_error(ledger, monkeypatch):
         os.remove(main.app.config["GROUP_PATH"])
         rec.reconcile_nas_gss_cache()
     assert flushes == []
+
+
+def test_reconcile_reports_whether_it_actually_flushed(ledger, monkeypatch):
+    """#161 온디맨드 재시도 루프가 "이번에 끝났다"를 판단하는 근거가 반환값이다."""
+    write_group, flushes = ledger
+    write_group("alice:x:21000:", "teamx:x:70000:alice")
+    _nas_says(monkeypatch, {"alice": set()})
+    with main.app.app_context():
+        assert rec.reconcile_nas_gss_cache() is False   # NAS 가 아직 모름
+        _nas_says(monkeypatch, {"alice": {70000}})
+        assert rec.reconcile_nas_gss_cache() is True     # 이번엔 flush됨
+        assert rec.reconcile_nas_gss_cache() is False    # 더 비울 게 없음
+
+
+def test_state_write_leaves_no_leftover_tmp_file(ledger, monkeypatch):
+    """os.replace로 교체하므로 성공하면 임시 파일이 남지 않아야 한다."""
+    write_group, flushes = ledger
+    write_group("alice:x:21000:", "teamx:x:70000:alice")
+    _nas_says(monkeypatch, {"alice": {70000}})
+    with main.app.app_context():
+        rec.reconcile_nas_gss_cache()
+        state_dir = os.path.dirname(rec._gss_state_path())
+        leftovers = [f for f in os.listdir(state_dir) if ".tmp." in f]
+    assert leftovers == []
+
+
+class TestNasGssFlushOndemand:
+    """#161 온디맨드 재시도 루프. 실제 스레드/Redis는 안 쓰고 락과 시간 상수만 가짜로 바꾼다."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_timing(self, monkeypatch):
+        # 실제 20초/10분을 기다리면 시험이 못 끝난다 — 폴링 간격과 타임아웃을 밀리초 단위로 줄인다.
+        monkeypatch.setattr(rec, "NAS_GSS_ONDEMAND_POLL_SEC", 0.01)
+        monkeypatch.setattr(rec, "NAS_GSS_ONDEMAND_TIMEOUT_SEC", 0.05)
+
+    def test_stops_retrying_as_soon_as_flush_succeeds(self, ledger, monkeypatch):
+        write_group, flushes = ledger
+        write_group("alice:x:21000:", "teamx:x:70000:alice")
+        _nas_says(monkeypatch, {"alice": {70000}})   # 첫 시도부터 바로 통과
+
+        released = []
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: True)
+        monkeypatch.setattr(rec, "release_flush_lock", lambda: released.append(1))
+
+        with main.app.app_context():
+            started = rec.trigger_nas_gss_flush_ondemand()
+            assert started is True
+            # 백그라운드 스레드가 끝날 때까지 대기(폴링 간격이 짧아 금방 끝난다)
+            for t in threading.enumerate():
+                if t.name != threading.main_thread().name and t.daemon:
+                    t.join(timeout=2)
+
+        assert flushes == [1]
+        assert released == [1]     # 성공 후 락을 명시적으로 풀어준다
+
+    def test_gives_up_after_timeout_without_crashing(self, ledger, monkeypatch):
+        """NAS 가 끝까지 안 따라잡아도 예외 없이 조용히 포기해야 한다(30분 크론이 안전망)."""
+        write_group, flushes = ledger
+        write_group("alice:x:21000:", "teamx:x:70000:alice")
+        _nas_says(monkeypatch, {"alice": set()})     # 절대 안 통과
+
+        released = []
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: True)
+        monkeypatch.setattr(rec, "release_flush_lock", lambda: released.append(1))
+
+        with main.app.app_context():
+            rec.trigger_nas_gss_flush_ondemand()
+            for t in threading.enumerate():
+                if t.name != threading.main_thread().name and t.daemon:
+                    t.join(timeout=2)
+
+        assert flushes == []
+        assert released == [1]     # 타임아웃으로 포기해도 락은 풀어야 다음 승인이 새로 시도할 수 있다
+
+    def test_does_not_start_a_second_loop_when_one_is_already_running(self, ledger, monkeypatch):
+        """동시 승인 겹침 — 락을 이미 다른 쪽이 쥐고 있으면 새 루프를 안 띄운다."""
+        write_group, flushes = ledger
+        write_group("alice:x:21000:", "teamx:x:70000:alice")
+
+        monkeypatch.setattr(rec, "try_acquire_flush_lock", lambda ttl: False)  # 이미 누가 쥐고 있음
+        release_calls = []
+        monkeypatch.setattr(rec, "release_flush_lock", lambda: release_calls.append(1))
+
+        with main.app.app_context():
+            started = rec.trigger_nas_gss_flush_ondemand()
+
+        assert started is False
+        assert release_calls == []   # 애초에 스레드를 안 띄웠으니 해제할 것도 없다
+
+
+def test_lock_uses_set_nx_ex(monkeypatch):
+    """Redis 락은 gunicorn 워커 여러 개에 걸친 중복 실행을 막는 유일한 장치라 NX+EX 인지 확인한다."""
+    from adapters import nas_gss_flush_lock as lock_mod
+
+    calls = []
+    monkeypatch.setattr(lock_mod.r, "set", lambda *a, **kw: calls.append((a, kw)) or True)
+    assert lock_mod.try_acquire_flush_lock(600) is True
+    (args, kwargs) = calls[0]
+    assert kwargs.get("nx") is True
+    assert kwargs.get("ex") == 600
