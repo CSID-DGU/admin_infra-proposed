@@ -23,8 +23,6 @@ fi
 PROD_NS=ailab-infra
 PROD_RELEASE=containerssh-config-server
 PROD_BE_NS=default
-PROD_DB_NS=ailab-be      # 운영 admin_be의 DB (기준 데이터 복사용, 읽기만)
-PROD_DB_POD=my-mysql-0
 
 # 할당 값은 uid-ranges.yaml 한 곳에 선언돼 있다(admin_infra-proposed#118). case문에 손으로
 # 적지 않는 이유와 실제 겪은 충돌 사고들은 그 파일 머리말 주석 참고.
@@ -400,39 +398,17 @@ kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
 kubectl -n "$NS" rollout status deployment/admin-redis --timeout=5m
 echo "admin_be 이미지: ${ADMIN_IMAGE##*[@:]}"
 
-step "기준 데이터 복사 (운영 admin DB → 스택)"
-# 신청 화면에 필요한 서버·자원 그룹·노드·GPU·이미지와 메일 문구만 복사한다. 사용자·신청은 운영 개인정보이고,
-# 그룹은 운영 GID에 묶여 있어 복사하지 않는다. 운영 DB는 읽기만 한다.
-# 운영 DB에는 ddl-auto가 지우지 않은 옛 열이 남아 있을 수 있어, 임시 DB에 그대로 받은 뒤 공통 열만 옮긴다.
-REF_TABLES="resource_groups nodes gpus container_image resource_group_images message_templates"
+step "기준 데이터 확인 (스택 admin DB)"
+# 신청 화면에 필요한 서버·자원 그룹·노드·GPU·이미지와 메일 문구는 최초 1회 스택에 심어 두면 된다.
+# 운영은 9/15부터 평소 0대로 내려가 있는 게 정상이라(비용 절감), 운영 DB에서 매번 새로 복사해 올
+# 원본이 없다 — 스택에 이미 있는 기준 데이터를 그대로 쓴다. 스택에 기준 데이터가 아예 없으면
+# (새 스택 최초 기동 등) 다른 스택에서 옮기거나 운영을 잠시 띄워 수동으로 넣어야 한다.
 smy()  { kubectl -n "$NS" exec mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N "$@"' _ "$@" </dev/null; }
-smyi() { kubectl -n "$NS" exec -i mysql-0 -- sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot "$@"' _ "$@"; }
-if [ "$(kubectl -n "$PROD_DB_NS" get pod "$PROD_DB_POD" -o jsonpath='{.status.phase}' 2>/dev/null)" != Running ]; then
-  # 운영을 내린 뒤에는 복사할 원본이 없다. 스택에 이미 받아 둔 기준 데이터가 있으면 그대로 쓴다.
-  HAVE=$(smy -e "SELECT COUNT(*) FROM web_admin.resource_groups" 2>/dev/null || echo 0)
-  if [ "${HAVE:-0}" -gt 0 ]; then
-    echo "운영 DB가 멈춰 있어 복사하지 않고 스택의 기존 기준 데이터를 씀 (자원 그룹 ${HAVE}행)"
-  else
-    echo "운영 DB가 멈춰 있고 스택에 기준 데이터가 없음 — 운영 DB를 잠시 띄우거나 다른 스택에서 기준 데이터를 옮겨야 함"; exit 1
-  fi
+HAVE=$(smy -e "SELECT COUNT(*) FROM web_admin.resource_groups" 2>/dev/null || echo 0)
+if [ "${HAVE:-0}" -gt 0 ]; then
+  echo "스택의 기존 기준 데이터를 씀 (자원 그룹 ${HAVE}행)"
 else
-smy -e "DROP DATABASE IF EXISTS refdata_src; CREATE DATABASE refdata_src"
-kubectl -n "$PROD_DB_NS" exec "$PROD_DB_POD" -- sh -c \
-  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction --no-tablespaces --skip-triggers --set-gtid-purged=OFF "$MYSQL_DATABASE" "$@"' _ $REF_TABLES \
-  | smyi refdata_src
-for T in $REF_TABLES; do
-  COLS=$(smy -e "SELECT GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.ORDINAL_POSITION) FROM information_schema.COLUMNS s
-    JOIN information_schema.COLUMNS p ON p.TABLE_SCHEMA='refdata_src' AND p.TABLE_NAME=s.TABLE_NAME AND LOWER(p.COLUMN_NAME)=LOWER(s.COLUMN_NAME)
-    WHERE s.TABLE_SCHEMA='web_admin' AND s.TABLE_NAME='$T'")
-  [ -n "$COLS" ] && [ "$COLS" != NULL ] || { echo "$T: 운영과 스택에 공통 열이 없음 (표가 없는지 확인)"; exit 1; }
-  SKIP=$(smy -e "SELECT IFNULL(GROUP_CONCAT(p.COLUMN_NAME), '-') FROM information_schema.COLUMNS p
-    LEFT JOIN information_schema.COLUMNS s ON s.TABLE_SCHEMA='web_admin' AND s.TABLE_NAME=p.TABLE_NAME AND LOWER(s.COLUMN_NAME)=LOWER(p.COLUMN_NAME)
-    WHERE p.TABLE_SCHEMA='refdata_src' AND p.TABLE_NAME='$T' AND s.COLUMN_NAME IS NULL")
-  UPD=$(echo "$COLS" | tr ',' '\n' | sed 's/.*/&=VALUES(&)/' | paste -sd, -)
-  smy -e "SET FOREIGN_KEY_CHECKS=0; INSERT INTO web_admin.$T ($COLS) SELECT $COLS FROM refdata_src.$T ON DUPLICATE KEY UPDATE $UPD"
-  echo "$T: 운영 $(smy -e "SELECT COUNT(*) FROM refdata_src.$T")행 → 스택 $(smy -e "SELECT COUNT(*) FROM web_admin.$T")행 (운영에만 있는 열: $SKIP)"
-done
-smy -e "DROP DATABASE refdata_src"
+  echo "스택에 기준 데이터가 없음 — 다른 스택에서 기준 데이터를 옮기거나 운영을 잠시 띄워 수동으로 넣어야 함"; exit 1
 fi
 
 step "사용자 컨테이너 이미지 태그"
