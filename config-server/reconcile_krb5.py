@@ -1,4 +1,5 @@
 import os
+import tempfile
 import threading
 import time
 
@@ -139,11 +140,25 @@ def _gss_state_path() -> str:
 def _write_gss_state(state_path: str, group_mtime: float) -> None:
     """임시 파일에 쓰고 os.replace 로 교체한다 — 같은 파일에 두 프로세스(30분 크론과 온디맨드
     재시도 루프)가 겹쳐 쓸 수 있는데, open(path,"w")는 원자적이지 않아 극히 드물게 값이 깨질
-    여지가 있었다. os.replace 는 POSIX에서 원자적이라 항상 둘 중 하나의 완전한 값만 남는다."""
-    tmp_path = f"{state_path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w") as f:
-        f.write(f"{group_mtime}\n")
-    os.replace(tmp_path, state_path)
+    여지가 있었다. os.replace 는 POSIX에서 원자적이라 항상 둘 중 하나의 완전한 값만 남는다.
+
+    임시 파일 이름은 pid만으로 만들지 않는다 — pid는 같은 프로세스 안 스레드끼리는 겹쳐서,
+    같은 워커의 온디맨드 재시도 스레드 두 개가 같은 임시 파일을 동시에 열면 서로 truncate
+    할 수 있다. tempfile.mkstemp 로 매 호출마다 유일한 이름을 받는다."""
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(state_path) or ".",
+        prefix=os.path.basename(state_path) + ".tmp.",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{group_mtime}\n")
+        os.replace(tmp_path, state_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def reconcile_nas_gss_cache() -> bool:
@@ -217,7 +232,7 @@ NAS_GSS_ONDEMAND_TIMEOUT_SEC = 600  # 10분 — 그 안에 안 되면 포기하�
 NAS_GSS_ONDEMAND_LOCK_TTL_SEC = NAS_GSS_ONDEMAND_TIMEOUT_SEC + 60  # 루프보다 넉넉히 길게.
 
 
-def _nas_gss_flush_retry_loop() -> None:
+def _nas_gss_flush_retry_loop(lock_token: str) -> None:
     """그룹 변경 승인 직후부터 짧은 간격으로 재시도한다(#161).
 
     30분 크론과 이 함수는 서로의 존재를 모른 채 같은 reconcile_nas_gss_cache()를 부른다 —
@@ -246,7 +261,7 @@ def _nas_gss_flush_retry_loop() -> None:
                 "30분 크론에 맡기고 포기"
             )
         finally:
-            release_flush_lock()
+            release_flush_lock(lock_token)
 
 
 def trigger_nas_gss_flush_ondemand() -> bool:
@@ -256,10 +271,16 @@ def trigger_nas_gss_flush_ondemand() -> bool:
     변경분까지 같이 처리해준다 — 겹쳐 부를 필요가 없다.
 
     반환값은 "루프를 새로 띄웠는지"일 뿐, flush 성공 여부가 아니다 — 이건 fire-and-forget이다."""
-    if not try_acquire_flush_lock(NAS_GSS_ONDEMAND_LOCK_TTL_SEC):
+    lock_token = try_acquire_flush_lock(NAS_GSS_ONDEMAND_LOCK_TTL_SEC)
+    if lock_token is None:
         app.logger.info("[NAS GSS 온디맨드] 이미 재시도 루프가 돌고 있어 새로 안 띄움")
         return False
-    threading.Thread(target=_nas_gss_flush_retry_loop, daemon=True).start()
+    try:
+        threading.Thread(target=_nas_gss_flush_retry_loop, args=(lock_token,), daemon=True).start()
+    except Exception:
+        # 스레드 시작 자체가 실패하면 루프가 절대 못 돌아 release가 안 불린다 — 여기서 직접 풀어준다.
+        release_flush_lock(lock_token)
+        raise
     return True
 
 
