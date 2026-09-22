@@ -823,6 +823,25 @@ accounts_bp = Blueprint("accounts", __name__)
 
 
 
+# 컨테이너 이미지가 이미 가진 그룹 이름. 이 이름으로 팀 그룹을 만들면 이미지 entrypoint 의
+# ensure_supplemental_groups() 가 "이름은 있는데 gid 가 다르다"로 판단해 컨테이너를 죽인다
+# (admin_infra_server container-images/entrypoint.sh:182-189). 사용자 컨테이너의 /etc/group 은
+# 이미지 자신의 것이고 config-server 가 마운트하지 않으므로, group 파일 중복 검사로는 못 막는다.
+#
+# 출처: 운영 중인 dguailab/decs 이미지(cuda11.8-tf2.13-ubuntu22.04 의 260627·260915, 두 판 동일)의
+# /etc/group 과 base_etc/group 시드의 합집합. 이미지를 바꾸면 아래로 다시 뽑아 갱신한다.
+#   kubectl exec <사용자 Pod> -- cut -d: -f1 /etc/group
+# 사용자 개인 그룹은 entrypoint 가 실행 중에 만드는 것이라 목록에 넣지 않는다.
+# crontab·docker·input·kvm·render·ssh 는 지금 이미지에는 없지만 데비안·NVIDIA 계열 이미지에서
+# 흔히 생기는 이름이라 미리 막는다(admin_infra-proposed#152).
+RESERVED_GROUP_NAMES = frozenset("""
+_ssh adm audio backup bin cdrom crontab daemon dialout dip disk docker fax floppy games gnats
+input irc kmem kvm list lp mail man messagebus news nogroup nova operator plugdev polkitd proxy
+render root sasl shadow src ssh ssl-cert staff sudo svmanager sys systemd-journal systemd-network
+systemd-resolve systemd-timesync tape tty users utmp uucp video voice www-data
+""".split())
+
+
 # ----------- Group management -----------
 @accounts_bp.route("/groups", methods=["POST"])
 @validate_body(AddGroupRequest)
@@ -885,6 +904,11 @@ def add_group(body: AddGroupRequest):
     if name in existing_users:
         return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_CONFLICTS_USER",
                                    f"group name collides with an existing user: {name}")), 400
+    # 이미지가 이미 쥔 이름이면 Pod 가 기동하지 못한다 — 여기서 막지 않으면 원인이 그룹 이름이라는
+    # 것을 기동 실패 로그에서 알아내야 한다(#152).
+    if name in RESERVED_GROUP_NAMES:
+        return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_RESERVED",
+                                   f"group name is reserved by the container image: {name}")), 409
     if members:
         invalid_members = [m for m in members if m not in existing_users]
         if invalid_members:
