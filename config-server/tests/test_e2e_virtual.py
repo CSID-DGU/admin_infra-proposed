@@ -549,7 +549,7 @@ def full(env, monkeypatch):
             uid = next(l.split(":")[2] for l in passwd_names_lines() if l.startswith(u + ":"))
             return uid, 0
         if "df -P" in cmd:
-            return "ok\nnas:/volume1/share/user 1 1 1 1% /home", 0
+            return "ok\n__SU=0\n__DF\nnas:/volume1/share/user 1 1 1 1% /home\n__OWNER\n50000", 0
         if "klist" in cmd:
             return e.probe_klist if hasattr(e, "probe_klist") else ("", 0)
         if "nvidia-smi" in cmd:
