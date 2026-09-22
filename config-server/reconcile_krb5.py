@@ -1,10 +1,13 @@
 import os
+import threading
+import time
 
 from main import (app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh,
                   _record_krb5_cleanup_pending, SHARED_GID_MIN, SHARED_GID_MAX)
 from utils import (get_db_connection, read_group_lines, parse_group_line,
                    read_passwd_lines, parse_passwd_line,
                    nas_shared_gids_for_users, nas_flush_gss_cache)
+from adapters.nas_gss_flush_lock import try_acquire_flush_lock, release_flush_lock
 
 
 def reconcile_krb5_cleanup_pending() -> None:
@@ -128,7 +131,22 @@ def _ledger_shared_gids_by_user() -> dict:
     return wanted
 
 
-def reconcile_nas_gss_cache() -> None:
+def _gss_state_path() -> str:
+    group_path = app.config["GROUP_PATH"]
+    return os.path.join(os.path.dirname(group_path), ".gss_flush_state")
+
+
+def _write_gss_state(state_path: str, group_mtime: float) -> None:
+    """임시 파일에 쓰고 os.replace 로 교체한다 — 같은 파일에 두 프로세스(30분 크론과 온디맨드
+    재시도 루프)가 겹쳐 쓸 수 있는데, open(path,"w")는 원자적이지 않아 극히 드물게 값이 깨질
+    여지가 있었다. os.replace 는 POSIX에서 원자적이라 항상 둘 중 하나의 완전한 값만 남는다."""
+    tmp_path = f"{state_path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        f.write(f"{group_mtime}\n")
+    os.replace(tmp_path, state_path)
+
+
+def reconcile_nas_gss_cache() -> bool:
     """공용 그룹이 바뀌었으면 NAS 의 GSS 컨텍스트 캐시를 비운다(#153).
 
     NAS 는 컨텍스트를 맺을 때 그룹 목록을 한 번 풀어 고정하고 컨텍스트 수명(= 티켓 수명 24h)
@@ -138,20 +156,25 @@ def reconcile_nas_gss_cache() -> None:
     **NAS 가 아직 모르는 상태에서 비우면 안 된다.** NAS winbind 가 새 멤버십을 알기까지 몇 분
     걸리는데, 그 전에 비우면 다음 컨텍스트가 **옛 목록으로 다시 굳어** 하루가 또 간다. 그래서
     고정된 대기 시간을 두지 않고 NAS 에 직접 물어 일치할 때만 비운다. 어긋나면 이번 주기는
-    건너뛰고 대장 mtime 을 남기지 않으므로 다음 주기가 다시 시도한다."""
-    group_path = app.config["GROUP_PATH"]
-    state_path = os.path.join(os.path.dirname(group_path), ".gss_flush_state")
+    건너뛰고 대장 mtime 을 남기지 않으므로 다음 주기가 다시 시도한다.
+
+    30분 크론(`__main__`)과 온디맨드 재시도 루프(`trigger_nas_gss_flush_ondemand`, #161) 둘 다
+    이 함수를 그대로 부른다 — mtime 게이트가 이미 중복 flush를 막아주므로 별도 락 없이 안전하다.
+
+    반환값: 이번 호출에서 실제로 flush했으면 True(호출부가 재시도를 멈추는 신호로 씀),
+    아니면(반영할 변경이 없었거나 아직 NAS가 못 따라잡았거나 실패) False."""
+    state_path = _gss_state_path()
     try:
-        group_mtime = os.path.getmtime(group_path)
+        group_mtime = os.path.getmtime(app.config["GROUP_PATH"])
     except OSError:
-        return                      # 아직 계정이 하나도 없는 스택
+        return False                # 아직 계정이 하나도 없는 스택
     try:
         with open(state_path) as f:
             flushed_for = float(f.read().strip() or 0)
     except (OSError, ValueError):
         flushed_for = 0.0
     if flushed_for >= group_mtime:
-        return
+        return False
 
     wanted = _ledger_shared_gids_by_user()
     known = _ledger_shared_gids()
@@ -159,7 +182,7 @@ def reconcile_nas_gss_cache() -> None:
         actual = nas_shared_gids_for_users(wanted, SHARED_GID_MIN, SHARED_GID_MAX)
     except Exception as e:
         app.logger.warning(f"[NAS GSS] NAS 그룹 조회 실패(다음 주기 재시도): {e}")
-        return
+        return False
     actual = {u: gids & known for u, gids in actual.items()}
 
     # 더한 그룹뿐 아니라 뺀 그룹도 본다. 같아야만 비운다 — 한쪽만 보면 회수가 반영되지 않는다.
@@ -176,17 +199,68 @@ def reconcile_nas_gss_cache() -> None:
             stale[username] = (gids, got)
     if stale:
         app.logger.info(f"[NAS GSS] NAS 가 아직 대장을 따라오지 못함(다음 주기 재시도): {stale}")
-        return
+        return False
 
     try:
         nas_flush_gss_cache()
     except Exception as e:
         app.logger.warning(f"[NAS GSS] 캐시 비우기 실패(다음 주기 재시도): {e}")
-        return
+        return False
 
-    with open(state_path, "w") as f:
-        f.write(f"{group_mtime}\n")
+    _write_gss_state(state_path, group_mtime)
     app.logger.info(f"[NAS GSS] 공용 그룹 변경 반영 완료 — 사용자 {len(wanted)}명, mtime={group_mtime}")
+    return True
+
+
+NAS_GSS_ONDEMAND_POLL_SEC = 20
+NAS_GSS_ONDEMAND_TIMEOUT_SEC = 600  # 10분 — 그 안에 안 되면 포기하고 30분 크론에 맡긴다.
+NAS_GSS_ONDEMAND_LOCK_TTL_SEC = NAS_GSS_ONDEMAND_TIMEOUT_SEC + 60  # 루프보다 넉넉히 길게.
+
+
+def _nas_gss_flush_retry_loop() -> None:
+    """그룹 변경 승인 직후부터 짧은 간격으로 재시도한다(#161).
+
+    30분 크론과 이 함수는 서로의 존재를 모른 채 같은 reconcile_nas_gss_cache()를 부른다 —
+    그 함수 안의 mtime 게이트가 중복 실행을 막아주므로 조율이 필요 없다. 이 함수가 막는 건
+    "온디맨드 루프끼리" 겹치는 것뿐이다(같은 시점에 승인이 여러 건이면 gunicorn 워커마다
+    스레드가 하나씩 뜰 수 있어서) — 그건 Redis 락으로 막는다.
+
+    타임아웃 안에 못 끝나면 그냥 포기한다 — 30분 크론이 결국 잡아준다(안전망, 안 없앰).
+    별도 스레드에서 돈다는 게 핵심: 이 함수를 부른 HTTP 요청(admin_be가 승인 직후 던진 호출)은
+    바로 돌아가고, 이 재시도는 그 요청과 무관하게 백그라운드에서 계속된다."""
+    with app.app_context():
+        deadline = time.monotonic() + NAS_GSS_ONDEMAND_TIMEOUT_SEC
+        attempts = 0
+        try:
+            while time.monotonic() < deadline:
+                attempts += 1
+                try:
+                    if reconcile_nas_gss_cache():
+                        app.logger.info(f"[NAS GSS 온디맨드] {attempts}번째 시도에 flush 완료")
+                        return
+                except Exception:
+                    app.logger.exception("[NAS GSS 온디맨드] 재시도 중 예외 — 다음 시도 계속")
+                time.sleep(NAS_GSS_ONDEMAND_POLL_SEC)
+            app.logger.info(
+                f"[NAS GSS 온디맨드] {NAS_GSS_ONDEMAND_TIMEOUT_SEC}초 안에 못 끝남({attempts}번 시도) — "
+                "30분 크론에 맡기고 포기"
+            )
+        finally:
+            release_flush_lock()
+
+
+def trigger_nas_gss_flush_ondemand() -> bool:
+    """승인 직후 admin_be가 부르는 진입점. 락을 얻으면 백그라운드 스레드로 재시도 루프를 띄우고
+    즉시 반환한다(요청을 안 막음) — 락을 못 얻으면(이미 도는 루프가 있으면) 아무것도 안 하고
+    반환한다. 이미 도는 루프가 매번 최신 대장 상태를 다시 읽으므로, 그 루프가 이번에 새로 생긴
+    변경분까지 같이 처리해준다 — 겹쳐 부를 필요가 없다.
+
+    반환값은 "루프를 새로 띄웠는지"일 뿐, flush 성공 여부가 아니다 — 이건 fire-and-forget이다."""
+    if not try_acquire_flush_lock(NAS_GSS_ONDEMAND_LOCK_TTL_SEC):
+        app.logger.info("[NAS GSS 온디맨드] 이미 재시도 루프가 돌고 있어 새로 안 띄움")
+        return False
+    threading.Thread(target=_nas_gss_flush_retry_loop, daemon=True).start()
+    return True
 
 
 if __name__ == "__main__":

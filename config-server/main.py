@@ -1283,6 +1283,28 @@ def register_migrate(body: MigrateRequest):
     return _register_job("migrate", body.request_id, body.username, job)
 
 
+@app.route("/operations/nas-gss-flush", methods=["POST"])
+def trigger_nas_gss_flush():
+    """
+    NAS GSS 캐시 온디맨드 flush 트리거 (#161)
+
+    그룹 변경 승인 직후 admin_be가 부른다. 30분 크론(reconcile_krb5.py)과 같은 조건(NAS
+    winbind가 이미 대장을 따라잡았을 때만)으로 flush하되, 승인 직후부터 짧은 간격으로 최대
+    10분간 재시도한다. 요청은 즉시 202로 끝나고 실제 작업은 백그라운드에서 돈다 — admin_be의
+    승인 트랜잭션을 막지 않기 위함이라, 이 응답은 "재시도를 시작했다/이미 돌고 있다"만 뜻하지
+    flush 성공을 보장하지 않는다(실패해도 30분 크론이 안전망으로 남아있다).
+    ---
+    tags:
+    - Operations
+    responses:
+      202: {description: 재시도 루프를 새로 띄웠거나 이미 돌고 있음}
+    """
+    # main.py를 import하는 reconcile_krb5.py를 순환 임포트 없이 쓰려고 함수 안에서 늦게 불러온다.
+    from reconcile_krb5 import trigger_nas_gss_flush_ondemand
+    started = trigger_nas_gss_flush_ondemand()
+    return jsonify({"status": "accepted", "started_new_loop": started}), 202
+
+
 @app.route("/operations/<kind>/<request_id>", methods=["GET"])
 def get_job_result(kind, request_id):
     """
