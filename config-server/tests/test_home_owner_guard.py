@@ -113,3 +113,20 @@ def test_step_create_home_reports_mismatch_with_own_error_code(monkeypatch, logs
     assert err.value.body["error"] == "HOME_OWNER_MISMATCH"
     assert err.value.body["step"] == "CREATE_HOME_DIRECTORY"
     assert any(r.get("error_code") == "HOME_OWNER_MISMATCH" for r in logs)
+    assert err.value.retry is False, "사람이 uid를 맞춰야 풀리므로 재시도해도 같은 결과 — 재시도 대상이면 안 된다"
+
+
+def test_step_create_home_retries_on_plain_nas_failure(monkeypatch, logs):
+    """소유자 불일치가 아닌 일반 NAS 장애(SSH 끊김 등)는 여전히 재시도 대상이다."""
+    from lifecycle_steps import provision
+
+    def boom(name, uid, gid):
+        raise ConnectionError("nas ssh refused")
+
+    monkeypatch.setattr(main, "create_user_home_directory", boom)
+    monkeypatch.setattr(main, "_rollback_user", lambda name: None)
+    with main.app.app_context():
+        with pytest.raises(main.StepFailed) as err:
+            provision.step_create_home({"request_id": "r1", "name": "yoon6yo", "uid": 21000, "gid": 21000})
+    assert err.value.body["error"] == "NAS_SSH_FAILED"
+    assert err.value.retry is True

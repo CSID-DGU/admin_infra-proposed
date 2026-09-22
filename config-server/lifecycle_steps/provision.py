@@ -1520,7 +1520,10 @@ def step_create_home(ctx):
                       error_code=code, error_detail=str(e))
         _main._rollback_user(name)
         detail = str(e) if mismatch else f"failed to create home directory for {name}"
-        raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", code, detail), 500, cause=e)
+        # 소유자 불일치는 사람이 uid를 맞춰야 풀린다 — 재시도는 같은 결과만 반복하고 DEGRADED로
+        # 넘어가면서 이 error_code를 가린다. retry=False로 한 번 만에 그대로 표면화한다.
+        raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", code, detail), 500,
+                                cause=e, retry=not mismatch)
     _main.log_operation(request_id=request_id, username=name, resource_type="storage",
                   action=Action.CREATE_HOME, phase=Phase.SUCCESS)
 
