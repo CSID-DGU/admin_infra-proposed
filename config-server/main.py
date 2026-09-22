@@ -83,6 +83,11 @@ ADMIN_BE_INTERNAL_URL = os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.de
 # UID/GID 대역 — AD uidNumber와 NAS 홈 소유권은 스택이 달라도 공유되므로 대역이 겹치면 안 된다.
 UID_MIN = int(os.getenv("UID_MIN", "20000"))
 UID_MAX = int(os.getenv("UID_MAX", "0")) or None
+# 공용(팀) 그룹 gid 대역 — 개인 그룹은 gid=uid라 uid 대역을 쓴다. 두 할당기가 같은 대역을 나눠
+# 쓰면 공용 그룹이 다음 uid 번호를 선점해 그 계정의 primary 그룹이 남의 팀 그룹이 된다(#148).
+# 대역을 떼면 충돌이 구조적으로 생기지 않는다. AD·NAS를 스택끼리 공유하므로 여기도 스택별로 나눈다.
+SHARED_GID_MIN = int(os.getenv("SHARED_GID_MIN", "70000"))
+SHARED_GID_MAX = int(os.getenv("SHARED_GID_MAX", "0")) or None
 # 사용자 Pod NodePort 대역 — 클러스터 전체에서 공유되므로 스택끼리 같은 순간 같은 포트를 고르지 않게 나눈다.
 NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
@@ -845,9 +850,12 @@ def add_group(body: AddGroupRequest):
             return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_EXISTS", f"group already exists (name: {name})")), 409
 
         if gid is None:
-            gid = _allocate_next_gid(g_lines, min_gid=UID_MIN)
-            if UID_MAX is not None and gid > UID_MAX:
-                return jsonify(infra_error("ADD_GROUP", "GID_RANGE_EXHAUSTED", f"gid range {UID_MIN}~{UID_MAX} exhausted")), 500
+            gid = _allocate_next_gid(g_lines, min_gid=SHARED_GID_MIN)
+            if SHARED_GID_MAX is not None and gid > SHARED_GID_MAX:
+                return jsonify(infra_error("ADD_GROUP", "GID_RANGE_EXHAUSTED", f"gid range {SHARED_GID_MIN}~{SHARED_GID_MAX} exhausted")), 500
+        elif gid < SHARED_GID_MIN or (SHARED_GID_MAX is not None and gid > SHARED_GID_MAX):
+            # 호출자가 gid를 직접 주는 경로 — 개인 그룹 대역(=uid 대역)을 침범하면 여기서 막는다.
+            return jsonify(infra_error("ADD_GROUP", "GID_OUT_OF_RANGE", f"gid {gid} outside shared gid range {SHARED_GID_MIN}~{SHARED_GID_MAX}")), 400
         elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
             return jsonify(infra_error("ADD_GROUP", "GROUP_GID_EXISTS", f"group already exists (gid: {gid})")), 409
 

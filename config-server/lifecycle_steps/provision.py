@@ -1397,12 +1397,18 @@ def step_create_account(ctx):
             content = f.read()
             g_lines = content.splitlines()
 
-            # primary group
-            primary_exists = any(
-                (_main.parse_group_line(gl) or {}).get("gid") == gid or
-                (_main.parse_group_line(gl) or {}).get("name") == pg_name
-                for gl in g_lines
-            )
+            # primary group — 공용 gid 대역을 떼어낸 뒤로 uid 대역의 group 줄은 이 사용자의 개인
+            # 그룹뿐이다. 이름·gid 중 한쪽만 맞는 줄은 원장이 깨진 것이므로 조용히 재사용하지 않고
+            # 아래 except 의 GROUP_WRITE_FAILED + 롤백 경로로 보낸다(#148).
+            primary_exists = False
+            for gl in g_lines:
+                rec = _main.parse_group_line(gl)
+                if not rec or (rec["gid"] != gid and rec["name"] != pg_name):
+                    continue
+                if rec["gid"] != gid or rec["name"] != pg_name:
+                    raise RuntimeError(
+                        f"primary group conflict: existing {rec['name']}:{rec['gid']} vs {pg_name}:{gid}")
+                primary_exists = True
             if not primary_exists:
                 g_lines.append(_main.format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
 

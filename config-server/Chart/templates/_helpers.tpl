@@ -29,6 +29,10 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   value: "{{ .Values.accounts.uidMin }}"
 - name: UID_MAX
   value: "{{ .Values.accounts.uidMax }}"
+- name: SHARED_GID_MIN
+  value: "{{ .Values.accounts.sharedGidMin }}"
+- name: SHARED_GID_MAX
+  value: "{{ .Values.accounts.sharedGidMax }}"
 - name: ACCOUNT_PREFIX
   value: "{{ .Values.accounts.prefix }}"
 - name: NODEPORT_MIN

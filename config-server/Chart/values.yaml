@@ -58,6 +58,9 @@ infra:
 accounts:
   uidMin: 20000
   uidMax: 0
+  # 공용(팀) 그룹 gid 대역. 개인 그룹은 gid=uid라 uid 대역을 쓰므로 여기와 겹치면 안 된다.
+  sharedGidMin: 70000
+  sharedGidMax: 0
   # 이 접두어로 시작하는 계정만 받는다. 실험 스택 전용, 운영은 비워 둔다.
   prefix: ""
 
