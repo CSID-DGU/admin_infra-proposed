@@ -568,9 +568,15 @@ def finished():
 
 body = wait(finished) or {}
 check("제어기가 작업을 실행함 (끝 상태로 종료)", bool(body), body.get("phase", "시간 초과"))
-check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
-      body.get("phase") == "FAIL" and body.get("error_code") == "USER_CONFIG_NOT_FOUND",
-      f"{body.get('phase')}/{body.get('error_code')}: {body.get('result')}")
+expected = body.get("phase") == "FAIL" and body.get("error_code") == "USER_CONFIG_NOT_FOUND"
+detail = ""
+if not expected:
+    # result(생성 성공 시 자원)는 실패 시 비어 있다 — 어느 단계에서 왜 실패했는지는 단계 기록(재시도 행의
+    # resource_type=단계 이름, error_code)에만 남는다.
+    steps = api.get(f"{base}/operations/provision/{rid}/steps", timeout=10).json()
+    detail = steps.get("jobs", [{}])[0].get("steps") if steps.get("jobs") else steps
+check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)", expected,
+      f"{body.get('phase')}/{body.get('error_code')}: {detail}")
 # 되돌리기는 노드를 모르면 보류한다(ACCOUNT_NODE_UNKNOWN). 이 시험은 노드가 정해지기 전 단계에서
 # 실패하므로 계정은 보류되어 남는 것이 정상이다 — baseline admin_be도 같은 상황에서 삭제하지 않고 알린다.
 check("되돌리기 보류 규칙대로 계정이 남음", account_status() == 200, account_status())
