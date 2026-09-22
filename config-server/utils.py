@@ -802,6 +802,52 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> None:
         _ssh_run(ssh, f"sudo chmod 700 {quoted}")
 
 
+NAS_GSS_FLUSH_COMMAND = "sudo -n /usr/local/sbin/decs-nfs-flush-gss"
+
+
+def nas_shared_gids_for_users(usernames, gid_min: int, gid_max) -> dict:
+    """NAS 가 지금 각 사용자의 보조 그룹으로 보고 있는 공용 대역 gid 들.
+
+    NFS 그룹 판정은 NAS 가 winbind 로 직접 한다(티켓 PAC 은 쓰이지 않는다 — 2026-09-22 실측,
+    #153). 그래서 "NAS 가 아직 모르는가"를 판정할 수 있는 곳도 NAS 뿐이다.
+
+    이름이 AD 에 없으면(레거시 계정 등) `id` 가 실패한다. 그런 사용자는 결과에서 빠지므로
+    호출자가 "모름"과 "그룹 없음"을 구분할 수 있다."""
+    if not usernames:
+        return {}
+    out = {}
+    with _nas_ssh_client() as ssh:
+        # 한 세션 안에서 한 번에 묻는다. 사용자 수만큼 SSH 를 새로 열면 재조정 한 번이 분 단위가 된다.
+        script = "\n".join(
+            'echo "%s|$(id -G %s 2>/dev/null)"' % (u, shlex.quote("FARM\\" + u))
+            for u in sorted(usernames)
+        )
+        _, text = _ssh_capture(ssh, script)
+    for line in text.splitlines():
+        name, _, gids = line.partition("|")
+        gids = gids.strip()
+        if not gids:
+            continue          # id 실패 — AD 에 없는 이름. "그룹 없음"과 구분해 빼 둔다.
+        out[name] = {int(g) for g in gids.split()
+                     if g.isdigit() and gid_min <= int(g) and (gid_max is None or int(g) <= gid_max)}
+    return out
+
+
+def nas_flush_gss_cache() -> None:
+    """NAS 의 GSS 컨텍스트 캐시를 비워 클라이언트가 컨텍스트를 다시 맺게 한다.
+
+    NAS 는 컨텍스트를 맺을 때 그룹 목록을 한 번 풀어 auth.rpcsec.context 에 고정하고,
+    컨텍스트 수명(= 티켓 수명 24h) 동안 다시 조회하지 않는다. 이걸 비우지 않으면 AD 를
+    고쳐도 이미 떠 있는 Pod 에 최대 하루 반영되지 않는다(#153).
+
+    비우는 파일이 0600 root 라 NAS 에 전용 스크립트를 두고 NOPASSWD 로 연다
+    (admin_infra_server kerberos-nfs/script/nas/decs-nfs-flush-gss). chmod 로 잠깐 열었다
+    닫는 우회는 그 사이 NAS 로컬 사용자 누구나 쓸 수 있어 쓰지 않는다."""
+    app.logger.info("[NAS SSH] flushing GSS context cache")
+    with _nas_ssh_client() as ssh:
+        _ssh_run(ssh, NAS_GSS_FLUSH_COMMAND)
+
+
 def delete_user_home_directory(username: str) -> None:
     path = _user_home_path(username)
     app.logger.info(f"[NAS SSH] deleting home dir {path}")
