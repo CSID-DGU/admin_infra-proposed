@@ -88,10 +88,34 @@ def test_does_not_flush_again_without_a_change(ledger, monkeypatch):
 
 def test_removal_also_waits_for_nas(ledger, monkeypatch):
     """회수도 본다 — NAS 가 아직 멤버로 보고 있으면 비우지 않는다.
-    더한 것만 보면 그룹에서 뺀 사용자가 하루 더 접근한다."""
+    더한 것만 보면 그룹에서 뺀 사용자가 하루 더 접근한다.
+
+    그룹 줄은 남고 멤버만 빠지는 것이 실제 회수 모습이다. 그룹 자체를 지우는 API 는
+    없다(POST /groups 와 POST /users/<u>/groups 둘뿐)."""
     write_group, flushes = ledger
-    write_group("alice:x:21000:")                  # teamx 에서 뺐다
-    _nas_says(monkeypatch, {"alice": {70000}})     # NAS 는 아직 멤버로 본다
+    write_group("alice:x:21000:", "teamx:x:70000:")   # teamx 는 남고 alice 만 빠졌다
+    _nas_says(monkeypatch, {"alice": {70000}})        # NAS 는 아직 멤버로 본다
+    with main.app.app_context():
+        rec.reconcile_nas_gss_cache()
+    assert flushes == []
+
+
+def test_ad_group_the_ledger_never_heard_of_does_not_block(ledger, monkeypatch):
+    """AD 에는 config-server 가 만들지 않은 공용 그룹이 있다(과거 수동 samba-tool 작업).
+    그런 그룹 하나 때문에 flush 가 영구히 막히면 안 된다 — 2026-09-22 실운영에서 실제로 걸렸다."""
+    write_group, flushes = ledger
+    write_group("alice:x:21000:", "teamx:x:70000:alice")
+    _nas_says(monkeypatch, {"alice": {70000, 79999}})     # 79999 는 대장에 없는 그룹
+    with main.app.app_context():
+        rec.reconcile_nas_gss_cache()
+    assert flushes == [1]
+
+
+def test_unknown_group_does_not_mask_a_real_lag(ledger, monkeypatch):
+    """모르는 그룹은 무시하되, 진짜 누락은 여전히 잡아야 한다."""
+    write_group, flushes = ledger
+    write_group("alice:x:21000:", "teamx:x:70000:alice")
+    _nas_says(monkeypatch, {"alice": {79999}})            # teamx 없음 + 모르는 그룹만 있음
     with main.app.app_context():
         rec.reconcile_nas_gss_cache()
     assert flushes == []

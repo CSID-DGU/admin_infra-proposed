@@ -92,6 +92,24 @@ def reconcile_krb5_orphans() -> None:
             )
 
 
+def _ledger_shared_gids() -> set:
+    """대장이 아는 공용 그룹 gid 전체. 대조는 이 안에서만 한다.
+
+    AD 에는 config-server 가 만들지 않은 공용 그룹도 있다 — 과거 공용 그룹은 전부 수동
+    samba-tool 로 만들었고 지금도 남아 있다. 그런 그룹에 속한 사용자가 한 명이라도 있으면
+    "완전 일치"를 요구하는 대조가 영원히 어긋나 flush 가 **영구히 막힌다**(2026-09-22 실운영
+    배포에서 실제로 걸렸다). 대장이 모르는 그룹은 우리 관심사가 아니므로 대조에서 뺀다."""
+    gids = set()
+    for line in read_group_lines():
+        g = parse_group_line(line)
+        if not g or g["gid"] < SHARED_GID_MIN:
+            continue
+        if SHARED_GID_MAX is not None and g["gid"] > SHARED_GID_MAX:
+            continue
+        gids.add(g["gid"])
+    return gids
+
+
 def _ledger_shared_gids_by_user() -> dict:
     """계정 대장이 말하는 {사용자: 공용 대역 gid 집합}. 이게 "이래야 하는" 값이다.
 
@@ -136,11 +154,13 @@ def reconcile_nas_gss_cache() -> None:
         return
 
     wanted = _ledger_shared_gids_by_user()
+    known = _ledger_shared_gids()
     try:
         actual = nas_shared_gids_for_users(wanted, SHARED_GID_MIN, SHARED_GID_MAX)
     except Exception as e:
         app.logger.warning(f"[NAS GSS] NAS 그룹 조회 실패(다음 주기 재시도): {e}")
         return
+    actual = {u: gids & known for u, gids in actual.items()}
 
     # 더한 그룹뿐 아니라 뺀 그룹도 본다. 같아야만 비운다 — 한쪽만 보면 회수가 반영되지 않는다.
     stale = {}
