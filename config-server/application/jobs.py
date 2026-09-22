@@ -76,7 +76,7 @@ RERUN_SAFE = {
     "step_cleanup_pod_node_krb5", "step_check_account_revocable",
     "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
-    "step_add_user_groups",
+    "step_add_user_groups", "step_sync_ad_groups",
 }
 
 PRE_STEP = {

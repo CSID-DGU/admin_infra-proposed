@@ -9,6 +9,7 @@
   ``$ref: '#/definitions/<모델 이름>'`` 만 적는다.
 """
 import base64
+import re
 import functools
 from typing import List, Optional
 
@@ -31,6 +32,9 @@ def _request_id(value):
     if not text.isdigit() or int(text) <= 0:
         raise ValueError("request_id는 admin_be 신청 번호(양의 정수)여야 합니다")
     return str(int(text))
+
+
+_VALID_UNIX_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 def _optional_text(value):
@@ -154,6 +158,15 @@ class MigrateRequest(RequestBody):
 
 class AddGroupRequest(RequestBody):
     name: str = Field(min_length=1, examples=["developers"])
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value):
+        # 이 이름은 AD DC 로 가는 SSH 명령 문자열에 그대로 들어가고 sAMAccountName 이 된다.
+        # 원격 스크립트도 같은 규칙으로 막지만, 보내는 쪽에서 먼저 거른다(#146).
+        if not _VALID_UNIX_NAME_RE.match(value):
+            raise ValueError("그룹 이름은 [a-z_]로 시작하는 32자 이하의 소문자·숫자·_·- 여야 합니다")
+        return value
     gid: Optional[int] = Field(default=None, description="생략하면 그룹 파일 기준으로 자동 할당")
     members: List[str] = []
 

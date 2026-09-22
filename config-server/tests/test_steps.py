@@ -46,8 +46,13 @@ def test_wrapped_timeout_is_unknown():
 # ---------- 단계 순서 ----------
 
 def test_step_order_matches_current_flow():
+    # AD 그룹 반영은 반드시 krb5 principal(=AD 사용자 생성) 뒤에 온다 — 그 전에는
+    # 멤버로 넣을 대상이 없다(#146).
     assert [s.__name__ for s in main.ACCOUNT_CREATE_STEPS] == [
-        "step_create_account", "step_create_home", "step_create_krb5_principal"]
+        "step_create_account", "step_create_home", "step_create_krb5_principal",
+        "step_sync_ad_groups"]
+    assert [s.__name__ for s in main.SUPP_GROUPS_ONLY_STEPS] == [
+        "step_add_user_groups", "step_sync_ad_groups"]
     assert [s.__name__ for s in main.POD_CREATE_STEPS] == [
         "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
         "step_create_pod_k8s", "step_wait_ready", "step_create_services"]

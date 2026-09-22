@@ -553,6 +553,11 @@ def _ssh_host_key_options() -> list:
 
 # ---- Kerberos AD helpers ----
 
+# ssh 가 원격 명령이 아니라 자기 문제(연결·인증·호스트 키)로 끝낼 때 쓰는 코드.
+# 그 외의 0 아닌 코드는 원격 명령이 돌려준 값이다.
+SSH_TRANSPORT_ERROR = 255
+
+
 def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
     """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
     그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
@@ -576,10 +581,17 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
             last_error = e
             app.logger.warning(f"[FARM AD SSH] {node['name']} 타임아웃")
             continue
-        if result.returncode != 0:
-            last_error = RuntimeError(f"AD DC SSH 실패 ({node['name']}): {result.stderr.strip()}")
-            app.logger.warning(f"[FARM AD SSH] {node['name']} 실패: {result.stderr.strip()}")
+        if result.returncode == SSH_TRANSPORT_ERROR:
+            # ssh 가 자기 문제(연결·인증·호스트 키)로 실패한 경우다. 이 DC 만의 사정이므로
+            # 다음 DC 로 넘어간다.
+            last_error = RuntimeError(f"AD DC 접속 실패 ({node['name']}): {result.stderr.strip()}")
+            app.logger.warning(f"[FARM AD SSH] {node['name']} 접속 실패: {result.stderr.strip()}")
             continue
+        if result.returncode != 0:
+            # 원격 스크립트가 요청을 평가해서 거절했다. DC 들은 같은 samdb 를 복제하므로
+            # 다른 DC 도 같은 판단을 한다 — 넘어가 봐야 왕복만 늘고, 마지막 DC 의 메시지가
+            # 진짜 이유를 덮어쓴다(#146 에서 실측으로 드러났다). 즉시 실패시킨다.
+            raise RuntimeError(f"AD DC 거절 ({node['name']}): {result.stderr.strip()}")
         return result.stdout
     raise last_error or RuntimeError("모든 AD DC 접속 실패")
 
@@ -614,6 +626,38 @@ def _delete_krb5_principal_and_secret(username: str) -> None:
     except client.exceptions.ApiException as e:
         if e.status != 404:
             raise
+
+
+def _ad_enabled() -> bool:
+    """AD 연동이 꺼진 환경(KRB5_REALM 미설정)에서는 그룹도 AD 에 올리지 않는다."""
+    return bool(app.config.get("KRB5_REALM"))
+
+
+def _create_ad_group(name: str, gid: int) -> None:
+    """공용 그룹을 AD 에 만든다. 홈이 sec=krb5 라 그룹 권한은 NAS 가 AD 를 보고 판정하므로,
+    AD 에 없는 그룹은 파일에만 있고 실제로는 없는 것과 같다(#146). 원격 스크립트가 멱등이라
+    이미 있으면 gid 만 맞춘다."""
+    if not _ad_enabled():
+        return
+    _farm_ad_ssh(f"group-create {name} {int(gid)}")
+
+
+def _add_ad_group_member(groupname: str, username: str) -> None:
+    """AD 그룹에 사용자를 넣는다. 이미 멤버면 아무 일도 하지 않는다.
+
+    주의: 이것만으로는 이미 떠 있는 Pod 에 반영되지 않는다. NAS 는 GSS 컨텍스트를 맺을
+    때 winbind 로 그룹을 풀어 auth.rpcsec.context 에 고정하고, 컨텍스트 수명(= 티켓 수명
+    24h) 동안 다시 보지 않는다. 반영하려면 NAS 에서 그 캐시를 비워야 한다(#153). 티켓
+    PAC 은 쓰이지 않으므로 클라이언트에서 kinit 을 다시 해도 소용없다 — 2026-09-22 실측."""
+    if not _ad_enabled():
+        return
+    _farm_ad_ssh(f"group-addmember {groupname} {username}")
+
+
+def _remove_group_line(name: str) -> None:
+    """그룹 파일에서 한 줄을 지운다. AD 반영 실패 시 방금 쓴 줄을 되돌리는 용도."""
+    write_group_lines([l for l in read_group_lines()
+                       if (parse_group_line(l) or {}).get("name") != name])
 
 
 def _get_farm_node_info(node_name: str) -> dict:
@@ -834,9 +878,14 @@ def add_group(body: AddGroupRequest):
     name, gid, members = body.name, body.gid, body.members
 
     # Validate that all members exist as users
+    passwd_lines = read_passwd_lines()
+    existing_users = {parse_passwd_line(l)["name"] for l in passwd_lines if parse_passwd_line(l)}
+    # AD 에서 사용자와 그룹은 sAMAccountName 을 공유한다 — 같은 이름이면 나중에 계정 생성이
+    # 실패하므로 여기서 막는다(#146).
+    if name in existing_users:
+        return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_CONFLICTS_USER",
+                                   f"group name collides with an existing user: {name}")), 400
     if members:
-        passwd_lines = read_passwd_lines()
-        existing_users = {parse_passwd_line(l)["name"] for l in passwd_lines if parse_passwd_line(l)}
         invalid_members = [m for m in members if m not in existing_users]
         if invalid_members:
             return jsonify(infra_error("ADD_GROUP", "INVALID_GROUP_MEMBER",
@@ -870,6 +919,21 @@ def add_group(body: AddGroupRequest):
         f.seek(0)
         f.write("\n".join(g_lines) + "\n")
         f.truncate()
+
+    # AD 에 올려야 NAS 가 이 그룹을 인정한다(#146). 여기서 실패하면 파일에만 있고 실제로는
+    # 안 먹는 그룹이 남으므로, 방금 쓴 줄을 되돌리고 실패로 답한다.
+    try:
+        _create_ad_group(name, gid)
+        for m in sorted(members):
+            _add_ad_group_member(name, m)
+    except Exception as e:
+        app.logger.exception("[ACCOUNTS] AD 그룹 생성 실패, group 파일 롤백: %s(%s)", name, gid)
+        try:
+            _remove_group_line(name)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
+        return jsonify(infra_error("ADD_GROUP", "AD_GROUP_CREATE_FAILED",
+                                   f"failed to create group in AD: {name}")), 500
 
     return jsonify({"group": {"name": name, "gid": gid}}), 201
 
@@ -944,6 +1008,16 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
     missing = [g for g in groups if g not in existing_group_names]
     if missing:
         return jsonify(infra_error("ADD_USER_GROUPS", "GROUP_NOT_FOUND", f"groups not found: {', '.join(missing)}")), 404
+
+    # AD 를 먼저 맞춘다 — 실패해도 group 파일이 더럽혀지지 않는다. 그룹·사용자 모두 이미
+    # 존재해야 하는 경로라 여기서 만들 것은 없고 멤버십만 더한다(#146).
+    try:
+        for g in sorted(names):
+            _add_ad_group_member(g, username)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] AD 그룹 멤버 추가 실패: %s -> %s", username, sorted(names))
+        return jsonify(infra_error("ADD_USER_GROUPS", "AD_GROUP_MEMBER_FAILED",
+                                   f"failed to add {username} to groups in AD")), 500
 
     write_group_lines(new_lines)
     return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
@@ -1030,7 +1104,7 @@ from lifecycle_steps.provision import (  # noqa: E402
     _resolve_primary_group, _build_user_groups_env, _get_sudo_allowed_commands,
     _build_sudoers_policy, _rollback_user, _allocate_next_uid, _allocate_next_gid,
     step_create_account, step_create_home, step_create_krb5_principal, ACCOUNT_CREATE_STEPS,
-    step_add_user_groups, SUPP_GROUPS_ONLY_STEPS,
+    step_add_user_groups, step_sync_ad_groups, SUPP_GROUPS_ONLY_STEPS,
     account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret,
     LoginPasswordMissing, decode_login_password, login_password_for_recreate)
 from lifecycle_steps.revoke import (  # noqa: E402
