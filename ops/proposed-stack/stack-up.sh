@@ -570,7 +570,7 @@ body = wait(finished) or {}
 check("제어기가 작업을 실행함 (끝 상태로 종료)", bool(body), body.get("phase", "시간 초과"))
 check("사용자 설정 없음으로 실패 (USER_CONFIG_NOT_FOUND)",
       body.get("phase") == "FAIL" and body.get("error_code") == "USER_CONFIG_NOT_FOUND",
-      f"{body.get('phase')}/{body.get('error_code')}")
+      f"{body.get('phase')}/{body.get('error_code')}: {body.get('result')}")
 # 되돌리기는 노드를 모르면 보류한다(ACCOUNT_NODE_UNKNOWN). 이 시험은 노드가 정해지기 전 단계에서
 # 실패하므로 계정은 보류되어 남는 것이 정상이다 — baseline admin_be도 같은 상황에서 삭제하지 않고 알린다.
 check("되돌리기 보류 규칙대로 계정이 남음", account_status() == 200, account_status())
