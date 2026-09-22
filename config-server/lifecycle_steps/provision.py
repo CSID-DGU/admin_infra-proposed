@@ -1142,7 +1142,12 @@ def build_pod_spec(
                                                     # (Pod 설정은 조회 권한만 있으면 누구나 볼 수 있다). Secret은 Pod를
                                                     # 만들기 직전에 ensure_account_secret()이 만든다.
                                                     {"name": "USER_PW", "valueFrom": {"secretKeyRef": {"name": account_secret_name(pod_name), "key": "USER_PW"}}},
-                                                    {"name": "USER_GROUPS", "value": _main._build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
+                                                    # 이미지 entrypoint.sh 의 ensure_supplemental_groups()가 읽는 이름은
+                                                    # DECS_SUPPLEMENTAL_GROUPS 다. USER_GROUPS 로 보내면 아무도 읽지 않아
+                                                    # 보조 그룹이 컨테이너 안에 만들어지지 않는다(#145). 값 형식(콤마 구분
+                                                    # 이름:gid)은 양쪽이 이미 같아 그대로 둔다 — 함수명까지 바꾸면
+                                                    # 재수출·호출부로 변경이 번진다.
+                                                    {"name": "DECS_SUPPLEMENTAL_GROUPS", "value": _main._build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
                                                     *([{"name": "ENABLE_VNC", "value": "true"}] if enable_vnc else []),
                                                     *([
                                                         {"name": "KRB5_REALM",          "value": _main.app.config["KRB5_REALM"]},
@@ -1253,7 +1258,7 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
 def _build_user_groups_env(
     username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
 ) -> str:
-    """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
+    """DECS_SUPPLEMENTAL_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
     entries = [f"{primary_group_name}:{primary_gid}"]
     seen = {primary_gid}
     g_lines = _main.read_group_lines()
