@@ -65,6 +65,22 @@ def test_group_name_must_not_collide_with_a_user(etc, api):
     assert sent == []          # AD 로 나가기 전에 막혀야 한다
 
 
+def test_group_name_reserved_by_the_image_is_rejected(etc, api):
+    """이미지가 이미 가진 이름이면 Pod 가 기동하지 못한다 — 만들기 전에 막는다(#152).
+    group 파일 중복 검사로는 못 잡는다. 시드에 없는 이름이라 409 에 걸리지 않기 때문이다."""
+    seed, sent = etc
+    with main.app.app_context():
+        seeded = _group_names()
+    for bad in ["render", "docker", "_ssh", "nova", "svmanager"]:
+        assert bad not in seeded, f"{bad} 가 시드에 있으면 이 시험이 의미 없다"
+        r = api.post("/groups", json={"name": bad, "gid": 70000})
+        assert r.status_code == 409, bad
+        assert r.get_json()["error"] == "GROUP_NAME_RESERVED", bad
+    assert sent == []          # AD 로 나가기 전에 막혀야 한다
+    with main.app.app_context():
+        assert _group_names() == seeded
+
+
 def test_group_name_charset_is_validated(etc, api):
     seed, sent = etc
     for bad in ["Team X", "team;rm -rf /", "TEAM", "1team"]:
