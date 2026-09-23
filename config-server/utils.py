@@ -291,26 +291,32 @@ echo "__RC=$rc"
 POD_GROUP_SYNC_TIMEOUT_SEC = float(os.getenv("POD_GROUP_SYNC_TIMEOUT_SEC", "15"))
 
 
-def sync_running_pod_groups(username: str, groups: dict) -> dict:
-    """이미 떠 있는 사용자 Pod 의 /etc/group 에 새 보조 그룹을 더한다(admin_infra_server#25).
+# 떠 있는 Pod 의 /etc/group 에서 보조 그룹 멤버십을 뺀다. 이미 빠져 있거나 그룹이 없으면 할 일이 없다.
+# 판정은 /etc/group 의 멤버 목록으로만 한다 — id -nG 는 primary 그룹도 섞여 나온다.
+_POD_GROUP_REMOVE_SCRIPT = r'''
+u="$1"; shift
+rc=0
+for n in "$@"; do
+    members="$(getent group "$n" | cut -d: -f4)"
+    printf '%s\n' "$members" | tr ',' '\n' | grep -qFx "$u" || continue
+    gpasswd -d "$u" "$n" >/dev/null || rc=1
+done
+echo "__RC=$rc"
+'''
 
-    Pod 의 /etc/group 은 기동 시 DECS_SUPPLEMENTAL_GROUPS 로 한 번만 채워지므로, 승인 뒤에도
-    재생성 전까지 새 그룹이 보이지 않는다. 새로 여는 세션부터 반영되고, 이미 떠 있는 프로세스와
-    컨테이너 재시작(Pod 의 env 는 그대로)에는 반영되지 않는다.
 
-    groups: {그룹 이름: gid}. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}.
+def _exec_on_running_pods(username: str, script: str, args: list, tag: str) -> dict:
+    """사용자의 Running Pod 마다 script 를 root 로 실행한다. 인자는 셸 문자열에 끼우지 않고 위치
+    인자로 넘긴다. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}.
     Pod 목록부터 못 읽으면 "대상 Pod 없음"과 구분되도록 "error": "POD_LIST_FAILED" 를 더한다."""
     result = {"synced": [], "failed": []}
-    if not groups:
-        return result
-    specs = [f"{name}:{gid}" for name, gid in sorted(groups.items())]
     namespace = app.config["NAMESPACE"]
     try:
         load_k8s()
         v1 = client.CoreV1Api()
         pods = v1.list_namespaced_pod(namespace=namespace, label_selector=f"username={username}").items
     except Exception:
-        app.logger.exception(f"[POD GROUP SYNC] Pod 목록 조회 실패: user={username}")
+        app.logger.exception(f"[{tag}] Pod 목록 조회 실패: user={username}")
         result["error"] = "POD_LIST_FAILED"
         return result
 
@@ -321,20 +327,44 @@ def sync_running_pod_groups(username: str, groups: dict) -> dict:
         try:
             out = stream(
                 v1.connect_get_namespaced_pod_exec, name, namespace,
-                command=["/bin/sh", "-c", _POD_GROUP_SYNC_SCRIPT, "decs-group-sync", username, *specs],
+                command=["/bin/sh", "-c", script, "decs-group-sync", username, *args],
                 stderr=True, stdin=False, stdout=True, tty=False,
                 _request_timeout=POD_GROUP_SYNC_TIMEOUT_SEC,
             ) or ""
         except Exception:
-            app.logger.exception(f"[POD GROUP SYNC] exec 실패: pod={name}")
+            app.logger.exception(f"[{tag}] exec 실패: pod={name}")
             result["failed"].append(name)
             continue
         if "__RC=0" in out:
             result["synced"].append(name)
         else:
-            app.logger.warning(f"[POD GROUP SYNC] 반영 실패: pod={name} groups={specs} out={out.strip()}")
+            app.logger.warning(f"[{tag}] 반영 실패: pod={name} args={args} out={out.strip()}")
             result["failed"].append(name)
     return result
+
+
+def sync_running_pod_groups(username: str, groups: dict) -> dict:
+    """이미 떠 있는 사용자 Pod 의 /etc/group 에 새 보조 그룹을 더한다(admin_infra_server#25).
+
+    Pod 의 /etc/group 은 기동 시 DECS_SUPPLEMENTAL_GROUPS 로 한 번만 채워지므로, 승인 뒤에도
+    재생성 전까지 새 그룹이 보이지 않는다. 새로 여는 세션부터 반영되고, 이미 떠 있는 프로세스와
+    컨테이너 재시작(Pod 의 env 는 그대로)에는 반영되지 않는다.
+
+    groups: {그룹 이름: gid}. 반환은 _exec_on_running_pods 와 같다."""
+    if not groups:
+        return {"synced": [], "failed": []}
+    specs = [f"{name}:{gid}" for name, gid in sorted(groups.items())]
+    return _exec_on_running_pods(username, _POD_GROUP_SYNC_SCRIPT, specs, "POD GROUP SYNC")
+
+
+def remove_running_pod_groups(username: str, groups: list) -> dict:
+    """이미 떠 있는 사용자 Pod 의 /etc/group 에서 보조 그룹 멤버십을 뺀다. 권한 판정은 NAS 가 AD 로
+    하므로 이것은 id·ls 표시와 ~/shared 링크 정리(다음 로그인 때)를 맞추는 용도다.
+
+    groups: 그룹 이름 목록. 반환은 _exec_on_running_pods 와 같다."""
+    if not groups:
+        return {"synced": [], "failed": []}
+    return _exec_on_running_pods(username, _POD_GROUP_REMOVE_SCRIPT, sorted(groups), "POD GROUP REMOVE")
 
 def generate_pod_name(username: str) -> str:
     suffix = uuid.uuid4().hex[:8]

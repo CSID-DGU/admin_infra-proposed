@@ -23,7 +23,7 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
-from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
+from request_models import (is_valid_unix_name, validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
@@ -54,6 +54,7 @@ from utils import (
     create_team_directory,
     TeamDirGroupMismatch,
     sync_running_pod_groups,
+    remove_running_pod_groups,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
@@ -657,6 +658,14 @@ def _add_ad_group_member(groupname: str, username: str) -> None:
     _farm_ad_ssh(f"group-addmember {groupname} {username}")
 
 
+def _remove_ad_group_member(groupname: str, username: str) -> None:
+    """AD 그룹에서 사용자를 뺀다. 이미 빠져 있으면 아무 일도 하지 않는다. 떠 있는 Pod 에 반영되는
+    시점은 _add_ad_group_member 와 같다 — NAS 캐시를 비워야 한다."""
+    if not _ad_enabled():
+        return
+    _farm_ad_ssh(f"group-removemember {groupname} {username}")
+
+
 def _ensure_team_dir(name: str, gid: int) -> None:
     """팀 공유 디렉터리를 만든다(#154). NAS 가 AD 그룹으로 권한을 판정하므로 AD 연동이
     꺼진 환경에서는 만들어도 팀에게 열리지 않는다 — 그룹 동기화와 같은 조건으로 건너뛴다."""
@@ -1088,6 +1097,80 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
     # 실패해도 요청은 성공으로 둔다.
     pods = sync_running_pod_groups(username, {g: gids[g] for g in names})
     return jsonify({"status": "updated", "user": username, "groups": sorted(list(names)), "pods": pods})
+
+# ----------- Remove user from a supplementary group -----------
+@accounts_bp.route("/users/<username>/groups/<groupname>", methods=["DELETE"])
+def remove_user_group(username: str, groupname: str):
+    """
+    사용자 보조 그룹 제거 API
+
+    사용자를 공용 그룹에서 뺍니다. 이미 빠져 있어도 성공입니다. 팀 디렉터리와 그 안의 파일은
+    건드리지 않습니다.
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 사용자 그룹 제거
+
+    parameters:
+
+      - in: path
+        name: username
+        required: true
+        type: string
+        example: user2100
+      - in: path
+        name: groupname
+        required: true
+        type: string
+        example: developers
+
+    responses:
+
+      200:
+        description: 제거 성공(이미 빠져 있던 경우 포함)
+      400:
+        description: 이름 형식 오류
+      404:
+        description: 그룹 없음
+      409:
+        description: 사용자의 primary 그룹
+      500:
+        description: AD 반영 실패
+    """
+    # 두 이름 모두 AD DC 로 가는 SSH 명령 문자열에 그대로 들어간다(#146).
+    for value in (username, groupname):
+        if not is_valid_unix_name(value):
+            return jsonify(infra_error("REMOVE_USER_GROUP", "INVALID_NAME", f"invalid name: {value}")), 400
+
+    g_lines = read_group_lines()
+    group = next((r for gl in g_lines if (r := parse_group_line(gl)) and r["name"] == groupname), None)
+    if not group:
+        return jsonify(infra_error("REMOVE_USER_GROUP", "GROUP_NOT_FOUND", f"group not found: {groupname}")), 404
+
+    # 회수된 계정은 passwd 에 없을 수 있다 — 그때도 남은 멤버십을 치울 수 있게 거부하지 않는다.
+    user = next((r for pl in read_passwd_lines() if (r := parse_passwd_line(pl)) and r["name"] == username), None)
+    if user and user["gid"] == group["gid"]:
+        return jsonify(infra_error("REMOVE_USER_GROUP", "PRIMARY_GROUP",
+                                   f"{groupname} is the primary group of {username}")), 409
+
+    # 추가와 같은 순서 — AD 가 실패하면 group 파일은 그대로 두어 재시도가 같은 상태에서 시작한다.
+    try:
+        _remove_ad_group_member(groupname, username)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] AD 그룹 멤버 제거 실패: %s -> %s", username, groupname)
+        return jsonify(infra_error("REMOVE_USER_GROUP", "AD_GROUP_MEMBER_FAILED",
+                                   f"failed to remove {username} from {groupname} in AD")), 500
+
+    members = [m for m in group.get("members", []) if m != username]
+    if members != group.get("members", []):
+        group["members"] = members
+        write_group_lines([format_group_entry(group) if (r := parse_group_line(gl)) and r["name"] == groupname else gl
+                           for gl in g_lines])
+
+    pods = remove_running_pod_groups(username, [groupname])
+    return jsonify({"status": "removed", "user": username, "group": groupname, "pods": pods})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)

@@ -18,6 +18,15 @@ def pod_group_sync(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def pod_group_remove(monkeypatch):
+    """pod_group_sync 와 같은 이유로 제거 쪽 exec 도 막는다. 반환: (username, [그룹]) 호출 목록"""
+    calls = []
+    monkeypatch.setattr(main, "remove_running_pod_groups",
+                        lambda u, g: calls.append((u, g)) or {"synced": [], "failed": []})
+    return calls
+
+
 @pytest.fixture
 def logs(monkeypatch):
     """log_operation 호출을 DB 대신 목록에 모은다."""

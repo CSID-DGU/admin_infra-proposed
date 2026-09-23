@@ -37,6 +37,11 @@ def _request_id(value):
 _VALID_UNIX_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
+def is_valid_unix_name(value: str) -> bool:
+    """본문이 아닌 경로로 받은 사용자·그룹 이름을 같은 규칙으로 거를 때 쓴다."""
+    return bool(_VALID_UNIX_NAME_RE.match(value))
+
+
 def _optional_text(value):
     return None if value is None or value == "" else str(value)
 
