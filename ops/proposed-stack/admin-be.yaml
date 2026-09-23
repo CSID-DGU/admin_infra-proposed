@@ -150,6 +150,18 @@ spec:
           port: 587
         - protocol: TCP
           port: 465
+    # 리소스 모니터링 화면의 GPU·컨테이너 지표(/api/monitoring/metrics). 읽기 전용 조회라 실험 스택에도 연다 —
+    # 막혀 있으면 백엔드가 빈 목록을 돌려주고 화면은 "GPU 데이터를 수신하지 못했어요"만 띄운다(admin_fe#169).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
     # 쿠버네티스 API(관리자 화면의 Pod 조회). 주소는 설치 스크립트가 클러스터에서 읽어 넣는다 — 서비스
     # 주소로 들어간 연결은 실제 API 서버 주소로 바뀐 뒤 정책에 걸리므로 둘 다 넣는다.
 __API_EGRESS__

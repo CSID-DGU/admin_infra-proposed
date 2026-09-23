@@ -345,9 +345,12 @@ PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpat
 SINK=http://127.0.0.1:9/
 SLACK_OVERRIDE=",\"slack-webhook-url\":{\"error-log\":\"$SINK\",\"noti\":\"$SINK\",\"farm-admin\":\"$SINK\",\"lab-admin\":\"$SINK\"},\"slack\":{\"bot-token\":\"disabled\"}"
 [ "$STACK" = "operation" ] && SLACK_OVERRIDE=""
+# 모니터링 지표는 클러스터 공용 Prometheus를 읽기만 하므로 모든 스택이 같은 곳을 본다. 예전엔 닿지 않는
+# 주소로 돌려 두어 리소스 모니터링 화면이 늘 비어 있었다(admin_fe#169). 연결은 admin-be.yaml 정책이 연다.
+PROMETHEUS_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE,"prometheus":{"base-url":"http://127.0.0.1:9"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
