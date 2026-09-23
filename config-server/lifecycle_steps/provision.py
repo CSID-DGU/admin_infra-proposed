@@ -1669,7 +1669,25 @@ ACCOUNT_CREATE_STEPS = [
     step_sync_ad_groups,
 ]
 
+def step_trigger_nas_gss_flush(ctx):
+    """재사용 계정에 그룹을 더했으면 NAS GSS 캐시 온디맨드 flush 를 띄운다(#181).
+
+    기존 계정은 이미 NAS 와 GSS 컨텍스트를 맺고 있어 옛 그룹 목록이 굳어 있다 — 비우지 않으면
+    30분 크론이 돌 때까지 새 그룹 디렉터리가 막힌다. 변경 요청 승인은 admin_be 가 직접 부르지만
+    (#161) 이 경로는 AD 가 작업 안에서 바뀌므로 바꾼 쪽이 부른다.
+
+    flush 는 부가 효과다 — 실패해도 30분 크론이 잡으므로 작업을 실패시키지 않는다."""
+    if not ctx.get("supp_groups") or not _main._ad_enabled():
+        return
+    try:
+        # reconcile_krb5 는 main 을 import 한다 — 순환을 피하려고 늦게 불러온다.
+        from reconcile_krb5 import trigger_nas_gss_flush_ondemand
+        trigger_nas_gss_flush_ondemand()
+    except Exception:
+        _main.app.logger.exception("[NAS GSS 온디맨드] 재사용 계정 그룹 추가 후 트리거 실패 — 30분 크론에 맡김")
+
 SUPP_GROUPS_ONLY_STEPS = [
     step_add_user_groups,
     step_sync_ad_groups,
+    step_trigger_nas_gss_flush,
 ]

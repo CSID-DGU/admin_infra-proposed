@@ -269,6 +269,47 @@ def test_step_runs_after_the_ad_user_exists(etc):
     assert names.index("step_sync_ad_groups") > names.index("step_create_krb5_principal")
 
 
+# ---------- step_trigger_nas_gss_flush (#181) ----------
+
+@pytest.fixture
+def flush_calls(monkeypatch):
+    import reconcile_krb5
+    calls = []
+    monkeypatch.setattr(reconcile_krb5, "trigger_nas_gss_flush_ondemand", lambda: calls.append(1) or True)
+    return calls
+
+
+def test_reuse_path_triggers_nas_flush_after_ad_sync(etc, flush_calls):
+    """재사용 계정은 NAS 에 옛 그룹 목록이 굳어 있다 — AD 를 바꾼 뒤 비워야 새 팀 디렉터리가 열린다."""
+    names = [s.__name__ for s in main.SUPP_GROUPS_ONLY_STEPS]
+    assert names.index("step_trigger_nas_gss_flush") > names.index("step_sync_ad_groups")
+    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
+    with main.app.app_context():
+        provision.step_trigger_nas_gss_flush(ctx)
+    assert flush_calls == [1]
+
+
+def test_nas_flush_is_skipped_without_groups_or_ad(etc, monkeypatch, flush_calls):
+    with main.app.app_context():
+        provision.step_trigger_nas_gss_flush({"request_id": "r1", "name": "alice", "supp_groups": []})
+        monkeypatch.setitem(main.app.config, "KRB5_REALM", "")
+        provision.step_trigger_nas_gss_flush(
+            {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]})
+    assert flush_calls == []
+
+
+def test_nas_flush_trigger_failure_does_not_fail_the_job(etc, monkeypatch):
+    """flush 는 부가 효과다 — 30분 크론이 안전망이라 작업을 실패시키면 안 된다."""
+    import reconcile_krb5
+
+    def boom():
+        raise RuntimeError("redis down")
+    monkeypatch.setattr(reconcile_krb5, "trigger_nas_gss_flush_ondemand", boom)
+    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
+    with main.app.app_context():
+        provision.step_trigger_nas_gss_flush(ctx)
+
+
 def test_new_group_with_members_adds_them_in_ad(etc, api):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"])
