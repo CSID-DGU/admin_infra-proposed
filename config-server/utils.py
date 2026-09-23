@@ -298,7 +298,8 @@ def sync_running_pod_groups(username: str, groups: dict) -> dict:
     재생성 전까지 새 그룹이 보이지 않는다. 새로 여는 세션부터 반영되고, 이미 떠 있는 프로세스와
     컨테이너 재시작(Pod 의 env 는 그대로)에는 반영되지 않는다.
 
-    groups: {그룹 이름: gid}. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}"""
+    groups: {그룹 이름: gid}. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}.
+    Pod 목록부터 못 읽으면 "대상 Pod 없음"과 구분되도록 "error": "POD_LIST_FAILED" 를 더한다."""
     result = {"synced": [], "failed": []}
     if not groups:
         return result
@@ -310,6 +311,7 @@ def sync_running_pod_groups(username: str, groups: dict) -> dict:
         pods = v1.list_namespaced_pod(namespace=namespace, label_selector=f"username={username}").items
     except Exception:
         app.logger.exception(f"[POD GROUP SYNC] Pod 목록 조회 실패: user={username}")
+        result["error"] = "POD_LIST_FAILED"
         return result
 
     for pod in pods:

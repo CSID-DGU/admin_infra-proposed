@@ -63,10 +63,15 @@ def test_one_pod_failing_does_not_stop_the_others(k8s):
     assert _sync({"teamx": 70000}) == {"synced": ["p3"], "failed": ["p1", "p2"]}
 
 
-def test_listing_failure_is_swallowed(k8s, monkeypatch):
+def test_listing_failure_is_reported_not_raised(k8s, monkeypatch):
+    """"떠 있는 Pod 없음"과 구분돼야 한다 — 둘 다 빈 목록이면 반영 누락을 알아챌 수 없다."""
     def boom():
         raise RuntimeError("kubeconfig 없음")
     monkeypatch.setattr(utils, "load_k8s", boom)
+    assert _sync({"teamx": 70000}) == {"synced": [], "failed": [], "error": "POD_LIST_FAILED"}
+
+
+def test_no_running_pods_has_no_error(k8s):
     assert _sync({"teamx": 70000}) == {"synced": [], "failed": []}
 
 
