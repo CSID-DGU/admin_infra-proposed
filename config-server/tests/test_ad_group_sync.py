@@ -242,6 +242,82 @@ def test_ad_failure_leaves_the_group_file_untouched(etc, api, monkeypatch):
         assert main.parse_group_line(line)["members"] == []
 
 
+# ---------- DELETE /users/<username>/groups/<groupname> ----------
+
+def _members(name):
+    line = [l for l in main.read_group_lines() if l.startswith(f"{name}:")][0]
+    return main.parse_group_line(line)["members"]
+
+
+def test_removing_user_from_group_goes_to_ad_then_file_then_pods(etc, api, pod_group_remove):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:alice,bob"])
+    r = api.delete("/users/alice/groups/teamx")
+    assert r.status_code == 200
+    assert sent == ["group-removemember teamx alice"]
+    assert _members("teamx") == ["bob"]
+    assert pod_group_remove == [("alice", ["teamx"])]
+
+
+def test_removing_a_non_member_still_clears_ad(etc, api):
+    """파일과 AD 가 어긋나 있을 수 있다 — 파일에 없어도 AD 쪽은 확실히 비운다."""
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:bob"])
+    assert api.delete("/users/alice/groups/teamx").status_code == 200
+    assert sent == ["group-removemember teamx alice"]
+    assert _members("teamx") == ["bob"]
+
+
+def test_revoked_account_membership_can_still_be_removed(etc, api):
+    seed, sent = etc
+    seed(group=["teamx:x:70000:alice"])
+    assert api.delete("/users/alice/groups/teamx").status_code == 200
+    assert _members("teamx") == []
+
+
+def test_primary_group_is_refused(etc, api):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:70000::/home/alice:/bin/bash"], group=["teamx:x:70000:"])
+    r = api.delete("/users/alice/groups/teamx")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "PRIMARY_GROUP"
+    assert sent == []
+
+
+def test_unknown_group_is_not_found(etc, api):
+    seed, sent = etc
+    r = api.delete("/users/alice/groups/nope")
+    assert r.status_code == 404
+    assert r.get_json()["error"] == "GROUP_NOT_FOUND"
+    assert sent == []
+
+
+@pytest.mark.parametrize("path", ["/users/Alice/groups/teamx", "/users/alice/groups/team%20x"])
+def test_names_outside_unix_rules_never_reach_ad(etc, api, path):
+    seed, sent = etc
+    seed(group=["teamx:x:70000:alice"])
+    r = api.delete(path)
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "INVALID_NAME"
+    assert sent == []
+
+
+def test_ad_failure_on_remove_leaves_the_group_file_untouched(etc, api, monkeypatch, pod_group_remove):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"], group=["teamx:x:70000:alice"])
+
+    def boom(cmd, stdin_data=""):
+        raise RuntimeError("AD DC 접속 실패")
+    monkeypatch.setattr(main, "_farm_ad_ssh", boom)
+    r = api.delete("/users/alice/groups/teamx")
+    assert r.status_code == 500
+    assert r.get_json()["error"] == "AD_GROUP_MEMBER_FAILED"
+    assert _members("teamx") == ["alice"]
+    assert pod_group_remove == []
+
+
 # ---------- step_sync_ad_groups ----------
 
 def test_step_creates_group_then_adds_member(etc, logs):

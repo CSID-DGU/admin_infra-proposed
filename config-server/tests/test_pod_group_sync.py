@@ -134,3 +134,60 @@ def test_script_does_not_evaluate_names(fake_bin, tmp_path):
     marker = tmp_path / "pwned"
     _run_script("alice", f"x$(touch {marker}):70000")
     assert not marker.exists()
+
+
+# ---------- 제거: remove_running_pod_groups ----------
+
+def test_remove_runs_the_remove_script_with_names_as_arguments(k8s):
+    pods, outputs, execs = k8s
+    pods += [_pod("p1"), _pod("p2", "Succeeded")]
+    with main.app.app_context():
+        assert utils.remove_running_pod_groups("alice", ["teamy", "teamx"]) == {"synced": ["p1"], "failed": []}
+    name, command = execs[0]
+    assert command[2] == utils._POD_GROUP_REMOVE_SCRIPT
+    assert command[4:] == ["alice", "teamx", "teamy"]
+
+
+def test_remove_nothing_to_do_without_groups(k8s):
+    pods, outputs, execs = k8s
+    pods.append(_pod("p1"))
+    with main.app.app_context():
+        assert utils.remove_running_pod_groups("alice", []) == {"synced": [], "failed": []}
+    assert execs == []
+
+
+@pytest.fixture
+def fake_gpasswd(tmp_path, monkeypatch):
+    db, calls = tmp_path / "group.db", tmp_path / "calls"
+    calls.write_text("")
+    bin_dir = tmp_path / "gbin"
+    bin_dir.mkdir()
+    for name, body in {
+        "getent": f'grep "^$2:" {db} || true',
+        "gpasswd": f'echo "gpasswd $*" >> {calls}',
+    }.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    return db, calls
+
+
+def _run_remove(*args):
+    return subprocess.run(["/bin/sh", "-c", utils._POD_GROUP_REMOVE_SCRIPT, "decs-group-sync", *args],
+                          capture_output=True, text=True).stdout
+
+
+def test_remove_script_only_touches_groups_the_user_is_listed_in(fake_gpasswd):
+    db, calls = fake_gpasswd
+    db.write_text("teamx:x:70000:bob,alice\nteamy:x:70001:alice2\n")
+    out = _run_remove("alice", "teamx", "teamy", "missing")
+    assert "__RC=0" in out
+    assert calls.read_text().splitlines() == ["gpasswd -d alice teamx"]
+
+
+def test_remove_script_does_not_evaluate_names(fake_gpasswd, tmp_path):
+    db, calls = fake_gpasswd
+    db.write_text("")
+    marker = tmp_path / "pwned"
+    _run_remove("alice", f"x$(touch {marker})")
+    assert not marker.exists()
