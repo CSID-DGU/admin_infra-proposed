@@ -53,6 +53,7 @@ from utils import (
     HomeOwnerMismatch,
     create_team_directory,
     TeamDirGroupMismatch,
+    sync_running_pod_groups,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
@@ -1081,7 +1082,12 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
                                    f"failed to create team directories: {', '.join(sorted(names))}")), 500
 
     write_group_lines(new_lines)
-    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
+
+    # 이미 떠 있는 Pod 는 기동 때 구운 /etc/group 을 그대로 쓴다 — 여기서 채워야 재생성 없이
+    # 새 세션부터 그룹이 보인다(admin_infra_server#25). 권한 원천(AD)은 이미 반영됐으므로
+    # 실패해도 요청은 성공으로 둔다.
+    pods = sync_running_pod_groups(username, {g: gids[g] for g in names})
+    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names)), "pods": pods})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)

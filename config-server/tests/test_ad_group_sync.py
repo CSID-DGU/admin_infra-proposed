@@ -359,3 +359,39 @@ def test_remote_rejection_stops_immediately_and_keeps_the_real_reason(monkeypatc
     assert len(seen) == 1                                  # farm6 으로 넘어가지 않았다
     assert "refusing to change gidNumber" in str(e.value)  # 진짜 이유가 남았다
     assert "farm2" in str(e.value)
+
+
+# ---------- 떠 있는 Pod 의 /etc/group (admin_infra_server#25) ----------
+
+def test_adding_user_to_group_syncs_running_pods(etc, api, pod_group_sync):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:", "teamy:x:70001:"])
+    r = api.post("/users/alice/groups", json={"groups": ["teamx", "teamy"]})
+    assert r.status_code == 200
+    assert pod_group_sync == [("alice", {"teamx": 70000, "teamy": 70001})]
+    assert r.get_json()["pods"] == {"synced": [], "failed": []}
+
+
+def test_pod_sync_failure_does_not_fail_the_request(etc, api, monkeypatch):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:"])
+    monkeypatch.setattr(main, "sync_running_pod_groups",
+                        lambda u, g: {"synced": [], "failed": ["ailab-alice-1"]})
+    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
+    assert r.status_code == 200
+    assert "alice" in next(l for l in main.read_group_lines() if l.startswith("teamx:"))
+    assert r.get_json()["pods"]["failed"] == ["ailab-alice-1"]
+
+
+def test_no_pod_sync_when_ad_rejects(etc, api, monkeypatch, pod_group_sync):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:"])
+
+    def boom(cmd, stdin_data=""):
+        raise RuntimeError("AD DC 접속 실패")
+    monkeypatch.setattr(main, "_farm_ad_ssh", boom)
+    assert api.post("/users/alice/groups", json={"groups": ["teamx"]}).status_code == 500
+    assert pod_group_sync == []
