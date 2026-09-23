@@ -189,6 +189,44 @@ def test_adding_user_to_group_goes_to_ad(etc, api):
     assert sent == ["group-addmember teamx alice"]
 
 
+def test_adding_user_to_older_group_fills_in_its_team_directory(etc, api, team_dirs):
+    """승인은 신규·재사용 계정 모두 이 경로를 탄다 — 디렉터리가 없던 옛 그룹도 여기서 채운다."""
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:"])
+    assert api.post("/users/alice/groups", json={"groups": ["teamx"]}).status_code == 200
+    assert team_dirs == [("teamx", 70000)]
+
+
+def test_team_dir_failure_on_member_add_leaves_the_group_file_untouched(etc, api, monkeypatch):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:"])
+
+    def boom(name, gid):
+        raise RuntimeError("NAS SSH 실패")
+    monkeypatch.setattr(main, "create_team_directory", boom)
+    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
+    assert r.status_code == 500
+    assert r.get_json()["error"] == "TEAM_DIR_CREATE_FAILED"
+    with main.app.app_context():
+        line = [l for l in main.read_group_lines() if l.startswith("teamx:")][0]
+        assert main.parse_group_line(line)["members"] == []
+
+
+def test_team_dir_mismatch_on_member_add_is_a_conflict(etc, api, monkeypatch):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
+         group=["alice:x:21000:", "teamx:x:70000:"])
+
+    def mismatch(name, gid):
+        raise main.TeamDirGroupMismatch("이미 gid 70001 소유")
+    monkeypatch.setattr(main, "create_team_directory", mismatch)
+    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "TEAM_DIR_GROUP_MISMATCH"
+
+
 def test_ad_failure_leaves_the_group_file_untouched(etc, api, monkeypatch):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
