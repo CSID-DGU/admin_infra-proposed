@@ -5,6 +5,14 @@ import main
 from lifecycle_steps import provision
 
 
+@pytest.fixture(autouse=True)
+def team_dirs(monkeypatch):
+    """NAS 에 팀 디렉터리를 만드는 호출을 가로챈다. 반환: 만든 (이름, gid) 목록"""
+    made = []
+    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: made.append((name, gid)))
+    return made
+
+
 @pytest.fixture
 def etc(tmp_path, monkeypatch):
     """계정 원장을 임시 파일로 돌리고 AD 호출을 가로챈다.
@@ -87,6 +95,57 @@ def test_group_name_charset_is_validated(etc, api):
         r = api.post("/groups", json={"name": bad, "gid": 70000})
         assert r.status_code == 400, bad
     assert sent == []
+
+
+# ---------- 팀 공유 디렉터리 (#154) ----------
+
+def test_new_group_gets_a_team_directory(etc, api, team_dirs):
+    seed, sent = etc
+    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
+    assert r.status_code == 201
+    assert team_dirs == [("teamx", 70000)]
+
+
+def test_team_directory_is_made_after_the_ad_group(etc, api, monkeypatch):
+    """NAS 는 AD 그룹을 보고 판정한다. AD 에 없으면 chown 할 gid 도 NAS 가 모른다."""
+    seed, sent = etc
+    order = []
+    monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": order.append("ad") or "")
+    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: order.append("dir"))
+    api.post("/groups", json={"name": "teamx", "gid": 70000})
+    assert order == ["ad", "dir"]
+
+
+def test_team_directory_failure_rolls_back_the_group_file(etc, api, monkeypatch):
+    seed, sent = etc
+
+    def boom(name, gid):
+        raise RuntimeError("NAS SSH 실패")
+    monkeypatch.setattr(main, "create_team_directory", boom)
+    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
+    assert r.status_code == 500
+    assert r.get_json()["error"] == "TEAM_DIR_CREATE_FAILED"
+    with main.app.app_context():
+        assert "teamx" not in _group_names()
+    # 같은 요청을 다시 보내면 끝까지 간다 — AD 그룹 생성은 멱등이다
+    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: None)
+    assert api.post("/groups", json={"name": "teamx", "gid": 70000}).status_code == 201
+
+
+def test_no_team_directory_when_ad_is_disabled(etc, api, monkeypatch, team_dirs):
+    seed, sent = etc
+    monkeypatch.setitem(main.app.config, "KRB5_REALM", "")
+    assert api.post("/groups", json={"name": "teamx", "gid": 70000}).status_code == 201
+    assert team_dirs == []
+
+
+def test_step_fills_in_team_directory_for_older_groups(etc, team_dirs):
+    """이 변경 전에 만든 그룹은 디렉터리가 없다 — 멤버가 들어오는 프로비저닝에서 채운다."""
+    seed, sent = etc
+    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
+    with main.app.app_context():
+        provision.step_sync_ad_groups(ctx)
+    assert team_dirs == [("teamx", 70000)]
 
 
 # ---------- POST /users/<username>/groups ----------

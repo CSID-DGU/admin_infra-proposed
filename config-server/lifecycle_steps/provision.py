@@ -1646,6 +1646,8 @@ def step_sync_ad_groups(ctx):
         for sg in supp_groups:
             _main._create_ad_group(sg["name"], int(sg["gid"]))
             _main._add_ad_group_member(sg["name"], name)
+            # 이 변경 전에 만든 그룹은 디렉터리가 없다. 멤버가 들어올 때 채워 둔다(#154).
+            _main._ensure_team_dir(sg["name"], int(sg["gid"]))
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 반영 실패: user=%s", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="groups",

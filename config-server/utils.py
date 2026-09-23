@@ -761,13 +761,52 @@ class HomeOwnerMismatch(RuntimeError):
     """이미 있는 홈의 소유자가 배정하려는 uid 와 달라서 덮어쓰지 않고 멈춘 경우."""
 
 
+TEAM_DIR_PREFIX = "_g_"
+
+
 def _user_home_path(username: str) -> str:
     """홈 경로를 만들기 전에 이름부터 검증한다. 이 경로는 원격 셸 명령에 그대로 들어가고 그중 하나는
     되돌릴 수 없는 삭제다 — 이름에 공백이나 셸 특수문자가 섞이면 의도하지 않은 대상을 지울 수 있다.
     이름은 admin_be가 만들고 내부 토큰으로 보호되지만, 지우는 쪽에 방어를 두는 편이 맞다."""
     if not _VALID_USERNAME_RE.match(username):
         raise ValueError(f"invalid username for home directory: {username!r}")
+    # 팀 디렉터리와 같은 자리에 놓이므로 이 접두어는 홈으로 쓰지 않는다 — 지우는 경로가 팀 데이터를 지운다.
+    if username.startswith(TEAM_DIR_PREFIX):
+        raise ValueError(f"username uses the reserved team directory prefix: {username!r}")
     return f"{os.environ['NFS_USER_SHARE_PATH']}/{username}"
+
+
+def team_dir_path(group_name: str) -> str:
+    if not _VALID_USERNAME_RE.match(group_name):
+        raise ValueError(f"invalid group name for team directory: {group_name!r}")
+    return f"{os.environ['NFS_USER_SHARE_PATH']}/{TEAM_DIR_PREFIX}{group_name}"
+
+
+class TeamDirGroupMismatch(RuntimeError):
+    """이미 있는 팀 디렉터리의 그룹이 배정하려는 gid 와 달라서 덮어쓰지 않고 멈춘 경우."""
+
+
+def create_team_directory(group_name: str, gid: int) -> None:
+    """팀 공유 디렉터리(/home/_g_<팀>)를 root:<gid> 2770 으로 만든다. 여러 번 불러도 같다.
+
+    user-share 전체가 Pod 의 /home 에 마운트되므로 Pod 쪽은 바꿀 것이 없다. setgid 비트가
+    새 파일의 그룹을 팀으로 고정하고, 로그인 umask 002 가 그룹 쓰기를 남긴다 — 사용자가
+    chgrp 할 일이 없다(#154). other 는 막는다. 팀 밖 사용자가 읽을 이유가 없다.
+
+    이미 있는 디렉터리의 그룹이 다르면 다른 팀의 데이터일 수 있어 건드리지 않는다."""
+    path = team_dir_path(group_name)
+    quoted = shlex.quote(path)
+    app.logger.info(f"[NAS SSH] ensuring team dir {path} gid={gid}")
+    with _nas_ssh_client() as ssh:
+        code, current = _ssh_capture(ssh, f"stat -c %g {quoted}")
+        if code == 0 and current.isdigit() and int(current) != int(gid):
+            raise TeamDirGroupMismatch(
+                f"팀 디렉터리 {path} 가 이미 gid {current} 소유인데 {gid} 로 배정하려 했습니다. "
+                f"다른 팀의 데이터일 수 있어 덮어쓰지 않습니다. NAS 에서 소유 그룹을 확인하십시오."
+            )
+        _ssh_run(ssh, f"sudo mkdir -p {quoted}")
+        _ssh_run(ssh, f"sudo chown 0:{int(gid)} {quoted}")
+        _ssh_run(ssh, f"sudo chmod 2770 {quoted}")
 
 
 def create_user_home_directory(username: str, uid: int, gid: int) -> None:
