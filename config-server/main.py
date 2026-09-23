@@ -1066,6 +1066,20 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
         return jsonify(infra_error("ADD_USER_GROUPS", "AD_GROUP_MEMBER_FAILED",
                                    f"failed to add {username} to groups in AD")), 500
 
+    # 신청 승인은 신규·재사용 계정 모두 이 경로로 그룹을 더한다. 팀 디렉터리가 생기기 전에
+    # 만든 그룹도 여기서 채워야 멤버가 같이 쓸 자리가 생긴다(#154). 멱등이라 매번 불러도 된다.
+    gids = {r["name"]: r["gid"] for gl in g_lines if (r := parse_group_line(gl))}
+    try:
+        for g in sorted(names):
+            _ensure_team_dir(g, gids[g])
+    except TeamDirGroupMismatch as e:
+        app.logger.error("[ACCOUNTS] 팀 디렉터리 gid 불일치: %s", e)
+        return jsonify(infra_error("ADD_USER_GROUPS", "TEAM_DIR_GROUP_MISMATCH", str(e))), 409
+    except Exception:
+        app.logger.exception("[ACCOUNTS] 팀 디렉터리 생성 실패: %s", sorted(names))
+        return jsonify(infra_error("ADD_USER_GROUPS", "TEAM_DIR_CREATE_FAILED",
+                                   f"failed to create team directories: {', '.join(sorted(names))}")), 500
+
     write_group_lines(new_lines)
     return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
 
