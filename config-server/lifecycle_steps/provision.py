@@ -1649,13 +1649,16 @@ def step_sync_ad_groups(ctx):
             # 이 변경 전에 만든 그룹은 디렉터리가 없다. 멤버가 들어올 때 채워 둔다(#154).
             _main._ensure_team_dir(sg["name"], int(sg["gid"]))
     except Exception as e:
+        # 팀 디렉터리 gid 불일치는 사람이 NAS 를 확인해야 풀린다 — 재시도는 같은 결과만 반복한다.
+        mismatch = isinstance(e, _main.TeamDirGroupMismatch)
+        code = "TEAM_DIR_GROUP_MISMATCH" if mismatch else "AD_GROUP_SYNC_FAILED"
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 반영 실패: user=%s", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="groups",
                       action=Action.CREATE_ACCOUNT, phase=_main._fail_phase(e),
-                      error_code="AD_GROUP_SYNC_FAILED", error_detail=str(e))
+                      error_code=code, error_detail=str(e))
         raise _main.StepFailed(_main.infra_error(
-            "SYNC_AD_GROUPS", "AD_GROUP_SYNC_FAILED",
-            f"failed to sync supplementary groups to AD for {name}"), 500, cause=e)
+            "SYNC_AD_GROUPS", code,
+            f"failed to sync supplementary groups to AD for {name}"), 500, cause=e, retry=not mismatch)
     _main.log_operation(request_id=request_id, username=name, resource_type="groups",
                   action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
 

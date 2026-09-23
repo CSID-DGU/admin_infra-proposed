@@ -148,6 +148,36 @@ def test_step_fills_in_team_directory_for_older_groups(etc, team_dirs):
     assert team_dirs == [("teamx", 70000)]
 
 
+def test_step_does_not_retry_team_dir_group_mismatch(etc, monkeypatch, logs):
+    """gid 가 다른 기존 디렉터리는 사람이 확인해야 풀린다 — 재시도 대상이면 같은 실패만 반복한다."""
+    seed, sent = etc
+
+    def mismatch(name, gid):
+        raise main.TeamDirGroupMismatch("이미 gid 70001 소유")
+    monkeypatch.setattr(main, "create_team_directory", mismatch)
+    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
+    with main.app.app_context():
+        with pytest.raises(main.StepFailed) as err:
+            provision.step_sync_ad_groups(ctx)
+    assert err.value.retry is False
+    assert err.value.body["error"] == "TEAM_DIR_GROUP_MISMATCH"
+    assert any(r.get("error_code") == "TEAM_DIR_GROUP_MISMATCH" for r in logs)
+
+
+def test_step_retries_plain_nas_failure(etc, monkeypatch):
+    seed, sent = etc
+
+    def boom(name, gid):
+        raise ConnectionError("nas ssh refused")
+    monkeypatch.setattr(main, "create_team_directory", boom)
+    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
+    with main.app.app_context():
+        with pytest.raises(main.StepFailed) as err:
+            provision.step_sync_ad_groups(ctx)
+    assert err.value.retry is True
+    assert err.value.body["error"] == "AD_GROUP_SYNC_FAILED"
+
+
 # ---------- POST /users/<username>/groups ----------
 
 def test_adding_user_to_group_goes_to_ad(etc, api):
