@@ -52,7 +52,7 @@ def test_step_order_matches_current_flow():
         "step_create_account", "step_create_home", "step_create_krb5_principal",
         "step_sync_ad_groups"]
     assert [s.__name__ for s in main.SUPP_GROUPS_ONLY_STEPS] == [
-        "step_add_user_groups", "step_sync_ad_groups"]
+        "step_add_user_groups", "step_sync_ad_groups", "step_trigger_nas_gss_flush"]
     assert [s.__name__ for s in main.POD_CREATE_STEPS] == [
         "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
         "step_create_pod_k8s", "step_wait_ready", "step_create_services"]
