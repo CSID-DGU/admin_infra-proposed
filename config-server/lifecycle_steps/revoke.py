@@ -331,8 +331,10 @@ def step_delete_account(ctx):
             sh_new.append(sl)
         _main.write_shadow_lines(sh_new)
 
-        # Clean /etc/group: remove user from all member lists; delete any group that had this user
-        # (either explicitly in members or implicitly as the primary GID group) if now empty.
+        # 모든 그룹의 멤버 목록에서 사용자를 빼고, 비게 된 개인(primary) 그룹만 지운다.
+        # 공용 그룹은 멤버가 0명이어도 남긴다 — AD 그룹·NAS 팀 디렉터리·admin_be 행은 그대로라
+        # 줄만 지우면 승인이 GROUP_NOT_FOUND 로 실패하고 빈 gid 가 다른 그룹에 다시 배정된다(#180).
+        # 공용 그룹 삭제는 명시적 그룹 삭제 경로의 몫이다(#177).
         g_lines = _main.read_group_lines()
         g_new = []
         for gl in g_lines:
@@ -341,15 +343,11 @@ def step_delete_account(ctx):
                 g_new.append(gl)
                 continue
 
-            had_user_member = username in grec.get("members", [])
-            is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
-
-            # Remove from explicit members list
-            if had_user_member:
+            if username in grec.get("members", []):
                 grec["members"] = [m for m in grec["members"] if m != username]
 
-            # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
-            if (had_user_member or is_primary_group) and not grec.get("members"):
+            is_primary_group = grec.get("gid") == removed_user.get("gid")
+            if is_primary_group and not grec.get("members"):
                 continue
 
             g_new.append(_main.format_group_entry(grec))
