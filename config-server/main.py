@@ -51,6 +51,8 @@ from utils import (
     create_user_home_directory,
     delete_user_home_directory,
     HomeOwnerMismatch,
+    create_team_directory,
+    TeamDirGroupMismatch,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
@@ -654,6 +656,14 @@ def _add_ad_group_member(groupname: str, username: str) -> None:
     _farm_ad_ssh(f"group-addmember {groupname} {username}")
 
 
+def _ensure_team_dir(name: str, gid: int) -> None:
+    """팀 공유 디렉터리를 만든다(#154). NAS 가 AD 그룹으로 권한을 판정하므로 AD 연동이
+    꺼진 환경에서는 만들어도 팀에게 열리지 않는다 — 그룹 동기화와 같은 조건으로 건너뛴다."""
+    if not _ad_enabled():
+        return
+    create_team_directory(name, int(gid))
+
+
 def _remove_group_line(name: str) -> None:
     """그룹 파일에서 한 줄을 지운다. AD 반영 실패 시 방금 쓴 줄을 되돌리는 용도."""
     write_group_lines([l for l in read_group_lines()
@@ -958,6 +968,19 @@ def add_group(body: AddGroupRequest):
             app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
         return jsonify(infra_error("ADD_GROUP", "AD_GROUP_CREATE_FAILED",
                                    f"failed to create group in AD: {name}")), 500
+
+    # 팀 디렉터리가 없으면 그룹은 있어도 같이 쓸 자리가 없다. AD 그룹과 디렉터리 생성이 모두
+    # 멱등이라 줄을 되돌려 두면 같은 요청을 다시 보내 이어서 끝낼 수 있다.
+    try:
+        _ensure_team_dir(name, gid)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] 팀 디렉터리 생성 실패, group 파일 롤백: %s(%s)", name, gid)
+        try:
+            _remove_group_line(name)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
+        return jsonify(infra_error("ADD_GROUP", "TEAM_DIR_CREATE_FAILED",
+                                   f"failed to create team directory: {name}")), 500
 
     return jsonify({"group": {"name": name, "gid": gid}}), 201
 

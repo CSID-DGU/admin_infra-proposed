@@ -130,3 +130,46 @@ def test_step_create_home_retries_on_plain_nas_failure(monkeypatch, logs):
             provision.step_create_home({"request_id": "r1", "name": "yoon6yo", "uid": 21000, "gid": 21000})
     assert err.value.body["error"] == "NAS_SSH_FAILED"
     assert err.value.retry is True
+
+
+# ---------- 팀 공유 디렉터리 (#154) ----------
+
+def test_team_dir_is_root_owned_setgid_and_closed_to_others(nas):
+    fake = nas(1, b"")
+    with main.app.app_context():
+        utils.create_team_directory("teamx", 70000)
+    assert fake.ran == ["sudo mkdir -p /volume1/share/user/_g_teamx",
+                        "sudo chown 0:70000 /volume1/share/user/_g_teamx",
+                        "sudo chmod 2770 /volume1/share/user/_g_teamx"]
+
+
+def test_team_dir_rerun_with_same_gid_is_safe(nas):
+    fake = nas(0, b"70000\n")
+    with main.app.app_context():
+        utils.create_team_directory("teamx", 70000)
+    assert len(fake.ran) == 3
+
+
+def test_team_dir_owned_by_another_group_is_left_alone(nas):
+    fake = nas(0, b"70001\n")
+    with main.app.app_context():
+        with pytest.raises(utils.TeamDirGroupMismatch):
+            utils.create_team_directory("teamx", 70000)
+    assert fake.ran == []
+
+
+def test_team_dir_rejects_unsafe_names(nas):
+    fake = nas(1, b"")
+    with main.app.app_context():
+        for bad in ["team x", "a;rm -rf /", "../etc", ""]:
+            with pytest.raises(ValueError):
+                utils.create_team_directory(bad, 70000)
+    assert fake.ran == []
+
+
+def test_home_path_refuses_the_team_prefix(nas):
+    """사용자 홈 삭제가 팀 디렉터리를 지우지 않도록 _g_ 로 시작하는 이름은 홈으로 쓰지 않는다."""
+    fake = nas(1, b"")
+    with pytest.raises(ValueError):
+        utils.delete_user_home_directory("_g_teamx")
+    assert fake.ran == []
