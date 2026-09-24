@@ -1,5 +1,6 @@
 """마이그레이션 작업(v2.0): 새 노드에 Pod를 먼저 만들고 기존 Pod를 정리한다. 옮길 이유가 없으면 건너뜀으로 끝난다."""
 import base64
+import crypt
 
 import main
 from test_e2e_virtual import env, full, tick, result, rows, PW  # noqa: F401  (env·full은 pytest fixture)
@@ -36,7 +37,8 @@ def test_force_migration_moves_pod_and_inherits_password(env, monkeypatch):
     assert new_pod != old_pod and old_pod not in e.v1.pods
     assert e.v1.pods[new_pod].spec.node_name == "farm7"
     assert f"{old_pod}-account" not in e.v1.secrets
-    assert e.v1.secrets[f"{new_pod}-account"]["data"]["USER_PW"] == base64.b64decode(PW).decode()
+    new_hash = e.v1.secrets[f"{new_pod}-account"]["data"]["USER_PW_HASH"]
+    assert crypt.crypt(base64.b64decode(PW).decode(), new_hash) == new_hash
     assert out["old_pod_cleanup"] is None and out["ports"]
     # 기존 노드의 keytab을 정리한다(그 노드에 같은 사용자의 다른 Pod가 없으므로)
     assert ("krb5_remove", ("exp-np-mig", "farm2")) in e.calls

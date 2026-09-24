@@ -4,6 +4,7 @@
 - 검증을 통과한 값만 경로 함수에 들어간다.
 - Swagger 요청 스키마는 모델에서 만들어지고 flasgger가 읽는 모양이다.
 """
+import crypt
 import json
 
 import pytest
@@ -33,6 +34,9 @@ def _invalid(r):
     ("post", "/operations/provision", {"request_id": True, "username": "exp-np-001"}, "request_id"),
     ("post", "/operations/provision", {"request_id": "1", "username": "exp-np-001", "account": {"passwd_base64": "%%"}},
      "account.passwd_base64"),
+    ("post", "/operations/provision", {"request_id": "1", "username": "u", "account": {"passwd_hash": "$6$x"}},
+     "account.passwd_hash"),
+    ("post", "/operations/provision", {"request_id": "1", "username": "u", "account": {}}, "account"),
     ("post", "/operations/provision", {"request_id": "1", "username": "u",
                                        "account": {"passwd_base64": "cHc=", "supplementary_groups": [{"name": "g"}]}},
      "account.supplementary_groups.0.gid"),
@@ -77,7 +81,9 @@ def test_request_id_accepts_positive_number_or_digit_string_only():
 
 def test_account_password_is_decoded_from_base64():
     account = rm.ProvisionAccount(passwd_base64="cHc=")
-    assert account.plaintext_password() == "pw"
+    legacy_hash = account.password_hash()
+    assert rm.SHA512_CRYPT_RE.match(legacy_hash) and crypt.crypt("pw", legacy_hash) == legacy_hash
+    assert rm.ProvisionAccount(passwd_hash=legacy_hash).password_hash() == legacy_hash
     assert account.gecos == "" and account.primary_group_name is None and account.supplementary_groups == []
 
 
