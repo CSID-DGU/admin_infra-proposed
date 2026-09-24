@@ -17,7 +17,6 @@ load_dotenv()
 
 import base64
 import hmac
-import crypt
 import json
 import subprocess
 from datetime import datetime
@@ -1261,7 +1260,7 @@ from lifecycle_steps.provision import (  # noqa: E402
     step_create_account, step_create_home, step_create_krb5_principal, ACCOUNT_CREATE_STEPS,
     step_add_user_groups, step_sync_ad_groups, SUPP_GROUPS_ONLY_STEPS,
     account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret,
-    LoginPasswordMissing, decode_login_password, login_password_for_recreate)
+    LoginPasswordMissing, decode_login_password, login_password_for_recreate, login_password_hash)
 from lifecycle_steps.revoke import (  # noqa: E402
     step_delete_services, step_release_nodeports, step_delete_pod_k8s,
     step_cleanup_pod_node_krb5, _new_delete_rollback, POD_DELETE_STEPS,
@@ -1346,7 +1345,7 @@ def register_provision(body: ProvisionRequest):
             "pg_name": account.primary_group_name or username,
             "supp_groups": [group.model_dump() for group in account.supplementary_groups],
             "gecos": account.gecos,
-            "passwd_hash": crypt.crypt(account.plaintext_password(), crypt.mksalt(crypt.METHOD_SHA512)),
+            "passwd_hash": account.password_hash(),
         }
     
     # supplementary_groups는 account가 없을 때도 처리 (기존 계정 재사용 경로)

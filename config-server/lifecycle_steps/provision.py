@@ -18,6 +18,7 @@ from kubernetes import client
 from typing import List, Optional
 
 from adapters.operation_log import Action, Phase
+from request_models import SHA512_CRYPT_RE
 
 
 class _MainProxy:
@@ -276,30 +277,50 @@ def decode_login_password(passwd_base64):
     return password
 
 
+def hash_login_password(password):
+    return crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512))
+
+
+def checked_login_password_hash(passwd_hash):
+    if not passwd_hash:
+        raise LoginPasswordMissing("로그인 비밀번호 해시가 비어 있음(승인 완료 뒤 지워졌을 수 있음)")
+    if not SHA512_CRYPT_RE.match(passwd_hash):
+        raise LoginPasswordMissing("로그인 비밀번호 해시 형식이 올바르지 않음")
+    return passwd_hash
+
+
+def login_password_hash(info):
+    """사용자 설정(admin_be)의 로그인 비밀번호 해시. admin_be는 해시(passwd_hash)만 보내고,
+    그 이전 버전은 평문(passwd_base64)을 보내므로 그때는 여기서 해시한다."""
+    info = info or {}
+    if info.get("passwd_hash"):
+        return checked_login_password_hash(info["passwd_hash"])
+    return hash_login_password(decode_login_password(info.get("passwd_base64")))
+
+
 def login_password_for_recreate(v1, ns, old_pod_name, user_info):
-    """다시 만드는 Pod(마이그레이션)의 비밀번호(base64). 옛 Pod의 Secret을 먼저 쓰고, 없으면 신청 설정 값을 쓴다."""
+    """다시 만드는 Pod(마이그레이션)의 비밀번호 해시. 옛 Pod의 Secret을 먼저 쓰고, 없으면 신청 설정 값을 쓴다.
+    해시 도입 전에 만든 Secret은 평문(USER_PW)이라 이어받으면서 해시로 바꾼다."""
     try:
         secret = v1.read_namespaced_secret(account_secret_name(old_pod_name), ns)
-        value = (secret.data or {}).get("USER_PW")
-        if value:
-            decode_login_password(value)
-            return value
+        data = secret.data or {}
+        if data.get("USER_PW_HASH"):
+            return checked_login_password_hash(base64.b64decode(data["USER_PW_HASH"]).decode("utf-8"))
+        if data.get("USER_PW"):
+            return hash_login_password(decode_login_password(data["USER_PW"]))
     except client.exceptions.ApiException as e:
         if e.status != 404:
             raise
-    fallback = (user_info or {}).get("passwd_base64")
-    decode_login_password(fallback)
-    return fallback
+    return login_password_hash(user_info)
 
 
-def ensure_account_secret(v1, ns, pod_name, username, passwd_base64):
-    """Pod가 읽을 로그인 비밀번호 Secret을 만든다(있으면 새 값으로 바꾼다). 비밀번호가 비면 만들지 않는다."""
-    password = decode_login_password(passwd_base64)
+def ensure_account_secret(v1, ns, pod_name, username, passwd_hash):
+    """Pod가 읽을 로그인 비밀번호 해시 Secret을 만든다(있으면 새 값으로 바꾼다). 해시가 비거나 형식이 다르면 만들지 않는다."""
     body = client.V1Secret(
         metadata=client.V1ObjectMeta(name=account_secret_name(pod_name), namespace=ns,
                                      labels={"app": "ailab-account", "ailab.dgu/pod": pod_name, "username": username}),
         type="Opaque",
-        string_data={"USER_PW": password},
+        string_data={"USER_PW_HASH": checked_login_password_hash(passwd_hash)},
     )
     try:
         v1.create_namespaced_secret(namespace=ns, body=body)
@@ -656,7 +677,7 @@ def step_create_pod_k8s(ctx):
     ctx["v1"] = v1
 
     try:
-        decode_login_password(ctx["user_info"].get("passwd_base64"))
+        passwd_hash = login_password_hash(ctx["user_info"])
     except LoginPasswordMissing as e:
         _main.set_pod_creation_status(request_id, "failed", "로그인 비밀번호 없음")
         rollback = _main._cleanup_create_failure(pod_name)
@@ -674,7 +695,7 @@ def step_create_pod_k8s(ctx):
                   node_name=best_node, resource_type="pod",
                   action=Action.CREATE_POD_K8S, phase=Phase.START)
     try:
-        ensure_account_secret(v1, ns, pod_name, username, ctx["user_info"]["passwd_base64"])
+        ensure_account_secret(v1, ns, pod_name, username, passwd_hash)
         created = v1.create_namespaced_pod(
             namespace=ns,
             body=ctx["pod_spec"]
@@ -1138,11 +1159,12 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "SHELL", "value": "/bin/bash"},
                                                     # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
-                                                    # `echo "$USER_ID:$USER_PW" | chpasswd`로 로그인 비밀번호를 설정한다.
+                                                    # `echo "$USER_ID:$USER_PW_HASH" | chpasswd -e`로 로그인 비밀번호를 설정한다.
+                                                    # 평문은 받지 않는다 — admin_be가 신청 때 해시만 남긴다.
                                                     # 값은 Pod 설정에 평문으로 두지 않고 Pod별 Secret에서 읽는다
                                                     # (Pod 설정은 조회 권한만 있으면 누구나 볼 수 있다). Secret은 Pod를
                                                     # 만들기 직전에 ensure_account_secret()이 만든다.
-                                                    {"name": "USER_PW", "valueFrom": {"secretKeyRef": {"name": account_secret_name(pod_name), "key": "USER_PW"}}},
+                                                    {"name": "USER_PW_HASH", "valueFrom": {"secretKeyRef": {"name": account_secret_name(pod_name), "key": "USER_PW_HASH"}}},
                                                     # 이미지 entrypoint.sh 의 ensure_supplemental_groups()가 읽는 이름은
                                                     # DECS_SUPPLEMENTAL_GROUPS 다. USER_GROUPS 로 보내면 아무도 읽지 않아
                                                     # 보조 그룹이 컨테이너 안에 만들어지지 않는다(#145). 값 형식(콤마 구분

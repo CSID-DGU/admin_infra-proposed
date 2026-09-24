@@ -9,6 +9,7 @@
   ``$ref: '#/definitions/<모델 이름>'`` 만 적는다.
 """
 import base64
+import crypt
 import re
 import functools
 from typing import List, Optional
@@ -17,6 +18,9 @@ from flask import jsonify, request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from error import infra_error
+
+# SHA-512 crypt($6$[rounds=N$]salt$hash). 이미지 entrypoint.sh 의 USER_PW_HASH_RE 와 같은 규칙이다.
+SHA512_CRYPT_RE = re.compile(r"^\$6\$(rounds=[0-9]+\$)?[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
 
 POD_NAME_PREFIX = "ailab-"
 
@@ -58,23 +62,45 @@ class SupplementaryGroup(RequestBody):
 
 
 class ProvisionAccount(RequestBody):
-    """계정을 새로 만들 때 함께 보내는 값. 계정이 이미 있으면 account 자체를 뺀다."""
-    passwd_base64: str = Field(description="UTF-8 평문 비밀번호를 base64로 인코딩한 값", examples=["cHc="])
+    """계정을 새로 만들 때 함께 보내는 값. 계정이 이미 있으면 account 자체를 뺀다.
+    비밀번호는 해시(passwd_hash)와 평문(passwd_base64, 해시 도입 전 admin_be) 중 하나만 보낸다."""
+    passwd_hash: Optional[str] = Field(default=None, description="SHA-512 crypt 해시($6$...)",
+                                       examples=["$6$saltsalt$" + "a" * 86])
+    passwd_base64: Optional[str] = Field(default=None, description="UTF-8 평문 비밀번호를 base64로 인코딩한 값(구 방식)",
+                                         examples=["cHc="])
     gecos: str = ""
     primary_group_name: Optional[str] = Field(default=None, description="생략하면 username")
     supplementary_groups: List[SupplementaryGroup] = []
 
+    @field_validator("passwd_hash")
+    @classmethod
+    def _sha512_crypt(cls, value):
+        if value is not None and not SHA512_CRYPT_RE.match(value):
+            raise ValueError("passwd_hash는 SHA-512 crypt 해시($6$...)여야 합니다")
+        return value
+
     @field_validator("passwd_base64")
     @classmethod
     def _decodable(cls, value):
+        if value is None:
+            return value
         try:
             base64.b64decode(value, validate=True).decode("utf-8")
         except Exception:
             raise ValueError("passwd_base64는 UTF-8 문자열을 base64로 인코딩한 값이어야 합니다")
         return value
 
-    def plaintext_password(self) -> str:
-        return base64.b64decode(self.passwd_base64, validate=True).decode("utf-8")
+    @model_validator(mode="after")
+    def _exactly_one_password(self):
+        if (self.passwd_hash is None) == (self.passwd_base64 is None):
+            raise ValueError("passwd_hash와 passwd_base64 중 하나만 보내야 합니다")
+        return self
+
+    def password_hash(self) -> str:
+        if self.passwd_hash is not None:
+            return self.passwd_hash
+        plaintext = base64.b64decode(self.passwd_base64, validate=True).decode("utf-8")
+        return crypt.crypt(plaintext, crypt.mksalt(crypt.METHOD_SHA512))
 
 
 class ProvisionRequest(RequestBody):

@@ -90,12 +90,12 @@ def step_migrate_select_target(ctx):
 
 
 def step_migrate_inherit_password(ctx):
-    """신청의 비밀번호는 승인 완료 뒤 지워지므로 기존 Pod의 로그인 비밀번호 Secret을 이어받는다.
+    """신청의 비밀번호 해시는 승인 완료 뒤 지워지므로 기존 Pod의 로그인 비밀번호 Secret을 이어받는다.
     사용자 설정 조회가 재개 때마다 다시 돌기 때문에 이 단계도 매번 다시 돈다."""
     ns = _main.app.config["NAMESPACE"]
     _main.load_k8s()
     try:
-        ctx["user_info"]["passwd_base64"] = _main.login_password_for_recreate(
+        ctx["user_info"]["passwd_hash"] = _main.login_password_for_recreate(
             client.CoreV1Api(), ns, ctx["old_pod_name"], ctx["user_info"])
     except _main.LoginPasswordMissing as e:
         _main.set_pod_creation_status(ctx["request_id"], "failed", "로그인 비밀번호 없음")

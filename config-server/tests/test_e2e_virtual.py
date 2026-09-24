@@ -1,6 +1,7 @@
 """가상 E2E (#25): 외부 시스템(k8s·SSH·WAS·Redis·DB)만 가짜로 두고 실제 단계 함수·엔드포인트·작업 SQL을 돈다.
 DB는 sqlite로 operation_log를 만들어 find_unfinished_jobs / get_job_result SQL을 그대로 실행한다."""
 import base64
+import crypt
 import sqlite3
 import subprocess
 import types
@@ -647,11 +648,13 @@ def test_pod_password_lives_in_owned_secret_and_is_removed_on_revoke(env):
     pod_name = next(iter(e.v1.pods))
     env_vars = e.v1.pods[pod_name].body["spec"]["containers"][0]["env"]
     by_name = {v["name"]: v for v in env_vars}
-    assert "value" not in by_name["USER_PW"]                                   # 평문 없음
-    assert by_name["USER_PW"]["valueFrom"]["secretKeyRef"] == {"name": f"{pod_name}-account", "key": "USER_PW"}
+    assert "USER_PW" not in by_name                                           # 평문 없음
+    assert "value" not in by_name["USER_PW_HASH"]
+    assert by_name["USER_PW_HASH"]["valueFrom"]["secretKeyRef"] == {"name": f"{pod_name}-account", "key": "USER_PW_HASH"}
     assert "HOME" not in by_name                                              # root로 들어가도 사용자 홈을 읽지 않게
     secret = e.v1.secrets[f"{pod_name}-account"]
-    assert secret["data"]["USER_PW"] == base64.b64decode(PW).decode()
+    assert set(secret["data"]) == {"USER_PW_HASH"}
+    assert crypt.crypt(base64.b64decode(PW).decode(), secret["data"]["USER_PW_HASH"]) == secret["data"]["USER_PW_HASH"]
     assert secret["owners"][0]["kind"] == "Pod" and secret["owners"][0]["uid"] == f"uid-{pod_name}"
 
     e.api.post("/operations/revoke", json={"request_id": "900", "pod_name": pod_name})
