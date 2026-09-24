@@ -124,6 +124,11 @@ API_TOKEN = os.getenv("CONFIG_API_TOKEN", "")
 _TOKEN_FREE_GET = re.compile(r"^/(health|requests/[^/]+/status|apispec_1\.json|apidocs/.*|flasgger_static/.*)$")
 
 
+def admin_be_headers():
+    """admin_be의 내부 전용 API(/api/requests/config/**, /api/internal/**)도 같은 토큰으로 호출자를 확인한다."""
+    return {"X-Internal-Token": API_TOKEN} if API_TOKEN else {}
+
+
 @app.before_request
 def _require_api_token():
     if not API_TOKEN:

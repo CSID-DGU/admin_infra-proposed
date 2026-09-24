@@ -27,6 +27,13 @@ spec:
                   value: "{{ .Values.config.namespace }}"
                 - name: ADMIN_BE_INTERNAL_URL
                   value: "{{ .Values.infra.adminBeInternalUrl }}"
+                # admin_be /api/internal/** 호출에 필요한 내부 API 토큰
+                - name: CONFIG_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: "{{ .Values.apiToken.secretName }}"
+                      key: token
+                      optional: true
                 - name: INFRA_SLACK_WEBHOOK_URL
                   valueFrom:
                     secretKeyRef:

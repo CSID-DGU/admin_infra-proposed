@@ -6,7 +6,7 @@ GPU 디바이스는 컨테이너 생성 시점에만 주입되고 그 이후 호
 실제 재시작/재생성은 사람이 직접 판단해서 진행한다 (#146 — 자동 재시작은 사용자
 동의 없이 진행 중인 작업을 강제로 끊을 수 있어 채택하지 않음).
 """
-from main import app, load_k8s
+from main import app, load_k8s, admin_be_headers
 from kubernetes import client
 from kubernetes.stream import stream
 import requests
@@ -82,6 +82,7 @@ def _alert_gpu_lost(pod_name: str, username: str, node_name: str) -> None:
         resp = requests.post(
             f"{app.config['ADMIN_BE_INTERNAL_URL']}/api/internal/slack/notify",
             json={"webhookUrl": webhook_url, "message": message},
+            headers=admin_be_headers(),
             timeout=10,
         )
         resp.raise_for_status()
