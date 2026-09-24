@@ -37,3 +37,13 @@ def test_status_route_is_open_only_for_get(client):
 def test_token_check_is_off_when_not_configured(monkeypatch):
     monkeypatch.setattr(main, "API_TOKEN", "")
     assert main.app.test_client().post("/operations/provision", json={}).status_code == 400
+
+
+def test_admin_be_headers_carry_token(monkeypatch):
+    monkeypatch.setattr(main, "API_TOKEN", "s3cret")
+    assert main.admin_be_headers() == {"X-Internal-Token": "s3cret"}
+
+
+def test_admin_be_headers_empty_when_not_configured(monkeypatch):
+    monkeypatch.setattr(main, "API_TOKEN", "")
+    assert main.admin_be_headers() == {}

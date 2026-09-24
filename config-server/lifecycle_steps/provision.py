@@ -395,7 +395,8 @@ def step_fetch_user_config(ctx):
 
     resp = None
     try:
-        resp = requests.get(was_url, timeout=_main.app.config["HTTP_TIMEOUT_SEC"])
+        resp = requests.get(was_url, headers=_main.admin_be_headers(),
+                            timeout=_main.app.config["HTTP_TIMEOUT_SEC"])
         user_info = resp.json()
         if not isinstance(user_info, dict):
             # 아래 status 조회가 사전을 전제한다. 사전이 아니면 예상 못 한 예외로 빠지는 대신

@@ -117,6 +117,34 @@ spec:
     - port: 80
       targetPort: 8080
 ---
+# admin_be에 들어오는 연결은 프론트엔드(nginx)와 config-server 본체·제어기만 허용한다. 같은 네임스페이스의
+# 사용자 컨테이너(app=ailab-guest)가 nginx를 거치지 않고 내부 전용 API를 직접 부르지 못하게 한다.
+# 내부 전용 API 자체는 admin_be가 X-Internal-Token으로도 검사한다(다중 방어).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-prod-ingress
+  namespace: __NS__
+spec:
+  podSelector:
+    matchLabels:
+      app: admin-prod
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ailab-frontend
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-server
+        - podSelector:
+            matchLabels:
+              app: containerssh-config-controller
+      ports:
+        - protocol: TCP
+          port: 8080
+---
 # 운영 이미지 안에는 운영 DB·config-server·Slack·메일 주소가 들어 있다. 덮어쓰기에서 하나라도 빠지면
 # 실험 admin_be가 운영에 닿을 수 있으므로, 같은 네임스페이스와 DNS 외의 모든 나가는 연결을 막는다.
 apiVersion: networking.k8s.io/v1

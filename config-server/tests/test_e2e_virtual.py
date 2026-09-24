@@ -189,12 +189,14 @@ def env(monkeypatch, tmp_path):
         def json(self):
             return self._b
 
-    def was(url, timeout):
+    def was(url, timeout, headers=None):
         e.calls.append(("was", url))
+        e.was_headers.append(headers or {})
         if e.was:
             return e.was(url)
         return Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW, "gpu_nodes": [
             {"node_name": "farm2", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"}]})
+    e.was_headers = []
     monkeypatch.setattr(main.requests, "get", was)
     e.Resp = Resp
     e.api = main.app.test_client()
@@ -690,3 +692,16 @@ def test_pod_env_carries_supplementary_groups_under_the_name_the_image_reads(env
     by_name = {v["name"]: v.get("value") for v in env_list}
     assert "USER_GROUPS" not in by_name
     assert by_name["DECS_SUPPLEMENTAL_GROUPS"].split(",")[1:] == ["teamx:53000"]
+
+
+def test_user_config_fetch_sends_internal_token(env, monkeypatch):
+    # admin_be의 설정 조회 API는 사용자 비밀번호를 돌려주므로 내부 토큰이 있어야만 열린다.
+    e = env
+    monkeypatch.setattr(main, "API_TOKEN", "s3cret")
+    r = e.api.post("/operations/provision", headers={"X-Internal-Token": "s3cret"},
+                   json={"request_id": "150", "username": "exp-np-tok", "account": {"passwd_base64": PW}})
+    assert r.status_code == 202
+
+    tick(e)
+
+    assert e.was_headers and all(h.get("X-Internal-Token") == "s3cret" for h in e.was_headers)

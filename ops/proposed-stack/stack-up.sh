@@ -452,7 +452,7 @@ was = os.environ.get("ADMIN_BE_INTERNAL_URL", "")
 err = ""
 for _ in range(12):
     try:
-        requests.get(f"{was}/api/requests/config/{name}", timeout=5)
+        requests.get(f"{was}/api/requests/config/{name}", headers=api.headers, timeout=5)
         err = ""
         break
     except Exception as e:
@@ -490,7 +490,9 @@ if fe:
     settled("프론트엔드 응답", lambda: requests.get(f"{fe}/", timeout=10), lambda c: c == 200)
     # /api/는 nginx가 이 스택의 admin_be로 넘긴다. 502·504면 대상이 틀렸거나 닿지 않는 것이다.
     settled("프론트엔드 /api/ → 스택 admin_be",
-            lambda: requests.get(f"{fe}/api/requests/config/{name}", timeout=10),
+            # 내부 토큰이 필요한 설정 조회 대신 공개로 둔 이름 중복 확인으로 경로만 확인한다.
+            lambda: requests.get(f"{fe}/api/requests/config/check-username",
+                                 params={"username": name}, timeout=10),
             lambda c: c not in (502, 503, 504))
     # 밖에서 들어오는 경로(ingress 컨트롤러, nodePort 30081)에 호스트 규칙이 붙었는지
     settled("30081 호스트 규칙으로 스택 화면",
