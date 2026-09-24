@@ -276,6 +276,13 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
         except Exception:
             _main.app.logger.warning("[JOB] pod status update failed", exc_info=True)
     if phase == Phase.SUCCESS:
+        if kind == "provision" and ctx.get("uid") is None:
+            # 계정을 재사용한 작업도 원장의 UID 를 실어 준다 — admin_be 가 계정 기록이 빠진 사용자를
+            # (원장 계정을 이어받은 경우) 이 값으로 다시 채운다.
+            try:
+                _observe_account_created(ctx)
+            except Exception:
+                _main.app.logger.warning("[JOB] 결과에 실을 uid 를 원장에서 읽지 못함", exc_info=True)
         # 작업이 만든 자원을 결과 조회에 실어 준다. 동기 경로는 같은 값을 응답 본문으로 돌려주므로,
         # 비동기 경로로 승인하는 쪽(admin_be)도 이 값으로 신청 기록을 채운다.
         result = {

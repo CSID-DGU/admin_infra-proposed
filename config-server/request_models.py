@@ -71,6 +71,9 @@ class ProvisionAccount(RequestBody):
     gecos: str = ""
     primary_group_name: Optional[str] = Field(default=None, description="생략하면 username")
     supplementary_groups: List[SupplementaryGroup] = []
+    expected_uid: Optional[int] = Field(
+        default=None, ge=1,
+        description="이 사용자가 예전에 쓰던 UID. 원장에 같은 이름·UID의 계정이 남아 있으면 새로 만들지 않고 이어받는다")
 
     @field_validator("passwd_hash")
     @classmethod

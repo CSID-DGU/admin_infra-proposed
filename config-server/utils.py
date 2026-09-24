@@ -305,10 +305,34 @@ echo "__RC=$rc"
 '''
 
 
-def _exec_on_running_pods(username: str, script: str, args: list, tag: str, log_args: bool = True) -> dict:
+def _exec_reading_stdin(v1, name, namespace, command, stdin_data):
+    """exec 에 stdin_data 를 표준입력으로 넘기고 표준출력을 모아 돌려준다. 인자로 넘기면 Pod 안의
+    프로세스 목록(ps)에 값이 보이므로, 비밀번호 해시처럼 드러나면 안 되는 값은 이 경로로 보낸다."""
+    resp = stream(
+        v1.connect_get_namespaced_pod_exec, name, namespace, command=command,
+        stderr=True, stdin=True, stdout=True, tty=False, _preload_content=False,
+        _request_timeout=POD_GROUP_SYNC_TIMEOUT_SEC,
+    )
+    try:
+        resp.write_stdin(stdin_data)
+        out = []
+        deadline = time.monotonic() + POD_GROUP_SYNC_TIMEOUT_SEC
+        while resp.is_open() and time.monotonic() < deadline:
+            resp.update(timeout=1)
+            if resp.peek_stdout():
+                out.append(resp.read_stdout())
+            if resp.peek_stderr():
+                resp.read_stderr()
+        return "".join(out)
+    finally:
+        resp.close()
+
+
+def _exec_on_running_pods(username: str, script: str, args: list, tag: str, stdin_data: Optional[str] = None) -> dict:
     """사용자의 Running Pod 마다 script 를 root 로 실행한다. 인자는 셸 문자열에 끼우지 않고 위치
-    인자로 넘긴다. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}.
-    Pod 목록부터 못 읽으면 "대상 Pod 없음"과 구분되도록 "error": "POD_LIST_FAILED" 를 더한다."""
+    인자로 넘기고, 드러나면 안 되는 값은 stdin_data 로 넘긴다. 부가 효과라 예외를 던지지 않는다 —
+    반환: {"synced": [...], "failed": [...]}. Pod 목록부터 못 읽으면 "대상 Pod 없음"과 구분되도록
+    "error": "POD_LIST_FAILED" 를 더한다."""
     result = {"synced": [], "failed": []}
     namespace = app.config["NAMESPACE"]
     try:
@@ -324,13 +348,16 @@ def _exec_on_running_pods(username: str, script: str, args: list, tag: str, log_
         if pod.status.phase != "Running":
             continue
         name = pod.metadata.name
+        command = ["/bin/sh", "-c", script, "decs-group-sync", username, *args]
         try:
-            out = stream(
-                v1.connect_get_namespaced_pod_exec, name, namespace,
-                command=["/bin/sh", "-c", script, "decs-group-sync", username, *args],
-                stderr=True, stdin=False, stdout=True, tty=False,
-                _request_timeout=POD_GROUP_SYNC_TIMEOUT_SEC,
-            ) or ""
+            if stdin_data is None:
+                out = stream(
+                    v1.connect_get_namespaced_pod_exec, name, namespace, command=command,
+                    stderr=True, stdin=False, stdout=True, tty=False,
+                    _request_timeout=POD_GROUP_SYNC_TIMEOUT_SEC,
+                ) or ""
+            else:
+                out = _exec_reading_stdin(v1, name, namespace, command, stdin_data) or ""
         except Exception:
             app.logger.exception(f"[{tag}] exec 실패: pod={name}")
             result["failed"].append(name)
@@ -338,8 +365,7 @@ def _exec_on_running_pods(username: str, script: str, args: list, tag: str, log_
         if "__RC=0" in out:
             result["synced"].append(name)
         else:
-            shown = args if log_args else "(생략)"
-            app.logger.warning(f"[{tag}] 반영 실패: pod={name} args={shown} out={out.strip()}")
+            app.logger.warning(f"[{tag}] 반영 실패: pod={name} args={args} out={out.strip()}")
             result["failed"].append(name)
     return result
 
@@ -368,9 +394,11 @@ def remove_running_pod_groups(username: str, groups: list) -> dict:
     return _exec_on_running_pods(username, _POD_GROUP_REMOVE_SCRIPT, sorted(groups), "POD GROUP REMOVE")
 
 # 이미지 entrypoint.sh 가 처음 기동할 때 하는 것과 같은 방식(chpasswd -e)으로 해시를 넣는다. 해시는
-# 셸 문자열에 끼우지 않고 위치 인자로 넘긴다 — 호출 전에 SHA-512 crypt 형식으로 검증돼 콜론·줄바꿈이 없다.
+# 표준입력 한 줄로 받는다 — 인자로 넘기면 Pod 안의 프로세스 목록에 보인다. 호출 전에 SHA-512 crypt
+# 형식으로 검증돼 콜론·줄바꿈이 없다.
 _POD_PASSWORD_SYNC_SCRIPT = r'''
-u="$1"; h="$2"
+u="$1"
+IFS= read -r h || { echo "__RC=1"; exit 0; }
 if printf '%s:%s\n' "$u" "$h" | chpasswd -e; then echo "__RC=0"; else echo "__RC=1"; fi
 '''
 
@@ -380,8 +408,8 @@ def sync_running_pod_password(username: str, passwd_hash: str) -> dict:
 
     Pod 의 비밀번호는 기동 때 계정 Secret(USER_PW_HASH)으로 한 번만 설정되므로, Secret 만 바꾸면
     다음 재생성 전까지 옛 비밀번호가 남는다. 반환은 _exec_on_running_pods 와 같다."""
-    return _exec_on_running_pods(username, _POD_PASSWORD_SYNC_SCRIPT, [passwd_hash],
-                                 "POD PASSWORD SYNC", log_args=False)
+    return _exec_on_running_pods(username, _POD_PASSWORD_SYNC_SCRIPT, [], "POD PASSWORD SYNC",
+                                 stdin_data=passwd_hash + "\n")
 
 
 def update_account_secrets(username: str, passwd_hash: str) -> list:
