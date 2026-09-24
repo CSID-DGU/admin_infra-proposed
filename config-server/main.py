@@ -23,7 +23,8 @@ from datetime import datetime
 
 from error import infra_error, k8s_error_fields
 from request_models import (is_valid_unix_name, validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
-                            DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest)
+                            DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest,
+                            ChangePasswordRequest)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -54,6 +55,8 @@ from utils import (
     TeamDirGroupMismatch,
     sync_running_pod_groups,
     remove_running_pod_groups,
+    sync_running_pod_password,
+    update_account_secrets,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
@@ -1175,6 +1178,82 @@ def remove_user_group(username: str, groupname: str):
 
     pods = remove_running_pod_groups(username, [groupname])
     return jsonify({"status": "removed", "user": username, "group": groupname, "pods": pods})
+
+# ----------- Change a user's login password -----------
+@accounts_bp.route("/users/<username>/password", methods=["PUT"])
+@validate_body(ChangePasswordRequest)
+def change_user_password(username: str, body: ChangePasswordRequest):
+    """
+    사용자 로그인 비밀번호 교체 API
+
+    계정 원장(shadow), 사용자의 모든 계정 Secret, 떠 있는 모든 Pod 의 /etc/shadow 를 새 해시로 바꾼다.
+    멱등이라 일부가 실패하면 같은 요청을 다시 보내면 된다. Pod 가 하나도 없어도 성공이다.
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 로그인 비밀번호 교체
+
+    parameters:
+
+      - in: path
+        name: username
+        required: true
+        type: string
+        example: user2100
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/ChangePasswordRequest'
+
+    responses:
+
+      200:
+        description: 원장·Secret·떠 있는 Pod 모두 반영
+      400:
+        description: 이름 또는 해시 형식 오류
+      404:
+        description: 계정 없음
+      500:
+        description: 일부 반영 실패(같은 요청으로 재시도)
+    """
+    if not is_valid_unix_name(username):
+        return jsonify(infra_error("CHANGE_PASSWORD", "INVALID_NAME", f"invalid name: {username}")), 400
+
+    # 원장을 먼저 바꾼다. 계정이 없으면 여기서 끝나 Secret·Pod 를 건드리지 않는다.
+    today_days = int(time.time() // 86400)
+    ensure_etc_layout()
+    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
+        sh_lines = f.read().splitlines()
+        found = False
+        for i, line in enumerate(sh_lines):
+            rec = parse_shadow_line(line)
+            if rec and rec["name"] == username:
+                rec["passwd"], rec["lastchg"] = body.passwd_hash, today_days
+                sh_lines[i] = format_shadow_entry(rec)
+                found = True
+                break
+        if not found:
+            return jsonify(infra_error("CHANGE_PASSWORD", "USER_NOT_FOUND", f"user not found: {username}")), 404
+        f.seek(0)
+        f.write("\n".join(sh_lines) + "\n")
+        f.truncate()
+
+    try:
+        secrets = update_account_secrets(username, body.passwd_hash)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] 계정 Secret 비밀번호 교체 실패: %s", username)
+        return jsonify(infra_error("CHANGE_PASSWORD", "SECRET_UPDATE_FAILED",
+                                   f"failed to update account secrets: {username}")), 500
+
+    pods = sync_running_pod_password(username, body.passwd_hash)
+    if pods["failed"] or pods.get("error"):
+        return jsonify(infra_error("CHANGE_PASSWORD", "POD_PASSWORD_SYNC_FAILED",
+                                   f"failed to apply password to running pods: {username}",
+                                   secrets=secrets, pods=pods)), 500
+    return jsonify({"status": "updated", "user": username, "secrets": secrets, "pods": pods})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)

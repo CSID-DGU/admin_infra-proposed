@@ -27,6 +27,17 @@ def pod_group_remove(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def pod_password_sync(monkeypatch):
+    """비밀번호 교체도 Secret·Pod 에 닿으므로 막는다. 반환: ("secrets"|"pods", username, 해시) 호출 목록"""
+    calls = []
+    monkeypatch.setattr(main, "update_account_secrets",
+                        lambda u, h: calls.append(("secrets", u, h)) or [])
+    monkeypatch.setattr(main, "sync_running_pod_password",
+                        lambda u, h: calls.append(("pods", u, h)) or {"synced": [], "failed": []})
+    return calls
+
+
 @pytest.fixture
 def logs(monkeypatch):
     """log_operation 호출을 DB 대신 목록에 모은다."""

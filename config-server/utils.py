@@ -305,7 +305,7 @@ echo "__RC=$rc"
 '''
 
 
-def _exec_on_running_pods(username: str, script: str, args: list, tag: str) -> dict:
+def _exec_on_running_pods(username: str, script: str, args: list, tag: str, log_args: bool = True) -> dict:
     """사용자의 Running Pod 마다 script 를 root 로 실행한다. 인자는 셸 문자열에 끼우지 않고 위치
     인자로 넘긴다. 부가 효과라 예외를 던지지 않는다 — 반환: {"synced": [...], "failed": [...]}.
     Pod 목록부터 못 읽으면 "대상 Pod 없음"과 구분되도록 "error": "POD_LIST_FAILED" 를 더한다."""
@@ -338,7 +338,8 @@ def _exec_on_running_pods(username: str, script: str, args: list, tag: str) -> d
         if "__RC=0" in out:
             result["synced"].append(name)
         else:
-            app.logger.warning(f"[{tag}] 반영 실패: pod={name} args={args} out={out.strip()}")
+            shown = args if log_args else "(생략)"
+            app.logger.warning(f"[{tag}] 반영 실패: pod={name} args={shown} out={out.strip()}")
             result["failed"].append(name)
     return result
 
@@ -365,6 +366,48 @@ def remove_running_pod_groups(username: str, groups: list) -> dict:
     if not groups:
         return {"synced": [], "failed": []}
     return _exec_on_running_pods(username, _POD_GROUP_REMOVE_SCRIPT, sorted(groups), "POD GROUP REMOVE")
+
+# 이미지 entrypoint.sh 가 처음 기동할 때 하는 것과 같은 방식(chpasswd -e)으로 해시를 넣는다. 해시는
+# 셸 문자열에 끼우지 않고 위치 인자로 넘긴다 — 호출 전에 SHA-512 crypt 형식으로 검증돼 콜론·줄바꿈이 없다.
+_POD_PASSWORD_SYNC_SCRIPT = r'''
+u="$1"; h="$2"
+if printf '%s:%s\n' "$u" "$h" | chpasswd -e; then echo "__RC=0"; else echo "__RC=1"; fi
+'''
+
+
+def sync_running_pod_password(username: str, passwd_hash: str) -> dict:
+    """이미 떠 있는 사용자 Pod 의 /etc/shadow 에 새 로그인 비밀번호 해시를 넣는다.
+
+    Pod 의 비밀번호는 기동 때 계정 Secret(USER_PW_HASH)으로 한 번만 설정되므로, Secret 만 바꾸면
+    다음 재생성 전까지 옛 비밀번호가 남는다. 반환은 _exec_on_running_pods 와 같다."""
+    return _exec_on_running_pods(username, _POD_PASSWORD_SYNC_SCRIPT, [passwd_hash],
+                                 "POD PASSWORD SYNC", log_args=False)
+
+
+def update_account_secrets(username: str, passwd_hash: str) -> list:
+    """사용자의 모든 Pod(상태 무관)의 계정 Secret 에서 USER_PW_HASH 를 바꾼다. 멈춘 Pod·다시 만드는 Pod
+    (마이그레이션은 옛 Pod 의 Secret 을 이어받는다)도 새 비밀번호로 뜨게 한다. 반환: 바꾼 Secret 이름 목록.
+
+    Secret 은 Pod 를 소유자로 두어 Pod 와 함께 지워지므로, Secret 목록(list 권한 없음) 대신 Pod 목록에서
+    이름을 만든다. Secret 이 없는 Pod(만드는 중)는 건너뛴다. 그 밖의 실패는 예외로 던진다 — 같은
+    요청을 다시 보내면 이어서 끝난다."""
+    from lifecycle_steps.provision import account_secret_name  # provision 이 main 을 거쳐 utils 를 import 한다
+    namespace = app.config["NAMESPACE"]
+    load_k8s()
+    v1 = client.CoreV1Api()
+    pods = v1.list_namespaced_pod(namespace=namespace, label_selector=f"username={username}").items
+    updated = []
+    for pod in pods:
+        name = account_secret_name(pod.metadata.name)
+        try:
+            v1.patch_namespaced_secret(name, namespace, {"stringData": {"USER_PW_HASH": passwd_hash}})
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                raise
+            continue
+        updated.append(name)
+    return sorted(updated)
+
 
 def generate_pod_name(username: str) -> str:
     suffix = uuid.uuid4().hex[:8]
