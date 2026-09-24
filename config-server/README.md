@@ -38,6 +38,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `delete_pvc` | route `DELETE /pvc` | PVC와 연결 NFS 디렉토리를 삭제한다. | JSON `{"pvcs":[{"name","type","pvc_name?"}]}` 또는 legacy username/type | JSON `{results:[...]}` |
 | `add_group` | route `PUT /accounts/groups` | 새 Linux group row를 추가한다. `gid` 생략 시 group 파일 기준으로 자동 할당한다. | JSON `name`, optional `gid`, optional `members` | 201 JSON `{group:{name,gid}}` |
 | `add_user_groups` | route `PUT /accounts/users/<username>/groups` | 사용자를 보조 그룹에 추가한다. | path username, JSON `groups` | JSON `{status,user,groups}` |
+| `change_user_password` | route `PUT /users/<username>/password` | 계정 원장(shadow)·모든 계정 Secret·떠 있는 Pod의 로그인 비밀번호 해시를 바꾼다. 멱등이라 실패하면 같은 요청으로 재시도한다. | path username, JSON `passwd_hash`(SHA-512 crypt) | JSON `{status,user,secrets,pods}` |
 
 ## `utils.py` 클래스와 함수
 

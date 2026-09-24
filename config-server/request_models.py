@@ -215,8 +215,20 @@ class AddUserGroupsRequest(RequestBody):
     groups: List[str] = Field(min_length=1, examples=[["developers"]])
 
 
+class ChangePasswordRequest(RequestBody):
+    """계정 로그인 비밀번호 교체. admin_be가 해시한 값만 받는다(평문은 받지 않는다)."""
+    passwd_hash: str = Field(description="SHA-512 crypt 해시($6$...)", examples=["$6$saltsalt$" + "a" * 86])
+
+    @field_validator("passwd_hash")
+    @classmethod
+    def _sha512_crypt(cls, value):
+        if not SHA512_CRYPT_RE.match(value):
+            raise ValueError("passwd_hash는 SHA-512 crypt 해시($6$...)여야 합니다")
+        return value
+
+
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  AddGroupRequest, AddUserGroupsRequest)
+                  AddGroupRequest, AddUserGroupsRequest, ChangePasswordRequest)
 
 
 def _errors(exc: ValidationError):
