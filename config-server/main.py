@@ -24,7 +24,7 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from request_models import (is_valid_unix_name, validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest,
-                            ChangePasswordRequest)
+                            ChangePasswordRequest, SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -1223,37 +1223,64 @@ def change_user_password(username: str, body: ChangePasswordRequest):
         return jsonify(infra_error("CHANGE_PASSWORD", "INVALID_NAME", f"invalid name: {username}")), 400
 
     # 원장을 먼저 바꾼다. 계정이 없으면 여기서 끝나 Secret·Pod 를 건드리지 않는다.
-    today_days = int(time.time() // 86400)
-    ensure_etc_layout()
-    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
-        sh_lines = f.read().splitlines()
-        found = False
-        for i, line in enumerate(sh_lines):
-            rec = parse_shadow_line(line)
-            if rec and rec["name"] == username:
-                rec["passwd"], rec["lastchg"] = body.passwd_hash, today_days
-                sh_lines[i] = format_shadow_entry(rec)
-                found = True
-                break
-        if not found:
-            return jsonify(infra_error("CHANGE_PASSWORD", "USER_NOT_FOUND", f"user not found: {username}")), 404
-        f.seek(0)
-        f.write("\n".join(sh_lines) + "\n")
-        f.truncate()
+    old_hash = set_ledger_password(username, body.passwd_hash)
+    if old_hash is None:
+        return jsonify(infra_error("CHANGE_PASSWORD", "USER_NOT_FOUND", f"user not found: {username}")), 404
 
     try:
         secrets = update_account_secrets(username, body.passwd_hash)
     except Exception:
         app.logger.exception("[ACCOUNTS] 계정 Secret 비밀번호 교체 실패: %s", username)
         return jsonify(infra_error("CHANGE_PASSWORD", "SECRET_UPDATE_FAILED",
-                                   f"failed to update account secrets: {username}")), 500
+                                   f"failed to update account secrets: {username}",
+                                   rolled_back=_restore_password(username, old_hash))), 500
 
     pods = sync_running_pod_password(username, body.passwd_hash)
     if pods["failed"] or pods.get("error"):
         return jsonify(infra_error("CHANGE_PASSWORD", "POD_PASSWORD_SYNC_FAILED",
                                    f"failed to apply password to running pods: {username}",
-                                   secrets=secrets, pods=pods)), 500
+                                   pods=pods, rolled_back=_restore_password(username, old_hash))), 500
     return jsonify({"status": "updated", "user": username, "secrets": secrets, "pods": pods})
+
+
+def set_ledger_password(username: str, passwd_hash: str):
+    """계정 원장(shadow)의 해시와 변경일을 바꾼다. 반환: 바꾸기 전 해시, 계정이 없으면 None."""
+    ensure_etc_layout()
+    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
+        sh_lines = f.read().splitlines()
+        for i, line in enumerate(sh_lines):
+            rec = parse_shadow_line(line)
+            if rec and rec["name"] == username:
+                old_hash = rec["passwd"]
+                rec["passwd"], rec["lastchg"] = passwd_hash, int(time.time() // 86400)
+                sh_lines[i] = format_shadow_entry(rec)
+                f.seek(0)
+                f.write("\n".join(sh_lines) + "\n")
+                f.truncate()
+                return old_hash
+    return None
+
+
+def _restore_password(username: str, old_hash: str) -> bool:
+    """비밀번호 교체가 중간에 실패했을 때 원장·Secret·떠 있는 Pod 를 옛 해시로 되돌린다. 일부만 바뀐 채로
+    남으면 컨테이너마다 비밀번호가 달라지고, admin_be 는 옛 해시를 계속 기준으로 삼는다.
+
+    옛 해시가 SHA-512 crypt 가 아니면(잠긴 계정 "!" 등) Secret 에 넣을 수 없어(이미지가 기동을 거부한다)
+    원장만 되돌린다. 반환: 모두 되돌렸는지. 되돌리기까지 실패하면 같은 요청을 다시 보내면 맞춰진다."""
+    try:
+        set_ledger_password(username, old_hash)
+        if not SHA512_CRYPT_RE.match(old_hash or ""):
+            app.logger.error("[ACCOUNTS] 옛 해시가 SHA-512 crypt 가 아니라 원장만 되돌림: %s", username)
+            return False
+        update_account_secrets(username, old_hash)
+        pods = sync_running_pod_password(username, old_hash)
+        if pods["failed"] or pods.get("error"):
+            app.logger.error("[ACCOUNTS] 비밀번호 되돌리기 중 Pod 반영 실패: %s %s", username, pods)
+            return False
+        return True
+    except Exception:
+        app.logger.exception("[ACCOUNTS] 비밀번호 되돌리기 실패 — 같은 요청으로 다시 맞출 것: %s", username)
+        return False
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp)
@@ -1392,6 +1419,18 @@ def _register_job(kind, request_id, username, job):
     return jsonify({"request_id": request_id, "job_id": job_id, "status": "accepted"}), 202
 
 
+def _adoptable_account_uid(username: str, expected_uid):
+    """원장에 같은 이름의 계정이 있고 UID 가 expected_uid 와 같으면 그 UID. 아니면 None.
+    UID 가 다르면 같은 이름을 쓰던 다른 사람의 계정일 수 있어 이어받지 않는다(새로 만들려다 막힌다)."""
+    if expected_uid is None:
+        return None
+    for line in read_passwd_lines():
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            return rec["uid"] if rec["uid"] == expected_uid else None
+    return None
+
+
 @app.route("/operations/provision", methods=["POST"])
 @validate_body(ProvisionRequest)
 def register_provision(body: ProvisionRequest):
@@ -1418,6 +1457,17 @@ def register_provision(body: ProvisionRequest):
     """
     username = body.username
     job = {"username": username}
+    adopted_uid = _adoptable_account_uid(username, body.account.expected_uid) if body.account else None
+    if adopted_uid is not None:
+        # admin_be 의 계정 기록만 빠진 경우다(실패 작업이 계정을 남겼거나 수동 정리). 새로 만들면
+        # USER_ALREADY_EXISTS 로 막히므로, 이 사용자가 쓰던 바로 그 계정이면 재사용 경로로 돌린다.
+        set_ledger_password(username, body.account.password_hash())
+        groups = {g.name: g.model_dump() for g in [*body.account.supplementary_groups, *body.supplementary_groups]}
+        job["adopted_uid"] = adopted_uid
+        if groups:
+            job["supp_groups_only"] = list(groups.values())
+        app.logger.warning(f"[JOB] 원장에 남은 계정을 이어받음: user={username} uid={adopted_uid}")
+        return _register_job("provision", body.request_id, username, job)
     if body.account is not None:
         account = body.account
         job["account"] = {
