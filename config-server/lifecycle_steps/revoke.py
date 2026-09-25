@@ -296,68 +296,71 @@ def step_delete_account(ctx):
     _main.log_operation(request_id=request_id, username=username, node_name=node_name,
                   resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.START)
 
-    # Remove from /etc/passwd
-    lines = _main.read_passwd_lines()
-    new_lines = []
-    removed_user = None
-    for line in lines:
-        rec = _main.parse_passwd_line(line)
-        if rec and rec["name"] == username:
-            removed_user = rec
-            continue
-        new_lines.append(line)
-    if removed_user is None:
-        # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
-        # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
-        # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
-        # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
-        _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="USER_NOT_FOUND",
-                      error_detail=f"user {username!r} not present in passwd")
-        raise _main.StepFailed({"error": "user not found"}, 404)
-    # passwd/shadow/group 세 파일을 지워야 계정 제거가 끝난다. 중간에 실패하면 계정이
-    # 반만 지워진 채 남으므로, 그 사실이 이력에 남도록 묶어서 감싼다.
-    try:
-        _main.write_passwd_lines(new_lines)
-
-        # Remove from /shadow
-        sh_lines = _main.read_shadow_lines()
-        sh_new = []
-        for sl in sh_lines:
-            srec = _main.parse_shadow_line(sl)
-            if srec and srec["name"] == username:
+    # 읽기부터 세 파일 쓰기까지를 원장 잠금 하나로 묶는다 — 그 사이 다른 Pod가 원장을 고치면
+    # 이 단계가 쓰는 옛 내용이 그 기록을 덮어쓴다.
+    with _main.ledger_lock():
+        # Remove from /etc/passwd
+        lines = _main.read_passwd_lines()
+        new_lines = []
+        removed_user = None
+        for line in lines:
+            rec = _main.parse_passwd_line(line)
+            if rec and rec["name"] == username:
+                removed_user = rec
                 continue
-            sh_new.append(sl)
-        _main.write_shadow_lines(sh_new)
+            new_lines.append(line)
+        if removed_user is None:
+            # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
+            # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
+            # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
+            # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
+            _main.log_operation(request_id=request_id, username=username, node_name=node_name,
+                          resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                          error_code="USER_NOT_FOUND",
+                          error_detail=f"user {username!r} not present in passwd")
+            raise _main.StepFailed({"error": "user not found"}, 404)
+        # passwd/shadow/group 세 파일을 지워야 계정 제거가 끝난다. 중간에 실패하면 계정이
+        # 반만 지워진 채 남으므로, 그 사실이 이력에 남도록 묶어서 감싼다.
+        try:
+            _main.write_passwd_lines(new_lines)
 
-        # 모든 그룹의 멤버 목록에서 사용자를 빼고, 비게 된 개인(primary) 그룹만 지운다.
-        # 공용 그룹은 멤버가 0명이어도 남긴다 — AD 그룹·NAS 팀 디렉터리·admin_be 행은 그대로라
-        # 줄만 지우면 승인이 GROUP_NOT_FOUND 로 실패하고 빈 gid 가 다른 그룹에 다시 배정된다(#180).
-        # 공용 그룹 삭제는 명시적 그룹 삭제 경로의 몫이다(#177).
-        g_lines = _main.read_group_lines()
-        g_new = []
-        for gl in g_lines:
-            grec = _main.parse_group_line(gl)
-            if not grec:
-                g_new.append(gl)
-                continue
+            # Remove from /shadow
+            sh_lines = _main.read_shadow_lines()
+            sh_new = []
+            for sl in sh_lines:
+                srec = _main.parse_shadow_line(sl)
+                if srec and srec["name"] == username:
+                    continue
+                sh_new.append(sl)
+            _main.write_shadow_lines(sh_new)
 
-            if username in grec.get("members", []):
-                grec["members"] = [m for m in grec["members"] if m != username]
+            # 모든 그룹의 멤버 목록에서 사용자를 빼고, 비게 된 개인(primary) 그룹만 지운다.
+            # 공용 그룹은 멤버가 0명이어도 남긴다 — AD 그룹·NAS 팀 디렉터리·admin_be 행은 그대로라
+            # 줄만 지우면 승인이 GROUP_NOT_FOUND 로 실패하고 빈 gid 가 다른 그룹에 다시 배정된다(#180).
+            # 공용 그룹 삭제는 명시적 그룹 삭제 경로의 몫이다(#177).
+            g_lines = _main.read_group_lines()
+            g_new = []
+            for gl in g_lines:
+                grec = _main.parse_group_line(gl)
+                if not grec:
+                    g_new.append(gl)
+                    continue
 
-            is_primary_group = grec.get("gid") == removed_user.get("gid")
-            if is_primary_group and not grec.get("members"):
-                continue
+                if username in grec.get("members", []):
+                    grec["members"] = [m for m in grec["members"] if m != username]
 
-            g_new.append(_main.format_group_entry(grec))
+                is_primary_group = grec.get("gid") == removed_user.get("gid")
+                if is_primary_group and not grec.get("members"):
+                    continue
 
-        _main.write_group_lines(g_new)
-    except Exception as e:
-        _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
-                      error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
-        raise
+                g_new.append(_main.format_group_entry(grec))
+
+            _main.write_group_lines(g_new)
+        except Exception as e:
+            _main.log_operation(request_id=request_id, username=username, node_name=node_name,
+                          resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                          error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
+            raise
 
     _main.log_operation(request_id=request_id, username=username, node_name=node_name,
                   resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)

@@ -6,6 +6,8 @@ import fcntl
 import time
 import pymysql
 import threading
+import logging
+from contextlib import contextmanager
 from typing import List, Optional
 import uuid
 
@@ -695,6 +697,86 @@ class LockedFile:
                 if self._thread_lock:
                     self._thread_lock.release()
 
+# ---- 원장(passwd/group/shadow) 교차 Pod 잠금 ----
+# 원장은 NFS(/kube_share)에 있고 API 서버·제어기·크론잡이 서로 다른 Pod에서 고친다. LockedFile의
+# 로컬(/tmp) 락은 같은 Pod 안에서만 통하므로, 원장 전체를 하나의 MySQL 이름 잠금으로 묶어
+# 읽기부터 쓰기까지를 Pod 사이에서도 직렬화한다. 같은 스레드가 겹쳐 잡으면 바깥 한 번만 잡는다.
+LEDGER_LOCK_NAME = "cssh-ledger"
+LEDGER_LOCK_TIMEOUT_SEC = int(os.getenv("LEDGER_LOCK_TIMEOUT_SEC", "30"))
+_ledger_local = threading.local()
+# LEDGER_LOCK_BACKEND=local(시험용)에서 쓰는 프로세스 안 잠금.
+_ledger_process_lock = threading.Lock()
+_ledger_log = logging.getLogger(__name__)
+
+
+class LedgerLockTimeout(RuntimeError):
+    pass
+
+
+def _ledger_lock_connection():
+    return pymysql.connect(
+        host=os.environ["DB_HOST"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        database=os.environ["DB_NAME"],
+        autocommit=True,
+        connect_timeout=5,
+        read_timeout=LEDGER_LOCK_TIMEOUT_SEC + 10,
+    )
+
+
+def _acquire_ledger_lock():
+    """잠금을 잡고 풀 때 쓸 연결을 돌려준다. 못 잡으면 잠금 없이 진행하지 않고 예외를 던진다."""
+    if os.getenv("LEDGER_LOCK_BACKEND", "mysql") == "local":
+        if not _ledger_process_lock.acquire(timeout=LEDGER_LOCK_TIMEOUT_SEC):
+            raise LedgerLockTimeout(f"ledger lock not acquired within {LEDGER_LOCK_TIMEOUT_SEC}s")
+        return None
+    conn = _ledger_lock_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, %s)", (LEDGER_LOCK_NAME, LEDGER_LOCK_TIMEOUT_SEC))
+            (got,) = cur.fetchone()
+    except Exception:
+        conn.close()
+        raise
+    if got != 1:
+        conn.close()
+        raise LedgerLockTimeout(f"ledger lock not acquired within {LEDGER_LOCK_TIMEOUT_SEC}s")
+    return conn
+
+
+def _release_ledger_lock(conn) -> None:
+    if conn is None:
+        _ledger_process_lock.release()
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT RELEASE_LOCK(%s)", (LEDGER_LOCK_NAME,))
+    except Exception:
+        # 연결을 닫으면 MySQL이 잠금을 풀어 주므로 해제 실패는 기록만 한다.
+        _ledger_log.exception("ledger lock release failed; closing connection releases it")
+    finally:
+        conn.close()
+
+
+@contextmanager
+def ledger_lock():
+    depth = getattr(_ledger_local, "depth", 0)
+    if depth:
+        _ledger_local.depth = depth + 1
+        try:
+            yield
+        finally:
+            _ledger_local.depth -= 1
+        return
+    conn = _acquire_ledger_lock()
+    _ledger_local.depth = 1
+    try:
+        yield
+    finally:
+        _ledger_local.depth = 0
+        _release_ledger_lock(conn)
+
 # ---- Ensure base etc layout ----
 
 def ensure_dir(path: str) -> None:
@@ -762,13 +844,13 @@ _group_line_re  = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<gid>\d+):(
 
 def read_passwd_lines() -> List[str]:
     ensure_etc_layout()
-    with LockedFile(app.config["PASSWD_PATH"], "r") as f:
+    with ledger_lock(), LockedFile(app.config["PASSWD_PATH"], "r") as f:
         return f.read().splitlines()
 
 
 def write_passwd_lines(lines: List[str]) -> None:
     ensure_etc_layout()
-    with LockedFile(app.config["PASSWD_PATH"], "r+") as f:
+    with ledger_lock(), LockedFile(app.config["PASSWD_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
         f.seek(0)
         f.write(content)
@@ -777,13 +859,13 @@ def write_passwd_lines(lines: List[str]) -> None:
 
 def read_group_lines() -> List[str]:
     ensure_etc_layout()
-    with LockedFile(app.config["GROUP_PATH"], "r") as f:
+    with ledger_lock(), LockedFile(app.config["GROUP_PATH"], "r") as f:
         return f.read().splitlines()
 
 
 def write_group_lines(lines: List[str]) -> None:
     ensure_etc_layout()
-    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+    with ledger_lock(), LockedFile(app.config["GROUP_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
         f.seek(0)
         f.write(content)
@@ -824,13 +906,13 @@ _shadow_line_re = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<lastchg>\d
 
 def read_shadow_lines() -> List[str]:
     ensure_etc_layout()
-    with LockedFile(app.config["SHADOW_PATH"], "r") as f:
+    with ledger_lock(), LockedFile(app.config["SHADOW_PATH"], "r") as f:
         return f.read().splitlines()
 
 
 def write_shadow_lines(lines: List[str]) -> None:
     ensure_etc_layout()
-    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
+    with ledger_lock(), LockedFile(app.config["SHADOW_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
         f.seek(0)
         f.write(content)
