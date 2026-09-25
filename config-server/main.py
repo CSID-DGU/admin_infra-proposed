@@ -41,6 +41,7 @@ from utils import (
     get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage, summarize_pod_start_events,
     get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, ledger_lock, get_node_gpu_score,
+    read_issued_id_max, record_issued_id,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -235,6 +236,7 @@ app.config.from_mapping({
     "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
     "BASH_LOGOUT_PATH": BASE_ETC_DIR + "/bash.bash_logout",
     "BASHRC_PATH": BASE_ETC_DIR + "/bashrc",
+    "ISSUED_ID_MAX_PATH": BASE_ETC_DIR + "/issued_id_max.json",
 })
 
 @app.route("/health", methods=["GET"])
@@ -971,7 +973,13 @@ def add_group(body: AddGroupRequest):
             return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_EXISTS", f"group already exists (name: {name})")), 409
 
         if gid is None:
-            gid = _allocate_next_gid(g_lines, min_gid=SHARED_GID_MIN)
+            try:
+                issued_max = read_issued_id_max("shared_gid")
+            except Exception:
+                app.logger.exception("[ACCOUNTS] gid 발급 기록을 읽지 못해 그룹 생성 중단: %s", name)
+                return jsonify(infra_error("ADD_GROUP", "ISSUED_ID_RECORD_FAILED",
+                                           "cannot read issued gid record")), 500
+            gid = _allocate_next_gid(g_lines, min_gid=SHARED_GID_MIN, issued_max=issued_max)
             if SHARED_GID_MAX is not None and gid > SHARED_GID_MAX:
                 return jsonify(infra_error("ADD_GROUP", "GID_RANGE_EXHAUSTED", f"gid range {SHARED_GID_MIN}~{SHARED_GID_MAX} exhausted")), 500
         elif gid < SHARED_GID_MIN or (SHARED_GID_MAX is not None and gid > SHARED_GID_MAX):
@@ -980,6 +988,13 @@ def add_group(body: AddGroupRequest):
         elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
             return jsonify(infra_error("ADD_GROUP", "GROUP_GID_EXISTS", f"group already exists (gid: {gid})")), 409
 
+        # 직접 준 gid(옛 팀을 원래 번호로 되살리는 운영 경로)도 기록해, 자동 배정이 그 번호를 다시 주지 않게 한다.
+        try:
+            record_issued_id("shared_gid", gid)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] gid 발급 기록 실패로 그룹 생성 중단: %s(%s)", name, gid)
+            return jsonify(infra_error("ADD_GROUP", "ISSUED_ID_RECORD_FAILED",
+                                       "cannot record issued gid")), 500
         new_group = {
             "name": name,
             "passwd": "x",
