@@ -430,6 +430,9 @@ step "프론트엔드"
 if [ -n "$FE_IMAGE" ]; then
   render "$HERE/admin-fe.yaml" | sed -e "s|__FE_IMAGE__|$FE_IMAGE|" -e "s|__FE_HOST__|$FE_HOST|" | kubectl apply -f -
   kubectl -n "$NS" rollout status deployment/ailab-frontend --timeout=5m
+  if [ "$STACK" = "operation" ]; then
+    kubectl apply -f "$HERE/main-entry.yaml"
+  fi
 else
   echo "프론트엔드 이미지가 없어 건너뜀"
 fi
