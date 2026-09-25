@@ -36,7 +36,7 @@ def _body(username):
     return {"request_id": "41", "username": username, "account": {"passwd_hash": HASH}}
 
 
-@pytest.mark.parametrize("username", ["docker", "video", "teamx"])
+@pytest.mark.parametrize("username", ["docker", "video", "teamx", "ubuntu", "ailab-krb5"])
 def test_username_matching_image_or_shared_group_is_rejected(etc, api, registered, username):
     r = api.post("/operations/provision", json=_body(username))
     assert r.status_code == 400
@@ -52,3 +52,18 @@ def test_leftover_personal_group_in_uid_range_is_not_a_conflict(etc, api, regist
 
 def test_unrelated_username_is_registered(etc, api, registered):
     assert api.post("/operations/provision", json=_body("alice")).status_code == 202
+
+
+def test_reserved_names_lists_image_groups_seed_users_and_ops_accounts(api):
+    r = api.get("/reserved-names")
+    assert r.status_code == 200
+    names = r.get_json()["names"]
+    assert names == sorted(names)
+    assert {"docker", "_apt", "admin", "ubuntu", "ailab-krb5"} <= set(names)
+    assert set(names) == set(main.RESERVED_ACCOUNT_NAMES)
+
+
+def test_reserved_names_requires_api_token(api, monkeypatch):
+    monkeypatch.setattr(main, "API_TOKEN", "secret")
+    assert api.get("/reserved-names").status_code == 401
+    assert api.get("/reserved-names", headers={"X-Internal-Token": "secret"}).status_code == 200
