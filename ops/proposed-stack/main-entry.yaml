@@ -1,0 +1,36 @@
+# 호스트 이름 없이 들어오는 메인 주소(nodePort 30081)를 운영 스택 프론트엔드로 보낸다. 운영 스택 설치 때만 적용한다.
+# 예전 프론트엔드(ailab-frontend 네임스페이스의 Deployment)는 은퇴했고 0대로 내려가 있다.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ailab-frontend-operation
+  namespace: ailab-frontend
+spec:
+  type: ExternalName
+  externalName: ailab-frontend.ailab-operation.svc.cluster.local
+  ports:
+    - port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ailab-frontend
+  namespace: ailab-frontend
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "570"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "570"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "570"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx-ailab
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ailab-frontend-operation
+                port:
+                  number: 80
