@@ -144,6 +144,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # 운영에서만 Alertmanager Slack 중계를 받는다(설치 스크립트가 채운다, 실험 스택은 빈 줄).
+__API_INGRESS__
 ---
 # 운영 이미지 안에는 운영 DB·config-server·Slack·메일 주소가 들어 있다. 덮어쓰기에서 하나라도 빠지면
 # 실험 admin_be가 운영에 닿을 수 있으므로, 같은 네임스페이스와 DNS 외의 모든 나가는 연결을 막는다.

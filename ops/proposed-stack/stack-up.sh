@@ -265,6 +265,12 @@ if [ -z "$(kubectl -n "$NS" get secret stack-db -o jsonpath='{.data.config_api_t
 fi
 kubectl -n "$NS" create secret generic config-server-api-token --from-literal=token="$(getpw config_api_token)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# 클러스터 경보(Alertmanager)는 운영 admin_be의 내부 Slack 알림 API로 보내므로, 같은 토큰을 monitoring
+# 네임스페이스에도 둔다. 실험 스택 토큰이 운영 경보 경로에 섞이면 안 되니 운영만 쓴다.
+if [ "$STACK" = "operation" ]; then
+  kubectl -n monitoring create secret generic cluster-monitor-notify-api-token \
+    --from-literal=token="$(getpw config_api_token)" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+fi
 echo "$([ "$TOKEN_NEW" = 1 ] && echo 새로 생성 || echo 기존 값 유지)"
 
 step "MySQL"
@@ -393,8 +399,26 @@ if [ "$STACK" = "operation" ]; then
         - protocol: TCP
           port: 443"
 fi
+# 클러스터 경보(Alertmanager의 Slack 중계)는 운영 admin_be의 /api/internal/slack/notify로만 들어온다.
+# 실험 스택은 진짜 경보를 받으면 안 되므로 운영에만 연다.
+API_INGRESS=""
+if [ "$STACK" = "operation" ]; then
+  API_INGRESS="    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: alertmanager
+      ports:
+        - protocol: TCP
+          port: 8080"
+fi
 render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__CONFIG_HASH__|$CONFIG_HASH|" \
-  | API_EGRESS="$API_EGRESS" awk '{ if (index($0, "__API_EGRESS__")) print ENVIRON["API_EGRESS"]; else print }' \
+  | API_EGRESS="$API_EGRESS" API_INGRESS="$API_INGRESS" awk '{
+      if (index($0, "__API_EGRESS__")) print ENVIRON["API_EGRESS"];
+      else if (index($0, "__API_INGRESS__")) print ENVIRON["API_INGRESS"];
+      else print }' \
   | kubectl apply -f -
 kubectl -n "$NS" rollout status deployment/admin-prod --timeout=10m
 kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
