@@ -1,0 +1,9 @@
+# 런타임에 쓰지 않는 파일은 이미지에 넣지 않는다.
+tests/
+Chart/
+Makefile
+README.md
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.env
