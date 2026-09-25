@@ -891,6 +891,42 @@ render root sasl shadow src ssh ssl-cert staff sudo svmanager sys systemd-journa
 systemd-resolve systemd-timesync tape tty users utmp uucp video voice www-data
 """.split())
 
+# 이미지 그룹이 아니어도 계정명으로 쓰면 안 되는 이름: base_etc/passwd 시드의 시스템 계정과
+# 노드·이미지 운영용 계정. 원장 시드 계정은 새로 만들 때 USER_ALREADY_EXISTS 로도 막히지만,
+# admin_be 가 가입 단계에서 한 목록으로 거르도록 여기 함께 둔다.
+RESERVED_USER_NAMES = frozenset("""
+root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc _apt nobody
+systemd-network systemd-timesync messagebus polkitd admin ubuntu ailab-krb5
+""".split())
+
+# 새 계정명으로 받지 않는 이름 전체. admin_be 는 GET /reserved-names 로 이 목록을 받아 가입 단계에서 쓴다.
+RESERVED_ACCOUNT_NAMES = RESERVED_GROUP_NAMES | RESERVED_USER_NAMES
+
+
+@accounts_bp.route("/reserved-names", methods=["GET"])
+def get_reserved_names():
+    """
+    예약 이름 목록 API
+
+    새 계정명으로 받지 않는 이름(이미지 그룹·시스템 계정·운영용 계정)을 돌려준다.
+    admin_be 가 가입 단계에서 같은 목록으로 거르도록 목록의 원본을 여기 한 곳에 둔다.
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 예약 이름 목록
+
+    responses:
+
+      200:
+        description: 정렬된 예약 이름 목록
+        schema:
+          type: object
+          example: {"names": ["_apt", "admin", "root"]}
+    """
+    return jsonify(names=sorted(RESERVED_ACCOUNT_NAMES)), 200
+
 
 # ----------- Group management -----------
 @accounts_bp.route("/groups", methods=["POST"])
@@ -1450,11 +1486,11 @@ def _adoptable_account_uid(username: str, expected_uid):
 
 
 def _username_group_conflict(username: str) -> Optional[str]:
-    """새 계정명이 이미지 그룹이나 공용 그룹 이름과 겹치면 사유를, 아니면 None 을 돌려준다.
+    """새 계정명이 예약 이름(RESERVED_ACCOUNT_NAMES)이나 공용 그룹 이름과 겹치면 사유를, 아니면 None 을 돌려준다.
     uid 대역(UID_MIN 이상, 공용 gid 대역 미만)의 같은 이름 그룹은 이 사용자의 개인 그룹이 남은
     것이라 계정 단계가 그대로 이어 쓴다 — 충돌로 보지 않는다."""
-    if username in RESERVED_GROUP_NAMES:
-        return f"username is reserved by the container image as a group: {username}"
+    if username in RESERVED_ACCOUNT_NAMES:
+        return f"username is reserved by the container image or operations: {username}"
     for line in read_group_lines():
         rec = parse_group_line(line)
         if not rec or rec["name"] != username:
