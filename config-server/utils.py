@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import shlex
 import re
@@ -833,6 +834,60 @@ def ensure_etc_layout() -> None:
     ensure_seeded_file(app.config["SHADOW_PATH"], "shadow")
     ensure_seeded_file(app.config["BASH_LOGOUT_PATH"], "bash.bash_logout")
     ensure_seeded_file(app.config["BASHRC_PATH"], "bashrc")
+
+# ---- 발급한 uid/gid 최댓값 ----
+# 원장에서 줄이 지워져도(계정 삭제·롤백) NAS 파일·백업·AD에는 그 번호가 남는다. 원장 최댓값 + 1만 보면
+# 맨 끝 번호가 지워진 뒤 같은 번호를 다른 사람에게 다시 줘 옛 파일이 새 주인에게 열린다(proposed#177).
+# 한 번 준 번호를 다시 주지 않도록 종류별 발급 최댓값을 원장 옆에 따로 남긴다. 원장 잠금 안에서 읽고 쓴다.
+ISSUED_ID_KINDS = ("uid", "shared_gid")
+
+
+class IssuedIdRecordCorrupt(RuntimeError):
+    pass
+
+
+def _read_issued_id_record() -> dict:
+    path = app.config["ISSUED_ID_MAX_PATH"]
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        # 0으로 되돌리면 재사용이 다시 열린다 — 추측하지 않고 발급을 멈춘다.
+        raise IssuedIdRecordCorrupt(f"issued id record unreadable: {path}: {e}") from e
+    if not isinstance(data, dict) or not all(
+            isinstance(data.get(k, 0), int) and not isinstance(data.get(k, 0), bool) for k in ISSUED_ID_KINDS):
+        raise IssuedIdRecordCorrupt(f"issued id record malformed: {path}")
+    return data
+
+
+def read_issued_id_max(kind: str) -> int:
+    """kind 로 지금까지 발급한 가장 큰 번호. 기록이 없으면 0."""
+    if kind not in ISSUED_ID_KINDS:
+        raise ValueError(f"unknown id kind: {kind}")
+    with ledger_lock():
+        return _read_issued_id_record().get(kind, 0)
+
+
+def record_issued_id(kind: str, value: int) -> None:
+    """value 가 기존 최댓값보다 크면 올린다. 원장에 줄을 쓰기 전에 불러, 중간에 죽어도 번호가 버려질 뿐
+    다시 나가지는 않게 한다."""
+    if kind not in ISSUED_ID_KINDS:
+        raise ValueError(f"unknown id kind: {kind}")
+    path = app.config["ISSUED_ID_MAX_PATH"]
+    with ledger_lock():
+        data = _read_issued_id_record()
+        if value <= data.get(kind, 0):
+            return
+        data[kind] = int(value)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
 # ---- /etc/passwd & /etc/group parsing ----
 PASSWD_FIELDS = ["name","passwd","uid","gid","gecos","home","shell"]

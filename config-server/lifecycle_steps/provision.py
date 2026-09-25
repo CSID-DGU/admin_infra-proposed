@@ -1327,9 +1327,9 @@ def _rollback_user(name: str) -> None:
             cleaned.append(_main.format_group_entry(rec))
         _main.write_group_lines(cleaned)
 
-def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
-    """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
-    passwd 전체에서 사용 중이지 않은 uid를 반환한다.
+def _allocate_next_uid(lines, min_uid: int = 20000, issued_max: int = 0) -> int:
+    """관리 유저(uid >= min_uid, home=/home/) 최댓값과 지금까지 발급한 최댓값(issued_max) 중 큰 쪽 + 1부터
+    시작해 passwd 전체에서 사용 중이지 않은 uid를 반환한다. 원장에서 지워진 번호는 다시 주지 않는다.
     시스템 계정이 중간 번호를 점유해도 건너뛰므로 충돌이 없다."""
     used_uids = {rec["uid"] for line in lines if (rec := _main.parse_passwd_line(line))}
     managed_uids = {
@@ -1338,13 +1338,13 @@ def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
         and rec["uid"] >= min_uid
         and rec.get("home", "").startswith("/home/")
     }
-    candidate = max(managed_uids, default=min_uid - 1) + 1
+    candidate = max(max(managed_uids, default=min_uid - 1), issued_max) + 1
     while candidate in used_uids:
         candidate += 1
     return candidate
 
-def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
-    """group 파일 기준으로 관리 그룹용 다음 GID를 반환한다."""
+def _allocate_next_gid(lines, min_gid: int = 20000, issued_max: int = 0) -> int:
+    """group 파일의 관리 그룹 최댓값과 지금까지 발급한 최댓값(issued_max) 중 큰 쪽 다음의 빈 GID를 반환한다."""
     reserved_gids = {65534}
     used_gids = {
         rec["gid"]
@@ -1355,7 +1355,7 @@ def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
         gid for gid in used_gids
         if gid >= min_gid and gid not in reserved_gids
     }
-    candidate = max(managed_gids, default=min_gid - 1) + 1
+    candidate = max(max(managed_gids, default=min_gid - 1), issued_max) + 1
     while candidate in used_gids or candidate in reserved_gids:
         candidate += 1
     return candidate
@@ -1384,7 +1384,8 @@ def step_create_account(ctx):
                               error_code="USER_ALREADY_EXISTS", error_detail="user already exists")
                 raise _main.StepFailed({"error": "user already exists"}, 409)
 
-            uid = _main._allocate_next_uid(lines, min_uid=_main.UID_MIN)
+            uid = _main._allocate_next_uid(lines, min_uid=_main.UID_MIN,
+                                           issued_max=_main.read_issued_id_max("uid"))
             if _main.UID_MAX is not None and uid > _main.UID_MAX:
                 _main.log_operation(request_id=request_id, username=name, resource_type="account",
                               action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
@@ -1395,6 +1396,7 @@ def step_create_account(ctx):
                     f"uid range {_main.UID_MIN}~{_main.UID_MAX} exhausted",
                 ), 500)
             gid = uid
+            _main.record_issued_id("uid", uid)
             _main.app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
 
             entry = {
@@ -1458,6 +1460,9 @@ def step_create_account(ctx):
                         updated.append(gl)
                 g_lines = updated
                 if not found:
+                    # 원장에서 빠진 팀 그룹 줄을 되살리는 경로 — 그 번호도 발급 기록에 올려 자동 배정과 겹치지 않게 한다.
+                    if sg_gid >= _main.SHARED_GID_MIN:
+                        _main.record_issued_id("shared_gid", sg_gid)
                     g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
                 added_supp.append({"name": sg_name, "gid": sg_gid})
 
@@ -1629,6 +1634,9 @@ def step_add_user_groups(ctx):
                         updated.append(gl)
                 g_lines = updated
                 if not found:
+                    # 원장에서 빠진 팀 그룹 줄을 되살리는 경로 — 그 번호도 발급 기록에 올려 자동 배정과 겹치지 않게 한다.
+                    if sg_gid >= _main.SHARED_GID_MIN:
+                        _main.record_issued_id("shared_gid", sg_gid)
                     g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [username]}))
                 added_supp.append({"name": sg_name, "gid": sg_gid})
             

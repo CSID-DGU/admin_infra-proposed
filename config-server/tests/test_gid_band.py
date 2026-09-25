@@ -64,3 +64,57 @@ def test_primary_group_name_collision_fails_and_rolls_back(etc, logs):
         provision.step_create_account(ctx)
     assert "newbie" not in {r["name"] for l in main.read_passwd_lines() if (r := main.parse_passwd_line(l))}
     assert [r["error_code"] for r in logs if r.get("phase") == main.Phase.FAIL] == ["GROUP_WRITE_FAILED"]
+
+
+# ---- proposed#177: 한 번 준 번호는 원장에서 지워져도 다시 주지 않는다 ----
+
+def _uids():
+    return {r["name"]: r["uid"] for l in main.read_passwd_lines() if (r := main.parse_passwd_line(l))}
+
+
+def _account_ctx(name):
+    return {"request_id": f"r-{name}", "name": name, "pg_name": name,
+            "supp_groups": [], "gecos": "", "plaintext_pw": "pw"}
+
+
+def test_deleted_top_uid_is_not_reissued(etc, logs):
+    etc(passwd=["yoon6yo:x:21000:21000::/home/yoon6yo:/bin/bash"], group=["yoon6yo:x:21000:"])
+    provision.step_create_account(_account_ctx("olduser"))
+    assert _uids()["olduser"] == 21001
+
+    provision._rollback_user("olduser")          # 맨 끝 번호의 계정이 원장에서 사라진다
+    provision.step_create_account(_account_ctx("newuser"))
+    assert _uids()["newuser"] == 21002
+
+
+def test_deleted_top_shared_gid_is_not_reissued(etc, api):
+    etc()
+    assert api.post("/groups", json={"name": "oldteam"}).status_code == 201
+    assert _gids()["oldteam"] == 70000
+
+    main._remove_group_line("oldteam")
+    r = api.post("/groups", json={"name": "newteam"})
+    assert r.status_code == 201 and r.get_json()["group"]["gid"] == 70001
+
+
+def test_explicit_gid_raises_the_issued_floor(etc, api):
+    etc()
+    assert api.post("/groups", json={"name": "restored", "gid": 70005}).status_code == 201
+    main._remove_group_line("restored")
+    r = api.post("/groups", json={"name": "teamx"})
+    assert r.get_json()["group"]["gid"] == 70006
+
+
+def test_missing_record_falls_back_to_ledger_max(etc, api):
+    etc(group=["legacy:x:70003:"])               # 기록 파일이 생기기 전부터 있던 팀
+    r = api.post("/groups", json={"name": "teamx"})
+    assert r.get_json()["group"]["gid"] == 70004
+
+
+def test_corrupt_record_stops_allocation(etc, api):
+    etc()
+    with open(main.app.config["ISSUED_ID_MAX_PATH"], "w") as f:
+        f.write("{not json")
+    r = api.post("/groups", json={"name": "teamx"})
+    assert r.status_code == 500 and r.get_json()["error"] == "ISSUED_ID_RECORD_FAILED"
+    assert "teamx" not in _gids()
