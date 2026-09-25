@@ -1306,25 +1306,26 @@ def _build_sudoers_policy(username: str) -> Optional[str]:
     return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
 
 def _rollback_user(name: str) -> None:
-    pw_lines = _main.read_passwd_lines()
-    _main.write_passwd_lines([l for l in pw_lines if (_main.parse_passwd_line(l) or {}).get("name") != name])
+    with _main.ledger_lock():
+        pw_lines = _main.read_passwd_lines()
+        _main.write_passwd_lines([l for l in pw_lines if (_main.parse_passwd_line(l) or {}).get("name") != name])
 
-    sh_lines = _main.read_shadow_lines()
-    _main.write_shadow_lines([l for l in sh_lines if (_main.parse_shadow_line(l) or {}).get("name") != name])
+        sh_lines = _main.read_shadow_lines()
+        _main.write_shadow_lines([l for l in sh_lines if (_main.parse_shadow_line(l) or {}).get("name") != name])
 
-    g_lines = _main.read_group_lines()
-    cleaned = []
-    for gl in g_lines:
-        rec = _main.parse_group_line(gl)
-        if not rec:
-            cleaned.append(gl)
-            continue
-        if name in rec["members"]:
-            rec["members"] = [m for m in rec["members"] if m != name]
-        if rec["name"] == name and not rec["members"]:
-            continue
-        cleaned.append(_main.format_group_entry(rec))
-    _main.write_group_lines(cleaned)
+        g_lines = _main.read_group_lines()
+        cleaned = []
+        for gl in g_lines:
+            rec = _main.parse_group_line(gl)
+            if not rec:
+                cleaned.append(gl)
+                continue
+            if name in rec["members"]:
+                rec["members"] = [m for m in rec["members"] if m != name]
+            if rec["name"] == name and not rec["members"]:
+                continue
+            cleaned.append(_main.format_group_entry(rec))
+        _main.write_group_lines(cleaned)
 
 def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
     """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
@@ -1373,7 +1374,7 @@ def step_create_account(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="account",
                   action=Action.CREATE_ACCOUNT, phase=Phase.START)
     try:
-        with _main.LockedFile(_main.app.config["PASSWD_PATH"], "r+") as f:
+        with _main.ledger_lock(), _main.LockedFile(_main.app.config["PASSWD_PATH"], "r+") as f:
             content = f.read()
             lines = content.splitlines()
 
@@ -1421,7 +1422,7 @@ def step_create_account(ctx):
     # 2) group — primary 생성 + supplementary 멤버 추가
     added_supp = []
     try:
-        with _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
+        with _main.ledger_lock(), _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
             content = f.read()
             g_lines = content.splitlines()
 
@@ -1477,7 +1478,6 @@ def step_create_account(ctx):
         passwd_sha512 = ctx.get("passwd_hash") or crypt.crypt(ctx["plaintext_pw"], crypt.mksalt(crypt.METHOD_SHA512))
 
         today_days = int(time.time() // 86400)
-        sh_lines = _main.read_shadow_lines()
         shadow_entry = {
             "name": name,
             "passwd": passwd_sha512,
@@ -1489,8 +1489,10 @@ def step_create_account(ctx):
             "expire": "",
             "flag": "",
         }
-        sh_lines.append(_main.format_shadow_entry(shadow_entry))
-        _main.write_shadow_lines(sh_lines)
+        with _main.ledger_lock():
+            sh_lines = _main.read_shadow_lines()
+            sh_lines.append(_main.format_shadow_entry(shadow_entry))
+            _main.write_shadow_lines(sh_lines)
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] shadow write failed for user=%s, rolling back", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="account",
@@ -1606,7 +1608,7 @@ def step_add_user_groups(ctx):
     
     try:
         added_supp = []
-        with _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
+        with _main.ledger_lock(), _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
             content = f.read()
             g_lines = content.splitlines()
             

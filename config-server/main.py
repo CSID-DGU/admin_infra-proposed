@@ -40,7 +40,7 @@ from lifecycle_steps import verify
 from utils import (
     get_db_connection, get_log_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage, summarize_pod_start_events,
     get_existing_pod, generate_pod_name, delete_pod_util,
-    LockedFile, get_node_gpu_score,
+    LockedFile, ledger_lock, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -683,8 +683,29 @@ def _ensure_team_dir(name: str, gid: int) -> None:
 
 def _remove_group_line(name: str) -> None:
     """그룹 파일에서 한 줄을 지운다. AD 반영 실패 시 방금 쓴 줄을 되돌리는 용도."""
-    write_group_lines([l for l in read_group_lines()
-                       if (parse_group_line(l) or {}).get("name") != name])
+    with ledger_lock():
+        write_group_lines([l for l in read_group_lines()
+                           if (parse_group_line(l) or {}).get("name") != name])
+
+
+def _set_group_membership(groupnames, username: str, member: bool) -> None:
+    """group 파일에서 username의 멤버십을 더하거나 뺀다. AD 호출 동안 원장 잠금을 쥐지 않도록
+    호출자가 앞서 읽은 내용을 쓰지 않고 잠금 안에서 다시 읽어, 그 사이 다른 Pod가 쓴 줄을 덮어쓰지 않는다."""
+    names = set(groupnames)
+    with ledger_lock():
+        lines = read_group_lines()
+        out, changed = [], False
+        for gl in lines:
+            rec = parse_group_line(gl)
+            if rec and rec["name"] in names:
+                current = rec.get("members", [])
+                wanted = sorted(set(current) | {username}) if member else [m for m in current if m != username]
+                if wanted != current:
+                    rec["members"] = wanted
+                    gl, changed = format_group_entry(rec), True
+            out.append(gl)
+        if changed:
+            write_group_lines(out)
 
 
 def _get_farm_node_info(node_name: str) -> dict:
@@ -943,7 +964,7 @@ def add_group(body: AddGroupRequest):
                                        f"invalid members (users not found): {', '.join(invalid_members)}")), 400
 
     ensure_etc_layout()
-    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+    with ledger_lock(), LockedFile(app.config["GROUP_PATH"], "r+") as f:
         g_lines = f.read().splitlines()
 
         if any((parse_group_line(gl) or {}).get("name") == name for gl in g_lines):
@@ -1050,22 +1071,8 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
     if not user_found:
         return jsonify(infra_error("ADD_USER_GROUPS", "USER_NOT_FOUND", f"user not found: {username}")), 404
 
-    # Update group file
     g_lines = read_group_lines()
     names = set(groups)
-    updated = False
-    new_lines = []
-    for gl in g_lines:
-        rec = parse_group_line(gl)
-        if rec and rec["name"] in names:
-            members = set(rec.get("members", []))
-            if username not in members:
-                members.add(username)
-                rec["members"] = sorted(members)
-                updated = True
-            new_lines.append(format_group_entry(rec))
-        else:
-            new_lines.append(gl)
 
     # Ensure all requested groups existed
     existing_group_names = {parse_group_line(gl)["name"] for gl in g_lines if parse_group_line(gl)}
@@ -1097,7 +1104,7 @@ def add_user_groups(username: str, body: AddUserGroupsRequest):
         return jsonify(infra_error("ADD_USER_GROUPS", "TEAM_DIR_CREATE_FAILED",
                                    f"failed to create team directories: {', '.join(sorted(names))}")), 500
 
-    write_group_lines(new_lines)
+    _set_group_membership(names, username, member=True)
 
     # 이미 떠 있는 Pod 는 기동 때 구운 /etc/group 을 그대로 쓴다 — 여기서 채워야 재생성 없이
     # 새 세션부터 그룹이 보인다(admin_infra_server#25). 권한 원천(AD)은 이미 반영됐으므로
@@ -1170,11 +1177,7 @@ def remove_user_group(username: str, groupname: str):
         return jsonify(infra_error("REMOVE_USER_GROUP", "AD_GROUP_MEMBER_FAILED",
                                    f"failed to remove {username} from {groupname} in AD")), 500
 
-    members = [m for m in group.get("members", []) if m != username]
-    if members != group.get("members", []):
-        group["members"] = members
-        write_group_lines([format_group_entry(group) if (r := parse_group_line(gl)) and r["name"] == groupname else gl
-                           for gl in g_lines])
+    _set_group_membership([groupname], username, member=False)
 
     pods = remove_running_pod_groups(username, [groupname])
     return jsonify({"status": "removed", "user": username, "group": groupname, "pods": pods})
@@ -1246,7 +1249,7 @@ def change_user_password(username: str, body: ChangePasswordRequest):
 def set_ledger_password(username: str, passwd_hash: str):
     """계정 원장(shadow)의 해시와 변경일을 바꾼다. 반환: 바꾸기 전 해시, 계정이 없으면 None."""
     ensure_etc_layout()
-    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
+    with ledger_lock(), LockedFile(app.config["SHADOW_PATH"], "r+") as f:
         sh_lines = f.read().splitlines()
         for i, line in enumerate(sh_lines):
             rec = parse_shadow_line(line)

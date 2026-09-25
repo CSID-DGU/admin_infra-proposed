@@ -9,6 +9,12 @@ import main  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def local_ledger_lock(monkeypatch):
+    """원장 잠금은 운영에서 MySQL 이름 잠금이다. 시험에는 DB가 없으므로 프로세스 안 잠금으로 돌린다."""
+    monkeypatch.setenv("LEDGER_LOCK_BACKEND", "local")
+
+
+@pytest.fixture(autouse=True)
 def pod_group_sync(monkeypatch):
     """떠 있는 Pod 에 들어가는 exec 를 막는다(로컬 kubeconfig 가 실제 클러스터를 가리킬 수 있다).
     반환: (username, {그룹: gid}) 호출 목록"""
