@@ -1434,6 +1434,22 @@ def _adoptable_account_uid(username: str, expected_uid):
     return None
 
 
+def _username_group_conflict(username: str) -> Optional[str]:
+    """새 계정명이 이미지 그룹이나 공용 그룹 이름과 겹치면 사유를, 아니면 None 을 돌려준다.
+    uid 대역(UID_MIN 이상, 공용 gid 대역 미만)의 같은 이름 그룹은 이 사용자의 개인 그룹이 남은
+    것이라 계정 단계가 그대로 이어 쓴다 — 충돌로 보지 않는다."""
+    if username in RESERVED_GROUP_NAMES:
+        return f"username is reserved by the container image as a group: {username}"
+    for line in read_group_lines():
+        rec = parse_group_line(line)
+        if not rec or rec["name"] != username:
+            continue
+        if UID_MIN <= rec["gid"] < SHARED_GID_MIN:
+            return None
+        return f"username collides with an existing group: {username} (gid {rec['gid']})"
+    return None
+
+
 @app.route("/operations/provision", methods=["POST"])
 @validate_body(ProvisionRequest)
 def register_provision(body: ProvisionRequest):
@@ -1472,6 +1488,12 @@ def register_provision(body: ProvisionRequest):
         app.logger.warning(f"[JOB] 원장에 남은 계정을 이어받음: user={username} uid={adopted_uid}")
         return _register_job("provision", body.request_id, username, job)
     if body.account is not None:
+        conflict = _username_group_conflict(username)
+        if conflict:
+            # 개인 그룹을 계정명으로 만들고 AD 는 사용자·그룹 이름 공간을 공유한다 — 작업으로 넘기면
+            # 계정 단계에서 primary group conflict 로 실패하고 되돌리므로 등록 전에 거절한다.
+            # 409 는 admin_be 가 "같은 신청의 작업이 진행 중"으로 읽으므로 400 으로 돌려준다.
+            return jsonify(infra_error("PROVISION", "USERNAME_CONFLICTS_GROUP", conflict)), 400
         account = body.account
         job["account"] = {
             "pg_name": account.primary_group_name or username,
