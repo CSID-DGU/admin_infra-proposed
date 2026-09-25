@@ -71,7 +71,9 @@ def test_success_result_carries_ledger_uid_for_reused_account(etc, monkeypatch):
     saved = []
     monkeypatch.setattr(main, "save_job_result", lambda a, r, d: saved.append(d))
     monkeypatch.setattr(main, "log_operation", lambda **kw: None)
-    ctx = {"request_id": "41", "username": "alice", "pod_name": "ailab-alice-1", "node": "farm2"}
+    # 앞 단계가 uid 키를 None 으로 남긴 경우까지 채워야 한다(실험 스택에서 재현).
+    ctx = {"request_id": "41", "username": "alice", "pod_name": "ailab-alice-1", "node": "farm2",
+           "uid": None, "gid": None}
     with main.app.app_context():
         jobs._finish_job("provision", "41", "alice", main.Phase.SUCCESS, ctx=ctx)
     assert saved and saved[0]["uid"] == 55000 and saved[0]["gid"] == 55000
