@@ -77,3 +77,15 @@ def test_success_result_carries_ledger_uid_for_reused_account(etc, monkeypatch):
     with main.app.app_context():
         jobs._finish_job("provision", "41", "alice", main.Phase.SUCCESS, ctx=ctx)
     assert saved and saved[0]["uid"] == 55000 and saved[0]["gid"] == 55000
+
+
+def test_result_fills_gid_when_only_uid_was_set(etc, monkeypatch):
+    """full 모드의 접근 시험은 ctx 에 uid 만 채운다 — gid 가 비면 admin_be 가 계정 기록을 채우지 못한다."""
+    from application import jobs
+    saved = []
+    monkeypatch.setattr(main, "save_job_result", lambda a, r, d: saved.append(d))
+    monkeypatch.setattr(main, "log_operation", lambda **kw: None)
+    ctx = {"request_id": "42", "username": "alice", "pod_name": "ailab-alice-2", "node": "farm2", "uid": 55000}
+    with main.app.app_context():
+        jobs._finish_job("provision", "42", "alice", main.Phase.SUCCESS, ctx=ctx)
+    assert saved[0]["uid"] == 55000 and saved[0]["gid"] == 55000

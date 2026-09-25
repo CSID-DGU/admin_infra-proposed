@@ -276,10 +276,11 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
         except Exception:
             _main.app.logger.warning("[JOB] pod status update failed", exc_info=True)
     if phase == Phase.SUCCESS:
-        if kind == "provision" and ctx.get("uid") is None:
+        if kind == "provision" and (ctx.get("uid") is None or ctx.get("gid") is None):
             # 계정을 재사용한 작업도 원장의 UID 를 실어 준다 — admin_be 가 계정 기록이 빠진 사용자를
             # (원장 계정을 이어받은 경우) 이 값으로 다시 채운다.
-            # 앞 단계가 uid 키를 None 으로 넣어 두기도 해서 setdefault 로는 채워지지 않는다 — 직접 넣는다.
+            # 앞 단계가 uid 키를 None 으로 넣어 두거나(uid 만 채우는 접근 시험도 있다) setdefault 로는 채워지지
+            # 않는다 — 둘 다 원장 값으로 직접 넣는다.
             try:
                 entry = next((e for line in _main.read_passwd_lines()
                               if (e := _main.parse_passwd_line(line)) and e["name"] == ctx.get("username")), None)
