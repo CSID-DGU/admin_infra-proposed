@@ -55,7 +55,9 @@ def _queued(store, action, request_id, job):
 
 # ---------- 작업 등록 ----------
 
-def test_provision_returns_202_and_stores_only_password_hash(api, logs, store):
+def test_provision_returns_202_and_stores_only_password_hash(api, logs, store, monkeypatch):
+    # 그룹 이름 충돌 검사는 원장 파일을 읽는다 — 이 테스트는 작업 저장만 보므로 뺀다.
+    monkeypatch.setattr(main, "_username_group_conflict", lambda username: None)
     r = api.post("/operations/provision", json={
         "request_id": 7, "username": "exp-np-001", "account": {"passwd_base64": PW, "gecos": "t"}})
 
