@@ -788,6 +788,38 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     return result.stdout
 
 
+# 새 계정(또는 삭제 뒤 다시 만든 계정)은 모든 DC에 들어간 뒤에도 노드·NAS에서 한동안 틀리게 보인다. 계정이
+# 생기기 전의 조회 결과를 노드 winbind(300초)·노드 커널 idmap(600초)·NAS가 각각 캐시하고, 우리 쪽에서는
+# 이 캐시들을 비울 수 없다(2026-09-26 실측: DC 복제 뒤 노드에서 본 홈 소유자가 맞기까지 약 6분). 그 사이
+# 컨테이너가 뜨면 사용자가 자기 홈에 쓰지 못하므로, 노드에서 한 번씩 확인해 준비될 때까지 기다린다.
+# 한도는 캐시 수명을 모두 넘기도록 잡는다. 확인은 읽기만 하므로 오래 기다려도 남는 것이 없다.
+NODE_IDENTITY_WAIT_SEC = float(os.getenv("NODE_IDENTITY_WAIT_SEC", "900"))
+NODE_IDENTITY_POLL_SEC = float(os.getenv("NODE_IDENTITY_POLL_SEC", "10"))
+
+
+class NodeIdentityTimeout(RuntimeError):
+    """노드가 한도 안에 사용자와 홈 소유자를 기대한 uid로 보지 못함."""
+
+
+def _wait_node_identity(node: dict, username: str, uid: int) -> None:
+    deadline = time.monotonic() + NODE_IDENTITY_WAIT_SEC
+    last = None
+    while True:
+        out = _farm_ssh(node["host"], node["port"], f"check-identity {username} {int(uid)}")
+        state = next((line.strip() for line in out.splitlines() if line.startswith("identity_state=")), "")
+        if state == "identity_state=ready":
+            return
+        if not state:
+            raise RuntimeError(f"check-identity 응답을 해석하지 못함: {out.strip()[-200:]!r}")
+        if state != last:
+            app.logger.info(f"[KRB5] 노드 신원 대기 {username} → {node['name']}: {state}")
+            last = state
+        if time.monotonic() >= deadline:
+            raise NodeIdentityTimeout(
+                f"{node['name']}에서 {username}(uid {uid})이 {int(NODE_IDENTITY_WAIT_SEC)}초 안에 준비되지 않음: {state}")
+        time.sleep(NODE_IDENTITY_POLL_SEC)
+
+
 def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
     """k8s Secret에서 keytab을 꺼내 원격 관리 스크립트의 deploy 액션으로 전달한다.
     keytab/env 작성, timer 기동, TGT 발급 확인까지 전부 원격에서 끝난다."""
@@ -800,11 +832,7 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
     )
     keytab_b64 = secret.data["krb5.keytab"]
 
-    # 새 계정은 DC 하나에 만들어지고 노드는 다른 DC에 물을 수 있다. 복제 전에 컨테이너가 뜨면 홈 소유자가
-    # nobody로 보이고 노드 커널이 그 결과를 10분 캐시한다. 노드가 사용자를 조회할 수 있을 때까지 먼저
-    # 기다린다. 이 대기는 아무것도 만들지 않는 별도 호출이라, SSH가 끊겨 원격에서 계속 돌거나 재시도와
-    # 겹쳐도 롤백 뒤에 흔적을 되살리지 않는다(deploy 안에 넣으면 되살린다).
-    _farm_ssh(node["host"], node["port"], f"wait-identity {username} {uid}")
+    _wait_node_identity(node, username, uid)
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
     try:
