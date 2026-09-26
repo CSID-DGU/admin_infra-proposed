@@ -790,6 +790,11 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
     )
     keytab_b64 = secret.data["krb5.keytab"]
 
+    # 새 계정은 DC 하나에 만들어지고 노드는 다른 DC에 물을 수 있다. 복제 전에 컨테이너가 뜨면 홈 소유자가
+    # nobody로 보이고 노드 커널이 그 결과를 10분 캐시한다. 노드가 사용자를 조회할 수 있을 때까지 먼저
+    # 기다린다. 이 대기는 아무것도 만들지 않는 별도 호출이라, SSH가 끊겨 원격에서 계속 돌거나 재시도와
+    # 겹쳐도 롤백 뒤에 흔적을 되살리지 않는다(deploy 안에 넣으면 되살린다).
+    _farm_ssh(node["host"], node["port"], f"wait-identity {username} {uid}")
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
     try:
