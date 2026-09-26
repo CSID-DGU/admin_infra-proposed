@@ -78,7 +78,8 @@ def cmd_run(args):
     try:
         run.prepare()
         for case in cases:
-            print(f"  {case['id']} 시작: {case.get('title', '')}")
+            if not catalog.is_fault_case(case) or args.allow_faults:
+                print(f"  {case['id']} 시작: {case.get('title', '')}")
             result = run.run_case(case, allow_faults=args.allow_faults)
             results.append(result)
             detail = f"  step {result.get('step')}: {result.get('error')}" if result["result"] == "FAIL" else ""
