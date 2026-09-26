@@ -1,0 +1,234 @@
+# E2E 시험 사례의 유일한 원본. `python -m harness.e2e run --stack <스택>`이 steps가 있는 사례를 실제 스택에서
+# 돌리고, harness/test_e2e_catalog.py가 CI에서 다음을 확인한다(클러스터 없이).
+#   1) admin_be의 신청 전이 표(lifecycle-transitions.yaml)의 모든 전이가 어느 사례의 covers에 있다.
+#   2) config-server의 모든 오류 코드가 어느 사례의 codes에 있거나, 시험 코드에 등장하거나, waived_codes에 이유와 함께 있다.
+#   3) junit·pytest로 가리킨 시험이 실제로 있다.
+#
+# 사례 형식:
+#   id / title / covers: ["FROM>TO", ...] / codes: [기대 오류 코드]
+#   steps: 실제 스택에서 실행할 단계(runner.py의 do_<단계>) — 또는 —
+#   junit: "<클래스>#<메서드>" (admin_be 단위 시험) / pytest: "<파일>::<시험>" (config-server 가상 시험)
+# fault 단계가 있는 사례는 --allow-faults 없이는 건너뛴다.
+
+cases:
+  - id: C01
+    title: 첫 승인 — 계정·UID가 새로 배정되고 컨테이너가 뜬다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    steps:
+      - user: a
+      - expect_user: {a: {active: false, uid: none}}
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - expect_user: {a: {active: true, uid: issued}}
+      - expect_pod: {r1: present}
+
+  - id: C02
+    title: 대기 중 신청 거절 — 계정을 만들지 않는다
+    covers: ["PENDING>DENIED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - reject: r1
+      - expect_status: {r1: DENIED}
+      - expect_user: {a: {active: false, uid: none}}
+
+  - id: C03
+    title: 사용자 취소 — 대기 중·거절된 신청을 지운다, 떠 있는 컨테이너는 취소로 못 지운다
+    covers: ["PENDING>DELETED", "DENIED>DELETED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - cancel: r1
+      - expect_status: {r1: DELETED}
+      - apply: {user: a, as: r2}
+      - reject: r2
+      - cancel: r2
+      - expect_status: {r2: DELETED}
+
+  - id: C04
+    title: 컨테이너 하나 회수 — 그 신청만 끝나고 같은 사람의 다른 컨테이너와 계정은 남는다
+    covers: ["FULFILLED>EXPIRING", "EXPIRING>DELETED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - apply: {user: a, as: r2}
+      - approve: r2
+      - wait: {r2: FULFILLED}
+      - reclaim_container: r1
+      - wait: {r1: DELETED}
+      - expect_status: {r2: FULFILLED}
+      - expect_pod: {r1: absent, r2: present}
+      - expect_user: {a: {active: true}}
+
+  - id: C05
+    title: 계정 회수 — 컨테이너가 전부 끝나고 계정은 비활성, UID는 그 사람 것으로 남는다
+    covers: ["FULFILLED>EXPIRING", "EXPIRING>DELETED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - remember_uid: {user: a, as: uid_a}
+      - reclaim_account: a
+      - wait: {r1: DELETED}
+      - expect_pod: {r1: absent}
+      - expect_user: {a: {active: false, uid: {same_as: uid_a}}}
+
+  - id: C06
+    title: 회수 후 재신청 — 같은 UID·같은 홈으로 계정이 되살아난다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - remember_uid: {user: a, as: uid_a}
+      - reclaim_account: a
+      - wait: {r1: DELETED}
+      - apply: {user: a, as: r2}
+      - approve: r2
+      - wait: {r2: FULFILLED}
+      - expect_user: {a: {active: true, uid: {same_as: uid_a}}}
+
+  - id: C07
+    title: 비활성화 → 재활성화 → 재승인 — 같은 UID로 돌아온다
+    covers: ["FULFILLED>EXPIRING", "EXPIRING>DELETED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - remember_uid: {user: a, as: uid_a}
+      - deactivate: a
+      - wait: {r1: DELETED}
+      - expect_user: {a: {active: false, uid: {same_as: uid_a}}}
+      - reactivate: a
+      - apply: {user: a, as: r2}
+      - approve: r2
+      - wait: {r2: FULFILLED}
+      - expect_user: {a: {active: true, uid: {same_as: uid_a}}}
+
+  - id: C08
+    title: 노드 이동 — 다른 farm 노드로 옮겨지고 컨테이너가 산다
+    covers: ["FULFILLED>MIGRATING", "MIGRATING>FULFILLED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - migrate: r1
+      - wait: {r1: FULFILLED}
+      - expect_node_changed: r1
+      - expect_pod: {r1: present}
+
+  - id: F01
+    title: 생성 중 제어기 Pod 사망 — 다른(새) 제어기가 이어받아 끝낸다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - sleep: 5
+      - fault: {kill: controller}
+      - wait: {r1: FULFILLED}
+      - expect_user: {a: {active: true, uid: issued}}
+
+  - id: F02
+    title: 생성 중 config-server API Pod 사망 — 작업은 제어기가 계속 돌려 끝낸다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - sleep: 5
+      - fault: {kill: config-server}
+      - wait: {r1: FULFILLED}
+
+  - id: F03
+    title: NAS 연결 차단 중 승인 — 작업이 실패하고 신청은 대기로 돌아오며, 복구 후 재승인은 된다
+    covers: ["PROCESSING>PENDING"]
+    codes: [NAS_SSH_FAILED]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - fault: {block: nas}
+      - approve: r1
+      - wait: {r1: PENDING, timeout: 1500}
+      - expect_codes: {r1: [NAS_SSH_FAILED]}
+      - heal: all
+      - approve: r1
+      - wait: {r1: FULFILLED}
+
+  - id: F04
+    title: AD(=KDC) 연결 차단 중 승인 — 작업이 실패하고 신청은 대기로 돌아오며, 복구 후 재승인은 된다
+    covers: ["PROCESSING>PENDING"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - fault: {block: ad}
+      - approve: r1
+      - wait: {r1: PENDING, timeout: 1500}
+      - heal: all
+      - approve: r1
+      - wait: {r1: FULFILLED}
+
+  - id: F05
+    title: config-server가 내려간 동안 컨테이너 회수 — 회수는 실패하고 신청은 떠 있는 상태로 돌아온다
+    covers: ["FULFILLED>EXPIRING", "EXPIRING>FULFILLED", "EXPIRING>DELETED"]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - fault: {down: config-server}
+      - reclaim_container: {req: r1, expect: error}
+      - expect_status: {r1: FULFILLED}
+      - heal: all
+      - reclaim_container: r1
+      - wait: {r1: DELETED}
+
+  - id: V01
+    title: 생성 작업이 실패로 끝난 뒤(폴러가 되돌리기 전) 거절 — 실제 스택에서는 경합 순간을 만들 수 없다
+    covers: ["PROCESSING>DENIED"]
+    junit: "AdminRequestCommandServiceTest#rejectRequest_success_whenProvisionJobFailed"
+
+# 아직 어떤 시험도 일으키지 않는 오류 코드. 이유를 적어 두고, 시험을 만들면 여기서 뺀다.
+# (테스트가 새로 생겼는데 이 목록에 남아 있으면 test_e2e_catalog가 알려 준다.)
+waived_codes:
+  ACCOUNT_FILE_WRITE_FAILED: 원장 파일 쓰기 실패 — /kube_share 쓰기 장애를 만들 수단이 아직 없음
+  ACCOUNT_PREFIX_MISMATCH: 접두어 가드 — stack-up 자체 점검이 403으로 확인(코드 문자열 단언은 없음)
+  DELETE_POD_FAILED: Pod 삭제 API 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  GID_RANGE_EXHAUSTED: 공용 그룹 gid 대역 소진 — 대역을 다 쓰는 시험은 비용이 커서 보류
+  GROUP_GID_EXISTS: 그룹 gid 중복 — 그룹 API E2E가 아직 없음
+  GROUP_NAME_EXISTS: 그룹 이름 중복 — 그룹 API E2E가 아직 없음
+  JOB_LOG_UNAVAILABLE: 작업 기록 DB 조회 실패 — log DB 장애 주입 수단 없음
+  JOB_STORE_UNAVAILABLE: 작업 저장소 실패 — log DB 장애 주입 수단 없음
+  K8S_CLIENT_SETUP_FAILED: 쿠버네티스 클라이언트 초기화 실패 — 설정 파손 시험 없음
+  KDC_FAILED: KDC 실패 — F04(AD 차단)에서 나올 수 있으나 어느 단계에서 먼저 끊기는지 확정 전이라 단언하지 않음
+  KRB5_FARM_CLEANUP_FAILED: farm keytab 정리 실패 — farm 노드 SSH 차단 장애 미구현
+  KRB5_PRINCIPAL_DELETE_FAILED: principal 삭제 실패 — 회수 중 AD 차단 사례 미구현
+  LOGIN_PASSWORD_MISSING: 로그인 비밀번호 없음 — admin_be가 항상 보내므로 API로 재현 불가
+  NODEPORT_RELEASE_FAILED: 포트 반납 실패 — 포트 DB 장애 주입 수단 없음
+  NODEPORT_SERVICE_DELETE_FAILED: 포트 Service 삭제 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  NODE_LIST_FAILED: 노드 목록 조회 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  NODE_SELECTION_FAILED: 노드 선택 실패 — 모든 노드를 꽉 채우는 시험은 비용이 커서 보류
+  OBSERVE_FAILED: 관측 실패 — 가상 시험 없음
+  OLD_POD_CLEANUP_FAILED: 이동 후 옛 Pod 정리 실패 — 이동 중 장애 주입 미구현
+  PASSWD_WRITE_FAILED: passwd 쓰기 실패 — /kube_share 쓰기 장애를 만들 수단이 아직 없음
+  POD_ALREADY_EXISTS: 같은 이름 Pod 존재 — 가상 시험 없음
+  POD_CHECK_FAILED: Pod 확인 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  POD_DELETE_FAILED: Pod 삭제 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  POD_DELETE_TIMEOUT: Pod 삭제 시간 초과 — finalizer로 삭제를 막는 장애 미구현
+  POD_READY_CHECK_FAILED: 준비 확인 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  POD_SPEC_BUILD_FAILED: Pod 명세 생성 실패 — 가상 시험 없음
+  POD_STATUS_LOOKUP_FAILED: Pod 상태 조회 실패 — 쿠버네티스 API 장애 주입 수단 없음
+  SHADOW_WRITE_FAILED: shadow 쓰기 실패 — /kube_share 쓰기 장애를 만들 수단이 아직 없음
+  STEP_FAILED: 분류되지 않은 단계 실패의 기본값 — 특정 장애로 일으키는 코드가 아님
+  SUDOERS_CREATE_FAILED: sudoers 생성 실패 — /kube_share 쓰기 장애를 만들 수단이 아직 없음
+  UID_RANGE_EXHAUSTED: UID 대역 소진 — 대역을 다 쓰는 시험은 비용이 커서 보류
+  UNRESUMABLE_UNKNOWN: 이어갈 수 없는 결과 불명 — 가상 시험 없음
+  USER_CONFIG_FETCH_FAILED: admin_be 설정 조회 실패 — admin_be 차단 장애 미구현
+  USER_CONFIG_INVALID_RESPONSE: admin_be 설정 응답 이상 — 가상 시험 없음
