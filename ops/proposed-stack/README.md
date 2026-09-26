@@ -1,16 +1,18 @@
 # 실험 스택 설치
 
-제안 시스템을 `ailab-baseline`, `ailab-noprobe`, `ailab-full` 네임스페이스에 띄우는 스크립트다. 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다.
+제안 시스템을 `ailab-baseline`, `ailab-noprobe`, `ailab-full`(실험)과 `ailab-operation`(운영) 네임스페이스에 띄우는 스크립트다. 직접 실행하지 않고 **CSID-DGU/admin_infra의 Actions → "Deploy Proposed Stack"**에서 실행한다. 새로 등록할 시크릿은 없다.
 
 | 입력 | 값 |
 | --- | --- |
-| stack | `baseline`, `noprobe`, `full` |
-| ref | 이 레포의 브랜치·태그·커밋 |
-| fe_ref / be_ref | admin_fe / admin_be의 브랜치·태그·커밋 (be 기본 `develop`) |
+| stack | `baseline`, `noprobe`, `full`, `operation` |
+| ref | 이 레포의 브랜치·태그·커밋 (기본 `main`) |
+| fe_ref / be_ref | admin_fe / admin_be의 브랜치·태그·커밋 (기본 `main`) |
 | action | `up`(띄우기, 이미 있으면 재배포) / `down`(테스트 계정 정리 후 내리기) |
 
 ```bash
-gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=baseline -f ref=develop
+gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=baseline
+# 운영: 네 저장소에 같은 릴리스 태그를 찍고 그 태그만 준다(워크플로 guard가 막는다)
+gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=operation -f ref=v3.0.0 -f fe_ref=v3.0.0 -f be_ref=v3.0.0
 ```
 
 세 스택에는 같은 커밋(`ref`, `fe_ref`, `be_ref` 모두)을 올린다. 세 스택의 차이는 config-server의 실행 방식(`VERIFY_MODE`) 하나여야 한다.
@@ -89,6 +91,6 @@ kubectl -n ailab-noprobe get pods -o wide
 
 admin_be는 세 스택 모두 작업 등록 인터페이스(`POST /operations/provision`·`revoke`, `GET /operations/{kind}/{신청번호}`)만 쓴다. baseline도 같은 be를 쓰고, 방식 차이는 config-server 제어기에서만 난다(9/14 결정). 옛 동기 경로는 admin_be `legacy-sync` 태그에 남아 있다.
 
-워크플로의 `be_ref`(기본 `develop`)로 `admin-prod-exp:<sha>` 이미지를 빌드해 올린다. 운영 admin_be 이미지는 이 인터페이스를 모르므로 쓰지 않는다. 운영 admin_be 배포는 `main` push에만 걸려 있어 브랜치를 올려도 운영에는 닿지 않는다.
+워크플로의 `be_ref`(기본 `main`)로 `admin-prod-exp:<sha>` 이미지를 빌드해 올린다. 어느 저장소에도 push로 도는 배포는 없다.
 
 스택 전용 이미지는 설정 파일을 굽지 않는다. 설정은 운영 `admin-prod-config` Secret 복사본을 `/app/config`에 마운트해서 받고, 스택 자원을 가리키는 값만 `SPRING_APPLICATION_JSON`으로 덮어쓴다.

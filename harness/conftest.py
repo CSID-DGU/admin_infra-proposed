@@ -30,6 +30,18 @@ def _raw(fixture):
     return getattr(fixture, "__wrapped__", fixture)
 
 
+# config-server 시험이 모든 시험에 자동으로 거는 격리(원장 잠금을 프로세스 안 잠금으로, 떠 있는 Pod 에 들어가는
+# exec 차단). 여기서 빠지면 가상 계층이 실제 DB·클러스터에 닿으려다 실패한다 — #198 원장 잠금이 빠져
+# harness 시험 8개가 DB_HOST 로 깨진 채 남아 있었다. lease_env 는 아래 lease 로 따로 건다.
+_TARGET_AUTOUSE = ("local_ledger_lock", "pod_group_sync", "pod_group_remove", "pod_password_sync")
+
+
+@pytest.fixture(autouse=True)
+def target_isolation(monkeypatch):
+    for name in _TARGET_AUTOUSE:
+        _raw(getattr(target_conftest, name))(monkeypatch)
+
+
 @pytest.fixture
 def lease(monkeypatch):
     return _raw(target_conftest.lease_env)(monkeypatch)
