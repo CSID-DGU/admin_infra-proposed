@@ -47,10 +47,10 @@ def test_wrapped_timeout_is_unknown():
 
 def test_step_order_matches_current_flow():
     # AD 그룹 반영은 반드시 krb5 principal(=AD 사용자 생성) 뒤에 온다 — 그 전에는
-    # 멤버로 넣을 대상이 없다(#146).
+    # 멤버로 넣을 대상이 없다(#146). 복제 대기는 AD 사용자가 생긴 바로 뒤, 노드가 조회하기 전에 온다.
     assert [s.__name__ for s in main.ACCOUNT_CREATE_STEPS] == [
         "step_create_account", "step_create_home", "step_create_krb5_principal",
-        "step_sync_ad_groups"]
+        "step_await_ad_replication", "step_sync_ad_groups"]
     assert [s.__name__ for s in main.SUPP_GROUPS_ONLY_STEPS] == [
         "step_add_user_groups", "step_sync_ad_groups", "step_trigger_nas_gss_flush"]
     assert [s.__name__ for s in main.POD_CREATE_STEPS] == [

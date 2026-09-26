@@ -62,6 +62,30 @@ def test_nas_client_rejects_unknown_hosts_when_known_hosts_present(tmp_path, mon
     assert seen == {"loaded": str(kh), "policy": "RejectPolicy"}
 
 
+def test_nas_client_bounds_only_the_tcp_connect(monkeypatch):
+    """연결에만 한도를 건다 — banner·auth·channel 한도나 명령 실행 한도는 두지 않는다(홈 작업은 오래 걸릴 수 있다)."""
+    import paramiko
+    monkeypatch.setenv("NAS_SSH_HOST", "nas")
+    monkeypatch.setenv("NAS_SSH_USER", "u")
+    monkeypatch.setenv("NAS_SSH_KEY_PATH", "/k")
+    seen = {}
+
+    class FakeClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeClient)
+    utils._nas_ssh_client()
+    assert seen["timeout"] == utils.NAS_SSH_CONNECT_TIMEOUT_SEC == 10
+    assert not {"banner_timeout", "auth_timeout", "channel_timeout"} & seen.keys()
+
+
 def test_ssh_targets_reads_nas_farm_and_ad_hosts():
     import importlib.util
     import pathlib
