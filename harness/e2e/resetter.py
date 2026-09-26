@@ -23,10 +23,10 @@ def admin_email(run_id):
 
 
 class Resetter:
-    def __init__(self, cluster, api, stack_prefix, run_id, *, wait_timeout=900, interval=10):
-        if cluster.stack == "operation":
-            # 실사용자 홈과 계정이 있는 스택에서는 이름 규칙이 맞아도 지우지 않는다.
-            raise ValueError("operation 스택에서는 E2E 정리를 실행하지 않는다")
+    def __init__(self, cluster, api, stack_prefix, run_id, *, wait_timeout=900, interval=10, allow_operation=False):
+        if cluster.stack == "operation" and not allow_operation:
+            # 실사용자 홈과 계정이 있는 스택에서는 명시하지 않는 한 이름 규칙이 맞아도 지우지 않는다.
+            raise ValueError("operation 스택에서는 allow_operation 없이 E2E 정리를 실행하지 않는다")
         self.cluster, self.api = cluster, api
         self.prefix = run_prefix(stack_prefix, run_id)
         self.admin_email = admin_email(run_id)

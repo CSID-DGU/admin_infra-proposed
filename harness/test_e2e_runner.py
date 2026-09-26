@@ -142,6 +142,13 @@ def test_resetter_refuses_operation_stack():
         Resetter(FakeCluster(stack="operation"), FakeApi(), "", "abc12")
 
 
+def test_resetter_on_operation_needs_explicit_opt_in_and_stays_within_run_prefix():
+    resetter = Resetter(FakeCluster(stack="operation"), FakeApi(), "", "abc12", allow_operation=True)
+    assert resetter.prefix == "e2eabc12"
+    with pytest.raises(ValueError):
+        resetter._delete_homes(["yoon6yo"])
+
+
 def test_resetter_never_deletes_homes_outside_the_run_prefix():
     resetter = Resetter(FakeCluster(), FakeApi(), "exp-fu-", "abc12")
     with pytest.raises(ValueError):
