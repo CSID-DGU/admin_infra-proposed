@@ -129,7 +129,7 @@ def env(monkeypatch, tmp_path):
         return cur.lastrowid
 
     monkeypatch.setattr(main, "log_operation", log_operation)
-    monkeypatch.setattr(main, "get_log_db_connection", lambda: Sql(db))
+    monkeypatch.setattr(main, "get_log_db_connection", lambda **timeouts: Sql(db))
 
     # Redis
     def save(a, r, job):

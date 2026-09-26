@@ -15,6 +15,7 @@ import requests
 import urllib3
 from kubernetes import client
 
+from adapters import job_control
 from adapters.operation_log import Action, Phase
 
 
@@ -321,6 +322,52 @@ def _remove_account_leftovers(username):
         _main.write_group_lines(g_new)
     return removed
 
+def _query_deletion_evidence(conn, username):
+    """이 사용자의 마지막 계정 생성 이후, 계정 파일을 실제로 고친 계정 삭제 기록 하나(id, request_id, phase, error_code)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM operation_log WHERE username = %s AND action = %s"
+            " AND resource_type = %s AND phase = %s",
+            (username, Action.CREATE_ACCOUNT.value, "account", Phase.SUCCESS.value))
+        created = cur.fetchone()[0] or 0
+        cur.execute(
+            "SELECT id, request_id, phase, error_code FROM operation_log WHERE username = %s AND action = %s"
+            " AND resource_type = %s AND id > %s AND ((phase = %s AND (error_detail IS NULL OR error_detail NOT LIKE %s))"
+            " OR error_code = %s) ORDER BY id DESC LIMIT 1",
+            (username, Action.DELETE_ACCOUNT.value, "account", created, Phase.SUCCESS.value,
+             "%already_absent%", "ACCOUNT_FILE_WRITE_FAILED"))
+        return cur.fetchone()
+
+
+def _account_deletion_evidence(username):
+    """계정이 없는 것이 "누가 지웠기 때문"임을 보이는 작업 기록. 없거나 조회하지 못하면 None.
+
+    계정 파일에 없다는 사실만으로는 회수됐다고 믿지 않는다 — 계정 파일이 비었거나 잘못 읽혔거나, 애초에
+    없던 사용자를 회수하라는 요청일 수 있다. 계정 파일과 다른 정보원(작업 기록)에서, 이 사용자의 마지막
+    계정 생성(CREATE_ACCOUNT SUCCESS, 없으면 처음부터) 이후에 계정 파일을 실제로 고친 삭제가 있었는지 본다.
+    - DELETE_ACCOUNT SUCCESS(이미 없음으로 넘긴 것은 제외 — 증거 없는 "없음"이 서로를 증거로 삼지 않게)
+    - ACCOUNT_FILE_WRITE_FAILED(passwd부터 쓰다가 멈춘 삭제 — 응답 끊김·반쪽 삭제)
+    운영에서 넘어온 옛 계정처럼 생성 기록이 없어도 첫 삭제가 기록을 남기므로 두 번째 노드부터는 증거가 있다.
+    계정 파일을 쓴 뒤 기록을 남기기 전에 제어기가 죽은 삭제는 증거가 없어 기존처럼 404로 남는다."""
+    # 계정 파일 잠금 안에서 부르므로 로그 DB가 멈춰도 계정 작업 전체가 멈추지 않게 시간 제한을 둔다.
+    try:
+        conn = _main.get_log_db_connection(**job_control.CHECKPOINT_DB_TIMEOUTS)
+    except Exception:
+        _main.app.logger.warning(f"[ACCOUNTS] {username} 삭제 기록 조회 실패 — 이미 없음을 인정하지 않음", exc_info=True)
+        return None
+    try:
+        row = _query_deletion_evidence(conn, username)
+    except Exception:
+        _main.app.logger.warning(f"[ACCOUNTS] {username} 삭제 기록 조회 실패 — 이미 없음을 인정하지 않음", exc_info=True)
+        return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    log_id, request_id, phase, error_code = row
+    return {"log_id": log_id, "request_id": str(request_id), "phase": phase, "error_code": error_code}
+
+
 def step_delete_account(ctx):
     request_id, username, node_name = ctx["request_id"], ctx["username"], ctx.get("node_name")
 
@@ -341,16 +388,21 @@ def step_delete_account(ctx):
                 continue
             new_lines.append(line)
         if removed_user is None:
-            if ctx.get("account_absent_is_goal"):
+            evidence = _account_deletion_evidence(username) if ctx.get("account_absent_is_goal") else None
+            if evidence is not None:
                 # 목표 상태(계정 없음)에 이미 도달했다(#213). 노드마다 등록되는 계정 회수의 두 번째부터,
                 # 또는 삭제는 끝났는데 응답이 끊긴 재시도에서 생긴다. 실패로 끝내면 뒤의 Kerberos 정리
                 # (그 노드 keytab)와 회수 확인이 빠지므로, 반쯤 지워진 흔적만 치우고 성공으로 넘긴다.
-                # 실제로 지운 경우와 섞이지 않게 error_detail에 already_absent를 남긴다.
+                # 실제로 지운 경우와 섞이지 않게 error_detail에 already_absent와 지운 기록을 남긴다.
                 leftovers = _remove_account_leftovers(username)
                 _main.log_operation(request_id=request_id, username=username, node_name=node_name,
                               resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS,
-                              error_detail=json.dumps({"already_absent": True, "leftovers_removed": leftovers}))
+                              error_detail=json.dumps({"already_absent": True, "deleted_by": evidence,
+                                                       "leftovers_removed": leftovers}))
                 return
+            if ctx.get("account_absent_is_goal"):
+                _main.app.logger.warning(
+                    f"[ACCOUNTS] {username}이(가) 계정 파일에 없지만 지운 기록이 없어 회수 완료로 보지 않음")
             # baseline(운영 재현)과 작업 보상 경로: 404로 돌려준다. 운영 admin_be는 404를 "이미 삭제됨"으로
             # 처리한다. 지표를 뽑을 때 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다.
             _main.log_operation(request_id=request_id, username=username, node_name=node_name,
