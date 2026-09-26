@@ -27,6 +27,28 @@ admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 �
 
 ---
 
+## E2E 시험 (`harness/e2e`)
+
+신청 생명주기의 모든 전이와 장애 사례를 실제 실험 스택에서 돌리고, 끝나면 이번 실행이 만든 것을 전부 지운 뒤
+남은 것이 있으면 실패로 끝난다. 사례는 `harness/e2e/catalog.yaml` 한 곳에만 있다.
+
+```bash
+python -m harness.e2e list                                   # 사례 목록
+python -m harness.e2e run --stack full                       # 장애 없는 사례
+python -m harness.e2e run --stack full --allow-faults        # Pod 사망·NAS/AD 차단·config-server 중단 포함
+python -m harness.e2e run --stack full --case C04 --keep     # 한 사례만, 정리하지 않고 남김(조사용)
+python -m harness.e2e reset --stack full --run <runid>       # 남겨 둔 실행 정리
+```
+
+- 접속 정보는 저장소 밖 `~/.ailab-exp/e2e.env`(`E2E_ENV`로 변경)에 둔다: `SSH_TARGET`, `SSH_PORT`, `SSH_KEY`,
+  `KUBECONFIG`, `URL_<STACK>`, `CA_FILE`(스택 입구의 자체 서명 인증서). 보고서는 `~/.ailab-exp/e2e-reports/`에 쓴다.
+- 사례마다 `<스택 접두어>e2e<runid><사례><별칭>` 이름의 새 사용자를 만든다. 정리는 이 접두어로만 범위를 좁히고,
+  operation 스택에서는 실행·정리 모두 거부한다.
+- CI는 `harness/test_e2e_catalog.py`로 admin_be 전이 표(`lifecycle-transitions.yaml`)의 모든 전이와
+  config-server의 모든 오류 코드가 사례·시험·면제(이유 필수) 중 하나에 있는지 확인한다.
+
+---
+
 ## 5. 트러블슈팅 (Troubleshooting)
 
 배포 후 문제가 발생했을 때 확인 및 조치 방법입니다.
