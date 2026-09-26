@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 # 프로세스 식별자. import 시점에 정해져 프로세스 안에서는 불변이다.
 OWNER = f"{os.getenv('HOSTNAME', 'local')}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 LEASE_TTL_SEC = float(os.getenv("JOB_LEASE_TTL_SEC", "30"))
+# 계정 단계 안의 체크포인트는 계정 파일 잠금을 쥔 채 진행 기록을 쓴다(#210). 로그 DB가 멈추면 모든 계정
+# 작업이 같이 멈추지 않도록 그 호출에만 시간 제한을 둔다(단계 사이 기록·작업 조회는 제한하지 않는다).
+CHECKPOINT_DB_TIMEOUTS = {
+    "connect_timeout": int(os.getenv("JOB_CONTROL_DB_CONNECT_TIMEOUT_SEC", "5")),
+    "read_timeout": int(os.getenv("JOB_CONTROL_DB_RW_TIMEOUT_SEC", "10")),
+    "write_timeout": int(os.getenv("JOB_CONTROL_DB_RW_TIMEOUT_SEC", "10")),
+}
 
 
 class LeaseLost(Exception):
@@ -67,16 +74,25 @@ def claim(job_id, request_id, action, owner=None, ttl_sec=None):
         conn.close()
 
 
-def record_step(job_id, done_steps, saved_ctx, owner=None):
-    """끝난 단계 목록과 이어하기 컨텍스트를 기록한다. 소유권이 넘어갔으면 LeaseLost."""
-    conn = get_log_db_connection()
+def record_step(job_id, done_steps, saved_ctx, owner=None, timeouts=None):
+    """끝난 단계 목록과 이어하기 컨텍스트를 기록한다. 소유권이 넘어갔으면 LeaseLost.
+
+    MySQL은 FOUND_ROWS 없이 "바뀐" 행 수를 돌려주므로, 저장된 값과 똑같은 기록은 소유자여도 0행이다
+    (되감기 뒤 같은 uid를 다시 받은 계정 체크포인트 등, #210). 0행이면 소유자를 다시 읽어 판정한다.
+    timeouts: 계정 파일 잠금 안에서 부를 때만 CHECKPOINT_DB_TIMEOUTS를 넘긴다. 단계 사이의 기록은 기다린다."""
+    owner = owner or OWNER
+    conn = get_log_db_connection(**(timeouts or {}))
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE job_control SET done_steps=%s, saved_ctx=%s "
                         "WHERE job_id=%s AND owner=%s",
                         (json.dumps(done_steps), json.dumps(saved_ctx, default=str),
-                         job_id, owner or OWNER))
-            lost = cur.rowcount == 0
+                         job_id, owner))
+            lost = False
+            if cur.rowcount == 0:
+                cur.execute("SELECT owner FROM job_control WHERE job_id=%s", (job_id,))
+                row = cur.fetchone()
+                lost = row is None or row[0] != owner
             conn.commit()
         if lost:
             raise LeaseLost(f"job {job_id}")

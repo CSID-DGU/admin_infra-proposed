@@ -159,3 +159,24 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 필수 입력은 `name`, `uid`, `gid`, `passwd_sha512`이다. 먼저 passwd에 같은 사용자가 있는지 확인하고, 없으면 passwd entry를 추가한다. 그 다음 primary group name과 gid를 기준으로 group entry가 없으면 새로 만든다. shadow에는 전달받은 SHA-512 crypt 패스워드와 password aging 기본값을 넣는다.
 
 `SUDO_ALLOWED_COMMANDS` 설정이 있으면 `_build_sudoers_policy()`가 password-protected sudo whitelist 정책을 만들고, 사용자별 sudoers 파일을 `0440` 권한으로 생성한다. 이 API로 만든 계정 정보는 이후 `build_pod_spec()`에서 Pod에 read-only subPath mount되어 컨테이너 내부의 `/etc/passwd`, `/etc/group`, `/etc/shadow`처럼 보이게 된다.
+
+#### 제어기 작업에서 계정 단계 도중 중단됐을 때 (#210)
+
+제어기가 실행하는 생성 작업(NoProbe·Full)에서 계정 단계(`step_create_account`)는 이 이름의 계정이 없음을 잠금 안에서 확인하고 uid를 정한 직후, 계정 파일에 쓰기 **전에** 그 작업의 진행 기록(`job_control.saved_ctx`)에 쓰기 시작 표시 `account_write_started`(= 정한 uid)를 남긴다. 계정 단계 도중 제어기가 죽으면 이어받은 제어기는 계정 단계를 다시 실행하기 전에 `_judge_interrupted_account`(`application/jobs.py`)로 판정한다.
+
+| 이어받을 때 본 상태 | 처리 |
+| --- | --- |
+| 표시 없음 | 이 작업은 계정 파일에 쓰지 않았다. 계정 단계를 그대로 실행한다(같은 이름 계정은 예전 신청이 만든 것이므로 지금처럼 `USER_ALREADY_EXISTS`) |
+| 표시 있음, 계정 없음 | 쓰기 전에 죽었다. 계정 단계를 그대로 실행한다 |
+| 표시 있음, 이름·uid 일치, passwd·group(개인·보조)·shadow·sudoers 모두 있음 | 이 작업이 끝까지 쓴 계정이다. `CREATE_ACCOUNT SUCCESS`(error_detail에 `resumed`)를 남기고 다음 단계로 간다 |
+| 표시 있음, 이름·uid 일치, 일부 빠짐 | 이 작업이 쓰다 만 계정이다. `_rollback_user(name, primary_gid=…)`로 치우고(개인 그룹 이름이 사용자명과 달라도 그 gid의 빈 개인 그룹까지) 계정 단계를 다시 실행한다 |
+| 표시 있음, 이름은 있는데 uid가 다름 | 이 작업은 쓰지 못했고 같은 사람의 다른 신청이 그 사이 만든 계정이다(admin_be는 같은 사람의 신청을 동시에 승인할 수 있다). 표시 없음과 같이 그대로 실행해 계정을 건드리지 않고 `USER_ALREADY_EXISTS`로 실패한다 → admin_be가 신청을 PENDING으로 되돌리고 재승인 때 재사용한다 |
+| 계정 파일을 읽지 못함 | 판정하지 않고 `DEGRADED`(`reason=OBSERVE_FAILED`)로 넘긴다 — 결과 불명 관찰 실패와 같은 규칙 |
+
+- 판정과 치우기는 계정 파일 잠금(`ledger_lock`) 안에서 한다. lease가 넘어간 뒤에도 옛 소유자가 아직 쓰는 중일 수 있다.
+- 표시는 계정 파일 잠금을 쥔 채 로그 DB에 기록하므로 이 기록(`record_step(..., timeouts=CHECKPOINT_DB_TIMEOUTS)`)에만 시간 제한을 둔다(`JOB_CONTROL_DB_CONNECT_TIMEOUT_SEC` 기본 5초, `JOB_CONTROL_DB_RW_TIMEOUT_SEC` 기본 10초). 기록이 실패하면 아무것도 쓰지 않은 채 `CHECKPOINT_FAILED`로 남기고 재시도한다. 소유권을 잃었으면(`LeaseLost`) 쓰지 않고 물러난다.
+- MySQL은 값이 바뀌지 않은 UPDATE를 0행으로 돌려준다(FOUND_ROWS 미사용). `record_step`은 0행이면 소유자를 다시 읽어, 같은 값을 다시 기록한 소유자를 `LeaseLost`로 오판하지 않는다.
+
+- 알려진 한계: 예전에 계정이 있던 사람은 동시에 승인된 두 신청이 같은 uid(`expected_uid`)를 되돌려 받을 수 있다. 표시만 남기고 죽은 작업이 다른 신청이 쓴 계정을 자기 것으로 보고 이어갈 수 있으며, 그 작업이 Kerberos 단계 뒤에 실패하면 보상이 그 계정을 지우려 할 수 있다(다른 컨테이너가 떠 있으면 `ACCOUNT_IN_USE`로 보류). uid만으로는 가릴 수 없어, 계정 생성 작업이 도는 동안 같은 사람의 승인을 막는 것은 admin_be 몫이다.
+
+baseline은 운영의 "죽으면 끝"을 재현해야 하므로 표시를 남기지 않고 판정도 하지 않는다.

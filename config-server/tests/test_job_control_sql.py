@@ -49,7 +49,7 @@ def db(monkeypatch):
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.execute("""CREATE TABLE job_control (job_id INTEGER PRIMARY KEY, request_id TEXT, action TEXT,
         owner TEXT NOT NULL, lease_until REAL NOT NULL, done_steps TEXT, saved_ctx TEXT)""")
-    monkeypatch.setattr(job_control, "get_log_db_connection", lambda: Sql(conn))
+    monkeypatch.setattr(job_control, "get_log_db_connection", lambda **kw: Sql(conn))
     for n, fn in _REAL.items():                       # 이 파일은 실제 SQL 경로를 검증한다
         monkeypatch.setattr(job_control, n, fn)
     return conn
@@ -99,3 +99,66 @@ def test_renew_only_touches_own_jobs_and_release_removes_row(db):
     assert db.execute("SELECT COUNT(*) FROM job_control").fetchone()[0] == 2
     job_control.release(1, owner="me")
     assert db.execute("SELECT COUNT(*) FROM job_control WHERE job_id=1").fetchone()[0] == 0
+
+
+class _MysqlAffectedRows:
+    """MySQL 기본(FOUND_ROWS 없음) 의미론 대역: UPDATE의 rowcount는 "바뀐" 행 수다.
+    sqlite는 일치한 행 수를 세므로 이 경우를 재현하지 못한다."""
+
+    def __init__(self, owner):
+        self.owner, self.stored, self.executed, self.kw = owner, None, [], None
+
+    def cursor(self):
+        outer = self
+
+        class Cur:
+            rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+            def execute(self, sql, params=()):
+                outer.executed.append(sql.split()[0])
+                if sql.startswith("UPDATE"):
+                    done, ctx, _job, who = params
+                    changed = who == outer.owner and outer.stored != (done, ctx)
+                    if who == outer.owner:
+                        outer.stored = (done, ctx)
+                    self.rowcount = 1 if changed else 0
+
+            def fetchone(self):
+                return (outer.owner,)
+        return Cur()
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_record_step_identical_write_by_owner_is_not_lease_lost(monkeypatch):
+    """같은 값을 다시 기록하면 MySQL은 0행을 돌려준다 — 소유자면 LeaseLost가 아니다(#210)."""
+    conn = _MysqlAffectedRows(owner="me")
+    seen = {}
+    monkeypatch.setattr(job_control, "get_log_db_connection", lambda **kw: (seen.update(kw), conn)[1])
+    monkeypatch.setattr(job_control, "record_step", _REAL["record_step"])
+    cp = job_control.CHECKPOINT_DB_TIMEOUTS
+    job_control.record_step(1, [], {"account_write_started": 50001}, owner="me", timeouts=cp)
+    job_control.record_step(1, [], {"account_write_started": 50001}, owner="me", timeouts=cp)   # 똑같은 기록
+    assert conn.executed[-1] == "SELECT"                                      # 0행이라 소유자를 다시 봤다
+    assert seen["read_timeout"] > 0 and seen["connect_timeout"] > 0           # 잠금 안 호출이라 시간 제한
+    seen.clear()
+    job_control.record_step(1, ["s"], {}, owner="me")
+    assert seen == {}                                                         # 단계 사이 기록은 제한 없음
+
+
+def test_record_step_zero_rows_for_other_owner_is_lease_lost(monkeypatch):
+    conn = _MysqlAffectedRows(owner="new")
+    monkeypatch.setattr(job_control, "get_log_db_connection", lambda **kw: conn)
+    monkeypatch.setattr(job_control, "record_step", _REAL["record_step"])
+    with pytest.raises(job_control.LeaseLost):
+        job_control.record_step(1, [], {}, owner="old")

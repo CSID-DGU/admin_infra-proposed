@@ -90,7 +90,7 @@ def lease_env(monkeypatch):
             row.update(owner=owner, alive=True)
         return list(row["done"]), dict(row["ctx"])
 
-    def record_step(job_id, done_steps, saved_ctx, owner=None):
+    def record_step(job_id, done_steps, saved_ctx, owner=None, timeouts=None):
         row = rows.get(job_id)
         if row is None or row["owner"] != (owner or job_control.OWNER):
             raise job_control.LeaseLost(str(job_id))
