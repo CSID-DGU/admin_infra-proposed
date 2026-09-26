@@ -89,7 +89,7 @@ ALWAYS_RERUN = {"step_fetch_user_config", "step_migrate_inherit_password"}
 DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
 SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
-                  "verify_ports", "verify_node",
+                  "verify_ports", "verify_node", "home_created",
                   "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup")
 
 def _saved_ctx(ctx):

@@ -50,6 +50,8 @@ from utils import (
     parse_group_line, format_group_entry,
     parse_shadow_line, format_shadow_entry,
     create_user_home_directory,
+    user_home_owner_uid,
+    other_homes_owned_by,
     delete_user_home_directory,
     HomeOwnerMismatch,
     create_team_directory,
@@ -1554,8 +1556,10 @@ def register_provision(body: ProvisionRequest):
             "supp_groups": [group.model_dump() for group in account.supplementary_groups],
             "gecos": account.gecos,
             "passwd_hash": account.password_hash(),
+            # 원장엔 없지만 이 사람이 예전에 쓰던 uid — 계정 단계가 NAS 홈 소유자와 맞춰 보고 되돌려 준다.
+            "expected_uid": account.expected_uid,
         }
-    
+
     # supplementary_groups는 account가 없을 때도 처리 (기존 계정 재사용 경로)
     if body.supplementary_groups:
         job["supp_groups_only"] = [group.model_dump() for group in body.supplementary_groups]

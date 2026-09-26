@@ -35,6 +35,8 @@ class _FakeSSH:
         self.ran = []
 
     def exec_command(self, cmd):
+        if cmd.startswith("test -e "):
+            return None, _Out(0 if self.stat_code == 0 else 1), _Out(0)
         if cmd.startswith("stat "):
             return None, _Out(self.stat_code, self.stat_out), _Out(0)
         self.ran.append(cmd)
@@ -76,26 +78,88 @@ def test_creates_when_home_is_absent(nas):
     """홈이 없으면(stat 실패) 평소대로 만든다."""
     fake = nas(1, b"")
     with main.app.app_context():
-        utils.create_user_home_directory("newuser", 21005, 21005)
+        assert utils.create_user_home_directory("newuser", 21005, 21005) is True
     assert [c.split()[1] for c in fake.ran] == ["mkdir", "chown", "chmod"]
     assert "21005:21005" in fake.ran[1]
+
+
+def test_partial_creation_failure_reports_the_new_home(nas):
+    """없던 홈을 만들다 chown·chmod 에서 끊기면 빈 홈이 남는다 — 예외에 새로 만들었음을 실어 보낸다."""
+    fake = nas(1, b"")
+    fake.exec_command = _fail_after_mkdir(fake.exec_command)
+    with main.app.app_context():
+        with pytest.raises(RuntimeError) as err:
+            utils.create_user_home_directory("newuser", 21005, 21005)
+    assert err.value.home_created is True
+
+
+def _fail_after_mkdir(inner):
+    def run(cmd):
+        if cmd.startswith("sudo chown"):
+            return None, _Out(1), _Out(1, b"connection dropped")
+        return inner(cmd)
+    return run
 
 
 def test_creates_when_owner_already_matches(nas):
     """같은 uid 로 다시 프로비저닝하는 경우는 그대로 진행한다(재실행 안전)."""
     fake = nas(0, b"21001\n")
     with main.app.app_context():
-        utils.create_user_home_directory("csuhyeon", 21001, 21001)
+        # 이미 있던 홈이라 알려야 Kerberos 실패 정리가 사용자 데이터를 지우지 않는다
+        assert utils.create_user_home_directory("csuhyeon", 21001, 21001) is False
     assert len(fake.ran) == 3
 
 
-def test_ignores_unparsable_stat_output(nas):
-    """stat 이 숫자가 아닌 값을 돌려주면 판정하지 않고 진행한다. 조회 실패로 계정 생성을
-    막지는 않되, 막아야 할 때를 놓치지 않도록 숫자일 때만 비교한다."""
+@pytest.mark.parametrize("code,out,owner", [(0, b"21001\n", 21001), (1, b"", None)])
+def test_home_owner_lookup(nas, code, out, owner):
+    """돌아온 사용자 판별용 조회 — 홈이 없으면 None, 명령은 조회만 보낸다."""
+    fake = nas(code, out)
+    with main.app.app_context():
+        assert utils.user_home_owner_uid("csuhyeon") == owner
+    assert fake.ran == []
+
+
+def test_unreadable_owner_of_existing_home_is_an_error(nas):
+    """홈은 있는데 소유자를 못 읽으면 "없음"으로 치지 않는다 — 없음으로 치면 남의 uid 로 chown 하고,
+    이 작업이 만든 홈으로 알아 Kerberos 실패 정리가 사용자 데이터를 지울 수 있다."""
     fake = nas(0, b"?\n")
     with main.app.app_context():
-        utils.create_user_home_directory("someone", 21006, 21006)
-    assert len(fake.ran) == 3
+        with pytest.raises(utils.HomeOwnerUnknown):
+            utils.user_home_owner_uid("someone")
+        with pytest.raises(utils.HomeOwnerUnknown):
+            utils.create_user_home_directory("someone", 21006, 21006)
+    assert fake.ran == []
+
+
+class _ListSSH:
+    def __init__(self, code, out):
+        self.code, self.out, self.cmds = code, out, []
+
+    def exec_command(self, cmd):
+        self.cmds.append(cmd)
+        return None, _Out(self.code, self.out), _Out(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_other_homes_owned_by_lists_same_uid_except_self(nas, monkeypatch):
+    fake = _ListSSH(0, b"21003 /volume1/share/user/alice\n21003 /volume1/share/user/bob\n"
+                       b"21004 /volume1/share/user/carol\n0 /volume1/share/user/_g_teamx\n")
+    monkeypatch.setattr(utils, "_nas_ssh_client", lambda: fake)
+    with main.app.app_context():
+        assert utils.other_homes_owned_by(21003, "alice") == ["bob"]
+    assert fake.cmds == ["stat -c '%u %n' /volume1/share/user/*"]
+
+
+def test_other_homes_listing_failure_is_an_error(nas, monkeypatch):
+    monkeypatch.setattr(utils, "_nas_ssh_client", lambda: _ListSSH(1, b""))
+    with main.app.app_context():
+        with pytest.raises(RuntimeError):
+            utils.other_homes_owned_by(21003, "alice")
 
 
 def test_step_create_home_reports_mismatch_with_own_error_code(monkeypatch, logs):
