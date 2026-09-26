@@ -348,9 +348,13 @@ SLACK_OVERRIDE=",\"slack-webhook-url\":{\"error-log\":\"$SINK\",\"noti\":\"$SINK
 # 모니터링 지표는 클러스터 공용 Prometheus를 읽기만 하므로 모든 스택이 같은 곳을 본다. 예전엔 닿지 않는
 # 주소로 돌려 두어 리소스 모니터링 화면이 늘 비어 있었다(admin_fe#169). 연결은 admin-be.yaml 정책이 연다.
 PROMETHEUS_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+# 스키마는 admin_be가 기동할 때 Flyway 버전 파일(db/migration)로 맞춘다. Hibernate는 엔티티와 스키마가 맞는지만
+# 확인하고(validate) 어긋나면 기동하지 않는다 — update는 지운 제약·칸을 남기고 새 NOT NULL 칸을 임의 값으로 채워
+# 마이그레이션 없이 배포된 스택의 DB를 조용히 어긋나게 했다(9/27 noprobe). Flyway가 없는 옛 admin_be 이미지는
+# 이 값으로 기동하면 스키마를 바꾸지 않으므로, 이 변경은 Flyway를 넣은 admin_be(be#603)와 함께 배포한다.
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"update"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"validate"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
