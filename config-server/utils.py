@@ -1025,6 +1025,12 @@ def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
     return target
 
 
+# TCP 연결에만 거는 한도다. 연결된 뒤의 명령 실행(홈 생성·조회)에는 걸리지 않는다 — paramiko 는 이 값을
+# connect() 에만 쓰고, 연결 뒤에는 소켓 시간 제한을 자기 값으로 바꾼다. 한도가 없으면 NAS 가 응답하지 않을 때
+# OS 기본값(약 130초)까지 기다려, 재시도 4번에 9분이 걸렸다(E2E F03 실측). farm·AD SSH 의 ConnectTimeout 과 같다.
+NAS_SSH_CONNECT_TIMEOUT_SEC = float(os.getenv("NAS_SSH_CONNECT_TIMEOUT_SEC", "10"))
+
+
 def _nas_ssh_client():
     import paramiko
     ssh = paramiko.SSHClient()
@@ -1040,6 +1046,7 @@ def _nas_ssh_client():
         port=int(os.environ.get("NAS_SSH_PORT", "22")),
         username=os.environ["NAS_SSH_USER"],
         key_filename=os.environ["NAS_SSH_KEY_PATH"],
+        timeout=NAS_SSH_CONNECT_TIMEOUT_SEC,
     )
     return ssh
 

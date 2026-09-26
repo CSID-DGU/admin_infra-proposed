@@ -576,7 +576,7 @@ def _ssh_host_key_options() -> list:
 SSH_TRANSPORT_ERROR = 255
 
 
-def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
+def _farm_ad_ssh(remote_command: str, stdin_data: str = "", timeout: float = 30) -> str:
     """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
     그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
     DC 하나가 실패하면 다음 DC로 넘어간다."""
@@ -594,7 +594,7 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
                f"{app.config['FARM_AD_SSH_USER']}@{node['host']}",
                remote_command]
         try:
-            result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as e:
             last_error = e
             app.logger.warning(f"[FARM AD SSH] {node['name']} 타임아웃")
@@ -628,6 +628,16 @@ def _create_krb5_principal_and_secret(username: str, uid: int, gid: int) -> None
         data={"krb5.keytab": keytab_b64},
     )
     v1.create_namespaced_secret(namespace=app.config["NAMESPACE"], body=secret)
+
+# DC 스크립트는 최대 45초 기다리고 마지막 조회에 15초를 더 쓸 수 있다. 그보다 먼저 끊으면 다음 DC 에서
+# 같은 대기를 처음부터 다시 한다.
+AD_REPLICATION_SSH_TIMEOUT_SEC = 75
+
+
+def _await_ad_replicated(username: str, uid: int) -> None:
+    """도메인의 모든 DC가 이 사용자를 uid로 돌려줄 때까지 기다린다. 읽기만 한다."""
+    _farm_ad_ssh(f"await-replicated {username} {int(uid)}", timeout=AD_REPLICATION_SSH_TIMEOUT_SEC)
+
 
 def _delete_krb5_principal_and_secret(username: str) -> None:
     try:
@@ -778,6 +788,38 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     return result.stdout
 
 
+# 새 계정(또는 삭제 뒤 다시 만든 계정)은 모든 DC에 들어간 뒤에도 노드·NAS에서 한동안 틀리게 보인다. 계정이
+# 생기기 전의 조회 결과를 노드 winbind(300초)·노드 커널 idmap(600초)·NAS가 각각 캐시하고, 우리 쪽에서는
+# 이 캐시들을 비울 수 없다(2026-09-26 실측: DC 복제 뒤 노드에서 본 홈 소유자가 맞기까지 약 6분). 그 사이
+# 컨테이너가 뜨면 사용자가 자기 홈에 쓰지 못하므로, 노드에서 한 번씩 확인해 준비될 때까지 기다린다.
+# 한도는 캐시 수명을 모두 넘기도록 잡는다. 확인은 읽기만 하므로 오래 기다려도 남는 것이 없다.
+NODE_IDENTITY_WAIT_SEC = float(os.getenv("NODE_IDENTITY_WAIT_SEC", "900"))
+NODE_IDENTITY_POLL_SEC = float(os.getenv("NODE_IDENTITY_POLL_SEC", "10"))
+
+
+class NodeIdentityTimeout(RuntimeError):
+    """노드가 한도 안에 사용자와 홈 소유자를 기대한 uid로 보지 못함."""
+
+
+def _wait_node_identity(node: dict, username: str, uid: int) -> None:
+    deadline = time.monotonic() + NODE_IDENTITY_WAIT_SEC
+    last = None
+    while True:
+        out = _farm_ssh(node["host"], node["port"], f"check-identity {username} {int(uid)}")
+        state = next((line.strip() for line in out.splitlines() if line.startswith("identity_state=")), "")
+        if state == "identity_state=ready":
+            return
+        if not state:
+            raise RuntimeError(f"check-identity 응답을 해석하지 못함: {out.strip()[-200:]!r}")
+        if state != last:
+            app.logger.info(f"[KRB5] 노드 신원 대기 {username} → {node['name']}: {state}")
+            last = state
+        if time.monotonic() >= deadline:
+            raise NodeIdentityTimeout(
+                f"{node['name']}에서 {username}(uid {uid})이 {int(NODE_IDENTITY_WAIT_SEC)}초 안에 준비되지 않음: {state}")
+        time.sleep(NODE_IDENTITY_POLL_SEC)
+
+
 def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
     """k8s Secret에서 keytab을 꺼내 원격 관리 스크립트의 deploy 액션으로 전달한다.
     keytab/env 작성, timer 기동, TGT 발급 확인까지 전부 원격에서 끝난다."""
@@ -790,6 +832,7 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
     )
     keytab_b64 = secret.data["krb5.keytab"]
 
+    _wait_node_identity(node, username, uid)
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
     try:

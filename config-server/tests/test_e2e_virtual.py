@@ -178,6 +178,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "other_homes_owned_by",
                         lambda uid, name: sorted(n for n, o in e.homes.items() if o == uid and n != name))
     monkeypatch.setattr(main, "_create_krb5_principal_and_secret", rec("krb5_principal"))
+    monkeypatch.setattr(main, "_await_ad_replicated", rec("ad_replicated"))
     monkeypatch.setattr(main, "_delete_krb5_principal_and_secret", rec("krb5_principal_delete"))
     monkeypatch.setattr(main, "_deploy_krb5_to_farm", rec("krb5_deploy"))
     monkeypatch.setattr(main, "_remove_krb5_from_farm", rec("krb5_remove"))
@@ -264,7 +265,8 @@ def test_provision_then_revoke_full_flow(env):
 
     assert result(e, "provision", "101")["phase"] == "SUCCESS", rows(e, "101")
     steps = [a for a, p in rows(e, "101") if p == "SUCCESS"]
-    assert steps == ["CREATE_ACCOUNT", "CREATE_HOME", "CREATE_KRB5_PRINCIPAL", "FETCH_USER_CONFIG", "SELECT_NODE",
+    assert steps == ["CREATE_ACCOUNT", "CREATE_HOME", "CREATE_KRB5_PRINCIPAL", "CREATE_KRB5_PRINCIPAL",
+                     "FETCH_USER_CONFIG", "SELECT_NODE",
                      "ALLOCATE_NODEPORT", "DEPLOY_KRB5", "CREATE_POD_K8S", "WAIT_READY", "CREATE_SERVICE", "PROVISION"]
     assert "exp-np-e2e" in passwd_names()
     uid = int(passwd_line("exp-np-e2e").split(":")[2])
@@ -814,6 +816,34 @@ def test_krb5_transient_failure_restarts_from_account(env, monkeypatch):
     _assert_consistent_success(e, "805", "exp-np-rw5")
     calls = [c[0] for c in e.calls]
     assert calls.count("delete_home") == 1 and calls.count("create_home") == 2  # 지운 홈을 다시 만든다
+
+
+def test_ad_replication_wait_retries_only_itself(env, monkeypatch):
+    """복제 대기는 읽기만 한다. 실패하면 계정을 되돌리지 않고 그 단계만 다시 돈다."""
+    e = env
+    monkeypatch.setattr(main, "_await_ad_replicated", _fail_first(e, "ad_replicated"))
+    e.api.post("/operations/provision", json={"request_id": "809", "username": "exp-np-rw9",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    _assert_consistent_success(e, "809", "exp-np-rw9")
+    calls = [c[0] for c in e.calls]
+    assert calls.count("ad_replicated") == 2 and calls.count("krb5_principal") == 1
+    assert "delete_home" not in calls and "krb5_principal_delete" not in calls
+    assert calls.index("ad_replicated") < calls.index("krb5_deploy")
+
+
+def test_ad_replication_failure_in_baseline_fails_once(env, monkeypatch):
+    """baseline은 재시도 없이 그 오류로 끝난다. 계정 되돌리기는 baseline에서 admin_be 몫이다."""
+    e = env
+    monkeypatch.setattr(main, "VERIFY_MODE", "baseline")
+    monkeypatch.setattr(main, "_await_ad_replicated", _fail_first(e, "ad_replicated", n=99))
+    e.api.post("/operations/provision", json={"request_id": "810", "username": "exp-np-rw10",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    res = result(e, "provision", "810")
+    assert res["phase"] == "FAIL" and res["error_code"] == "AD_REPLICATION_TIMEOUT"
+    calls = [c[0] for c in e.calls]
+    assert calls.count("ad_replicated") == 1 and "krb5_deploy" not in calls
 
 
 def test_rewind_exhausted_is_handed_off_as_degraded(env, monkeypatch):
