@@ -72,12 +72,13 @@ def cmd_run(args):
     run_id = new_run_id()
     faults = Faults(cluster, run_id)
     faults.clear_leftovers()
-    run = Run(cluster, api, faults, stack_prefix=stack_prefix(args.stack), run_id=run_id)
+    run = Run(cluster, api, faults, stack_prefix=stack_prefix(args.stack), run_id=run_id, progress=print)
     print(f"run {run_id} on {args.stack}: {len(cases)} cases")
     results = []
     try:
         run.prepare()
         for case in cases:
+            print(f"  {case['id']} 시작: {case.get('title', '')}")
             result = run.run_case(case, allow_faults=args.allow_faults)
             results.append(result)
             detail = f"  step {result.get('step')}: {result.get('error')}" if result["result"] == "FAIL" else ""
@@ -122,6 +123,8 @@ def main(argv=None):
     reset.add_argument("--run", required=True)
     reset.set_defaults(fn=cmd_reset)
     args = parser.parse_args(argv)
+    # 파일이나 파이프로 보내도 줄마다 바로 보이게 한다(기본은 끝날 때까지 버퍼에 쌓인다).
+    sys.stdout.reconfigure(line_buffering=True)
     return args.fn(args) or 0
 
 

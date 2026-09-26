@@ -81,6 +81,20 @@ def test_failed_step_is_reported_and_faults_are_always_healed():
     assert faults.healed == 1
 
 
+def test_each_step_is_reported_before_it_runs():
+    cluster, api = FakeCluster(), FakeApi()
+    cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])
+    cluster.on(r"SELECT status, IFNULL\(node_name", [("PENDING", "", "")])
+    run = make_run(cluster, api)
+    lines = []
+    run.progress = lines.append
+    case = {"id": "C09", "steps": [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}, {"expect_status": {"r1": "DENIED"}}]}
+    run.run_case(case, allow_faults=False)
+    # 실패한 단계까지 알린다 — 어디서 멈췄는지 끝나기 전에도 보여야 한다.
+    assert [line.split()[1] for line in lines] == ["[1/3]", "[2/3]", "[3/3]"]
+    assert "expect_status" in lines[-1]
+
+
 def test_api_error_fails_unless_error_was_expected():
     cluster = FakeCluster()
     cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])

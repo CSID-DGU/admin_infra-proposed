@@ -19,8 +19,11 @@ class StepFailed(AssertionError):
 
 
 class Run:
-    def __init__(self, cluster, api, faults, *, stack_prefix, run_id, wait_timeout=900, interval=10):
+    def __init__(self, cluster, api, faults, *, stack_prefix, run_id, wait_timeout=900, interval=10,
+                 progress=lambda line: None):
         self.cluster, self.api, self.faults = cluster, api, faults
+        # 한 사례가 수 분씩 걸려 끝날 때만 알리면 멈춘 것과 구분이 안 된다. 단계마다 한 줄씩 알린다.
+        self.progress = progress
         self.prefix = run_prefix(stack_prefix, run_id)
         self.run_id = run_id
         self.wait_timeout, self.interval = wait_timeout, interval
@@ -48,9 +51,11 @@ class Run:
         ctx = Context(self, case["id"])
         started = time.monotonic()
         try:
+            total = len(case["steps"])
             for i, step in enumerate(case["steps"], 1):
                 verb, arg = next(iter(step.items()))
                 ctx.step_no = i
+                self.progress(f"    {case['id']} [{i}/{total}] {round(time.monotonic() - started)}s {verb} {arg}")
                 getattr(ctx, "do_" + verb)(arg)
             result = {"result": "PASS"}
         except Exception as e:  # 한 사례의 실패가 다른 사례 실행을 막지 않는다.
