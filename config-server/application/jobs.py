@@ -526,6 +526,9 @@ def _run_job(kind, request_id, username, job_id=None):
         _interrupt_baseline_job(kind, request_id, username, job, ctx, done)
         _release_lease(job_id)
         return
+    if not _is_baseline():
+        # 계정 회수에서 계정이 이미 없으면 목표 도달로 본다(#213). baseline은 운영처럼 404로 실패한다.
+        ctx["account_absent_is_goal"] = True
     if job_id is not None and not _is_baseline():
         # 단계가 끝나기 전에 남겨야 하는 진행 기록(계정 쓰기 시작 표시, #210)을 단계가 직접 저장하게 한다.
         # done은 되감기에서 다시 묶이므로 호출 시점의 값을 읽는다.
