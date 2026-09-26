@@ -453,8 +453,11 @@ def step_delete_account(ctx):
                           error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
             raise
 
-    _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
+        # 삭제 기록은 잠금 안에서 남긴다(#213). 노드별 계정 회수가 동시에 돌 때, 이 잠금을 이어받은 다른
+        # 노드의 작업은 계정이 없음을 보고 이 기록을 지운 증거로 찾는다 — 잠금 밖에서 남기면 그 사이에
+        # 조회해 증거를 못 찾고 실패한다.
+        _main.log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
 
 def step_remove_krb5(ctx):
     """keytab을 지울 노드: 호출자가 준 node_name, 없으면 같은 작업에서 지운 Pod가 떠 있던 노드."""

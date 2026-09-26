@@ -251,3 +251,36 @@ def test_present_account_revoke_is_unchanged(env, monkeypatch, mode):
     assert USER not in passwd_names()
     phase, code, detail = _delete_rows(e, "562")[-1]
     assert phase == "SUCCESS" and not detail
+
+
+def test_concurrent_node_revokes_see_the_first_deletion_as_evidence(env, monkeypatch):
+    """admin_be는 노드별 계정 회수를 한 번에 등록하고 제어기는 동시에 실행한다. 첫 노드 작업이 계정 파일 잠금을
+    놓자마자 두 번째 노드 작업이 잠금을 잡아도, 첫 삭제의 기록이 이미 증거로 보여야 한다(기록을 잠금 안에서 남김)."""
+    import contextlib
+    e = env
+    node = _provision_and_revoke_container(e, "601")
+    first = e.api.post("/operations/revoke", json={"request_id": "602", "username": USER, "node_name": node,
+                                                   "delete_account": True}).get_json()["job_id"]
+    second = e.api.post("/operations/revoke", json={"request_id": "603", "username": USER, "node_name": "farm7",
+                                                    "delete_account": True}).get_json()["job_id"]
+    real_lock = main.ledger_lock
+    state = {"ran": False}
+
+    @contextlib.contextmanager
+    def lock_then_interleave():
+        with real_lock():
+            yield
+        # 첫 작업이 계정을 지우고 잠금을 놓은 바로 그 순간에 두 번째 작업을 끼워 넣는다
+        if not state["ran"] and USER not in passwd_names():
+            state["ran"] = True
+            with main.app.app_context():
+                main.run_job("revoke", "603", USER, second)
+    monkeypatch.setattr(main, "ledger_lock", lock_then_interleave)
+
+    with main.app.app_context():
+        main.run_job("revoke", "602", USER, first)
+
+    assert state["ran"]
+    assert result(e, "revoke", "602")["phase"] == "SUCCESS", rows(e, "602")
+    assert result(e, "revoke", "603")["phase"] == "SUCCESS", rows(e, "603")
+    assert ("krb5_remove", (USER, "farm7")) in e.calls
