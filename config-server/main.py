@@ -328,7 +328,7 @@ class PodSpecBuildError(Exception):
 class StepFailed(Exception):
     """단계가 실패로 끝남. body·status는 동기 엔드포인트가 그대로 돌려주는 응답이다."""
 
-    def __init__(self, body, status, cause=None, retry=True):
+    def __init__(self, body, status, cause=None, retry=True, restart_from=None):
         super().__init__(body.get("error") if isinstance(body, dict) else str(body))
         self.body = body
         self.status = status
@@ -337,6 +337,9 @@ class StepFailed(Exception):
         # 다시 해 봐야 같은 결과인 실패. 단계가 자기 자원을 이미 정리했다면 재시도는 그 자원을
         # 못 찾아 실패하고, 그 오류가 처음 원인을 덮어쓴다.
         self.retry = retry
+        # 단계가 앞 단계의 자원까지 정리하고 실패했을 때, 다시 시작해야 할 단계 이름.
+        # 같은 단계만 다시 돌리면 정리된 자원(계정·포트 배정)을 전제로 실행돼 기록이 어긋난다.
+        self.restart_from = restart_from
 
 
 def _is_unknown_result(e) -> bool:

@@ -121,3 +121,25 @@ def test_migrate_steps_include_probes_only_in_full_mode(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_MODE", "full")
     n = names()
     assert n[-1] == "step_migrate_cleanup_old" and n.index("step_verify_endpoint") < n.index("step_migrate_cleanup_old")
+
+
+def test_migration_service_transient_failure_rewinds_and_keeps_old_pod_until_done(env, monkeypatch):
+    """새 Pod의 Service 생성이 한 번 실패하면 새 Pod·포트가 정리되므로 포트 배정부터 다시 한다.
+    기존 Pod는 마지막 단계에서만 정리되므로 되감는 동안 살아 있다."""
+    e = env
+    old_pod = _provisioned(e, monkeypatch, rid="1010", user="exp-np-mig10")
+    state = {"n": 0}
+
+    def svc(*a, **k):
+        state["n"] += 1
+        e.calls.append(("svc_create", a))
+        if state["n"] == 1:
+            raise RuntimeError("apiserver hiccup")
+    monkeypatch.setattr(main, "create_nodeport_services", svc)
+    e.api.post("/operations/migrate", json={"request_id": "1010", "username": "exp-np-mig10", "pod_name": old_pod,
+                                            "nodes": ["farm2", "farm7"], "force": True})
+    tick(e)
+    res = result(e, "migrate", "1010")
+    assert res["phase"] == "SUCCESS", rows(e, "1010")
+    new_pod = res["result"]["pod_name"]
+    assert list(e.v1.pods) == [new_pod] and e.v1.pods[new_pod].spec.node_name == "farm7"
