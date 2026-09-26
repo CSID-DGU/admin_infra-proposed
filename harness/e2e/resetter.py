@@ -35,9 +35,9 @@ class Resetter:
     # ---- 조회 ----
     def users(self):
         rows = self.cluster.sql(
-            f"SELECT user_id, IFNULL(ubuntu_username,''), ubuntu_account_active+0 FROM users "
+            f"SELECT user_id, IFNULL(ubuntu_username,''), ubuntu_account_status FROM users "
             f"WHERE ubuntu_username LIKE '{self.prefix}%' OR email = '{self.admin_email}';")
-        return [{"id": int(r[0]), "name": r[1], "active": r[2] == "1"} for r in rows]
+        return [{"id": int(r[0]), "name": r[1], "account": r[2]} for r in rows]
 
     def open_requests(self):
         rows = self.cluster.sql(
@@ -61,10 +61,12 @@ class Resetter:
                 self.api.call("POST", f"/api/admin/requests/{req['id']}/rejection", as_user=admin_id,
                               body={"adminComment": "e2e cleanup"})
         for user in self.users():
-            if user["active"] or any(r["user"] == user["id"] for r in self.open_requests()):
+            if user["account"] != "NONE" or any(r["user"] == user["id"] for r in self.open_requests()):
                 self.api.call("DELETE", f"/api/admin/users/{user['id']}/ubuntu-account", as_user=admin_id)
+        # 회수 API는 작업만 등록하고 돌아온다. 컨테이너(EXPIRING→DELETED)와 계정(RELEASING→NONE)이 끝나기를 기다린다.
         # 직접 회수한 신청은 admin_be에서 PROCESSING으로 남는다(되돌릴 경로가 없다). 행은 아래에서 지운다.
-        self._wait(lambda: all(r["id"] in stuck for r in self.open_requests()))
+        self._wait(lambda: all(r["id"] in stuck for r in self.open_requests())
+                   and all(u["account"] != "RELEASING" for u in self.users()))
 
         names = [u["name"] for u in self.users() if u["name"].startswith(self.prefix)]
         if names:

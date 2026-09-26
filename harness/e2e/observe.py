@@ -14,12 +14,12 @@ def request_row(cluster, request_id):
 
 
 def user_row(cluster, user_id):
-    rows = cluster.sql(f"SELECT IFNULL(ubuntu_uid,''), IFNULL(ubuntu_gid,''), ubuntu_account_active+0 "
+    rows = cluster.sql(f"SELECT IFNULL(ubuntu_uid,''), IFNULL(ubuntu_gid,''), ubuntu_account_status "
                        f"FROM users WHERE user_id={int(user_id)};")
     if not rows:
         return None
-    uid, gid, active = rows[0]
-    return {"uid": int(uid) if uid else None, "gid": int(gid) if gid else None, "active": active == "1"}
+    uid, gid, account = rows[0]
+    return {"uid": int(uid) if uid else None, "gid": int(gid) if gid else None, "account": account}
 
 
 def oplog_codes(cluster, request_id):

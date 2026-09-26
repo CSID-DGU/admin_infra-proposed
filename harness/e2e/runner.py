@@ -73,8 +73,8 @@ class Run:
         name = f"'{safe(username)}'" if username else "NULL"
         self.cluster.sql(
             "INSERT INTO users (created_at, updated_at, department, email, is_active, name, password, phone, role, "
-            "student_id, ubuntu_username, ubuntu_account_active) VALUES (NOW(6), NOW(6), 'e2e', "
-            f"'{safe(email)}', b'1', 'e2e', 'x', '010-0000-0000', '{safe(role)}', '0000000000', {name}, 0);")
+            "student_id, ubuntu_username, ubuntu_account_status) VALUES (NOW(6), NOW(6), 'e2e', "
+            f"'{safe(email)}', b'1', 'e2e', 'x', '010-0000-0000', '{safe(role)}', '0000000000', {name}, 'NONE');")
         return int(self.cluster.sql(f"SELECT user_id FROM users WHERE email='{safe(email)}';")[0][0])
 
 
@@ -226,8 +226,8 @@ class Context:
         for alias, want in arg.items():
             row = observe.user_row(self.run.cluster, self.users[alias]["id"])
             self.observed.append({"step": self.step_no, "user": alias, **row})
-            if "active" in want and row["active"] != want["active"]:
-                raise StepFailed(f"{alias}: 계정 활성 {want['active']}이어야 하는데 {row['active']}")
+            if "account" in want and row["account"] != want["account"]:
+                raise StepFailed(f"{alias}: 계정 상태가 {want['account']}이어야 하는데 {row['account']}")
             uid_rule = want.get("uid")
             if uid_rule == "issued" and row["uid"] is None:
                 raise StepFailed(f"{alias}: UID가 배정돼야 하는데 없음")
@@ -235,6 +235,21 @@ class Context:
                 raise StepFailed(f"{alias}: UID가 없어야 하는데 {row['uid']}")
             if isinstance(uid_rule, dict) and row["uid"] != self.memo[uid_rule["same_as"]]:
                 raise StepFailed(f"{alias}: UID가 {self.memo[uid_rule['same_as']]}로 유지돼야 하는데 {row['uid']}")
+
+    def do_wait_account(self, arg):
+        """우분투 계정이 원하는 상태(NONE·ACTIVE·RELEASING)가 될 때까지 기다린다. 계정 회수는 컨테이너 회수가
+        끝난 뒤 노드마다 따로 돌아서, 신청이 DELETED가 된 뒤에도 잠시 RELEASING에 머문다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, wanted in arg.items():
+            if alias == "timeout":
+                continue
+            user_id = self.users[alias]["id"]
+            row = observe.wait_until(
+                lambda: (r := observe.user_row(self.run.cluster, user_id)) and r["account"] == wanted and r,
+                timeout, self.run.interval) or observe.user_row(self.run.cluster, user_id)
+            self.observed.append({"step": self.step_no, "user": alias, **row})
+            if row["account"] != wanted:
+                raise StepFailed(f"{alias}: 계정 상태 {wanted}를 기다렸지만 {row['account']}")
 
     def do_remember_uid(self, arg):
         row = observe.user_row(self.run.cluster, self.users[arg["user"]]["id"])
