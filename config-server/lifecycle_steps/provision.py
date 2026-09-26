@@ -357,6 +357,13 @@ POD_FAILURE_LOG_LINES = 30
 POD_FAILURE_LOG_CHARS = 2000
 
 
+# 단계가 실패하면서 앞 단계의 자원까지 정리했을 때 재시도를 다시 시작할 단계.
+# Pod 쪽 정리는 포트 배정을 반환하므로 배정하는 단계부터, 계정 쪽 정리는 원장 계정을 지우므로
+# 계정 생성부터 다시 한다.
+POD_RESTART_STEP = "step_build_pod_spec"
+ACCOUNT_RESTART_STEP = "step_create_account"
+
+
 def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
     ns = _main.app.config["NAMESPACE"]
     rollback = {
@@ -673,7 +680,7 @@ def step_create_pod_k8s(ctx):
             str(e),
             rollback=rollback,
             pod_name=pod_name,
-        ), 500)
+        ), 500, restart_from=POD_RESTART_STEP)
     ctx["v1"] = v1
 
     try:
@@ -716,7 +723,7 @@ def step_create_pod_k8s(ctx):
             rollback=rollback,
             pod_name=pod_name,
             **_main.k8s_error_fields(e),
-        ), 500)
+        ), 500, restart_from=POD_RESTART_STEP)
     except Exception as e:
         _main.app.logger.exception("[CREATE POD] pod creation failed")
         _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
@@ -731,7 +738,7 @@ def step_create_pod_k8s(ctx):
             str(e),
             rollback=rollback,
             pod_name=pod_name,
-        ), 500, cause=e)
+        ), 500, cause=e, restart_from=POD_RESTART_STEP)
 
     _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                   node_name=best_node, resource_type="pod",
@@ -843,7 +850,7 @@ def step_wait_ready(ctx):
             rollback=rollback,
             pod_name=pod_name,
             **_main.k8s_error_fields(e),
-        ), 500)
+        ), 500, restart_from=POD_RESTART_STEP)
     except Exception as e:
         close_sub(Phase.FAIL, "POD_READY_CHECK_FAILED")
         _main.app.logger.exception("[CREATE POD] pod ready check failed")
@@ -859,7 +866,7 @@ def step_wait_ready(ctx):
             str(e),
             rollback=rollback,
             pod_name=pod_name,
-        ), 500, cause=e)
+        ), 500, cause=e, restart_from=POD_RESTART_STEP)
 
     # 이미지 다운로드처럼 오래 걸린 이유가 작업 기록에 남도록 이벤트 요약을 함께 적는다.
     start_summary = _main.summarize_pod_start_events(v1, ns, pod_name)
@@ -895,7 +902,7 @@ def step_create_services(ctx):
             rollback=rollback,
             pod_name=pod_name,
             **_main.k8s_error_fields(e),
-        ), 500)
+        ), 500, restart_from=POD_RESTART_STEP)
     except Exception as e:
         _main.app.logger.exception("[CREATE POD] service creation failed")
         _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
@@ -910,7 +917,7 @@ def step_create_services(ctx):
             str(e),
             rollback=rollback,
             pod_name=pod_name,
-        ), 500, cause=e)
+        ), 500, cause=e, restart_from=POD_RESTART_STEP)
 
     _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                   node_name=best_node, resource_type="service",
@@ -1553,7 +1560,7 @@ def step_create_home(ctx):
         # 소유자 불일치는 사람이 uid를 맞춰야 풀린다 — 재시도는 같은 결과만 반복하고 DEGRADED로
         # 넘어가면서 이 error_code를 가린다. retry=False로 한 번 만에 그대로 표면화한다.
         raise _main.StepFailed(_main.infra_error("CREATE_HOME_DIRECTORY", code, detail), 500,
-                                cause=e, retry=not mismatch)
+                                cause=e, retry=not mismatch, restart_from=ACCOUNT_RESTART_STEP)
     _main.log_operation(request_id=request_id, username=name, resource_type="storage",
                   action=Action.CREATE_HOME, phase=Phase.SUCCESS)
 
@@ -1585,7 +1592,7 @@ def step_create_krb5_principal(ctx):
         except Exception:
             _main.app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
         _main._rollback_user(name)
-        raise _main.StepFailed(_main.infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}"), 500, cause=e)
+        raise _main.StepFailed(_main.infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}"), 500, cause=e, restart_from=ACCOUNT_RESTART_STEP)
 
     # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
     # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을

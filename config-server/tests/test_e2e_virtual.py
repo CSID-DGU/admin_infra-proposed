@@ -708,3 +708,133 @@ def test_user_config_fetch_sends_internal_token(env, monkeypatch):
     tick(e)
 
     assert e.was_headers and all(h.get("X-Internal-Token") == "s3cret" for h in e.was_headers)
+
+
+# ---------- 앞 단계 자원까지 정리한 실패의 재시도(되감기) ----------
+# 아래 단계는 실패하면서 앞 단계가 만든 자원(계정·Pod·포트 배정)까지 정리한다. 그 단계만 다시 돌리면
+# 정리된 자원을 전제로 실행돼, Pod 없는 SUCCESS·배정 기록 없는 포트·원장에 없는 계정이 생겼다.
+
+def _fail_first(e, name, n=1, exc=None):
+    state = {"calls": 0}
+
+    def f(*a, **k):
+        e.calls.append((name, a))
+        state["calls"] += 1
+        if state["calls"] <= n:
+            raise exc or RuntimeError(f"{name} transient failure")
+    return f
+
+
+def _assert_consistent_success(e, rid, username):
+    res = result(e, "provision", rid)
+    assert res["phase"] == "SUCCESS", rows(e, rid)
+    made = res["result"]
+    assert list(e.v1.pods) == [made["pod_name"]]                      # 결과가 가리키는 Pod가 실제로 있다
+    assert int(passwd_line(username).split(":")[2]) == made["uid"]     # 원장 계정과 결과 uid가 같다
+    return made
+
+
+def test_pod_create_transient_failure_reallocates_ports(env, monkeypatch):
+    e = env
+    orig = e.v1.create_namespaced_pod
+    fail = _fail_first(e, "pod_create_attempt", exc=ApiException(status=500, reason="hiccup"))
+    monkeypatch.setattr(e.v1, "create_namespaced_pod", lambda namespace, body: (fail(), orig(namespace, body))[1])
+    e.api.post("/operations/provision", json={"request_id": "801", "username": "exp-np-rw1",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    _assert_consistent_success(e, "801", "exp-np-rw1")
+    calls = [c[0] for c in e.calls]
+    # 실패 처리가 배정을 반환했으므로 포트를 다시 배정받고 나서 Pod를 만든다
+    assert calls.count("allocate") == 2
+    assert calls.index("allocate", calls.index("pod_create_attempt") + 1) < len(calls)
+
+
+def test_wait_ready_transient_api_error_is_not_degraded(env, monkeypatch):
+    e = env
+    state = {"n": 0}
+
+    def ready(pod):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ApiException(status=500, reason="hiccup")
+        return True
+    monkeypatch.setattr(main, "is_pod_ready", ready)
+    e.api.post("/operations/provision", json={"request_id": "802", "username": "exp-np-rw2",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    _assert_consistent_success(e, "802", "exp-np-rw2")
+
+
+def test_service_create_transient_failure_does_not_succeed_without_pod(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(main, "create_nodeport_services", _fail_first(e, "svc_create"))
+    e.api.post("/operations/provision", json={"request_id": "803", "username": "exp-np-rw3",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    _assert_consistent_success(e, "803", "exp-np-rw3")
+    assert [c[0] for c in e.calls].count("allocate") == 2
+
+
+def test_home_transient_failure_restarts_from_account(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(main, "create_user_home_directory", _fail_first(e, "create_home"))
+    e.api.post("/operations/provision", json={"request_id": "804", "username": "exp-np-rw4",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    made = _assert_consistent_success(e, "804", "exp-np-rw4")
+    # 되감은 뒤의 홈·principal은 원장에 다시 만든 계정의 uid로 만든다
+    homes = [c[1] for c in e.calls if c[0] == "create_home"]
+    assert homes[-1][1] == made["uid"]
+    assert [c[1][1] for c in e.calls if c[0] == "krb5_principal"] == [made["uid"]]
+
+
+def test_krb5_transient_failure_restarts_from_account(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(main, "_create_krb5_principal_and_secret", _fail_first(e, "krb5_principal"))
+    e.api.post("/operations/provision", json={"request_id": "805", "username": "exp-np-rw5",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    _assert_consistent_success(e, "805", "exp-np-rw5")
+    calls = [c[0] for c in e.calls]
+    assert calls.count("delete_home") == 1 and calls.count("create_home") == 2  # 지운 홈을 다시 만든다
+
+
+def test_rewind_exhausted_is_handed_off_as_degraded(env, monkeypatch):
+    """되감기를 다 써도 안 되면 같은 단계 재시도 소진과 똑같이 DEGRADED로 넘긴다(계정은 점검용으로 보존)."""
+    e = env
+    monkeypatch.setattr(main, "create_nodeport_services", _fail_first(e, "svc_create", n=99))
+    e.api.post("/operations/provision", json={"request_id": "806", "username": "exp-np-rw6",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    res = result(e, "provision", "806")
+    assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED"
+    assert [c[0] for c in e.calls].count("svc_create") == main.STEP_MAX_ATTEMPTS
+    assert e.v1.pods == {}                                             # 새 Pod는 단계가 정리했다
+    assert "exp-np-rw6" in passwd_names()
+    detail = e.db.execute("SELECT error_detail FROM operation_log WHERE request_id='806'"
+                          " AND action='PROVISION' AND phase='FAIL'").fetchone()[0]
+    assert "NODEPORT_SERVICE_CREATE_FAILED" in detail and "RETRIES_EXHAUSTED" in detail
+
+
+def test_rewind_is_not_used_in_baseline(env, monkeypatch):
+    e = env
+    monkeypatch.setattr(main, "VERIFY_MODE", "baseline")
+    monkeypatch.setattr(main, "create_nodeport_services", _fail_first(e, "svc_create"))
+    e.api.post("/operations/provision", json={"request_id": "807", "username": "exp-np-rw7",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    res = result(e, "provision", "807")
+    assert res["phase"] == "FAIL" and res["error_code"] == "NODEPORT_SERVICE_CREATE_FAILED"
+    assert [c[0] for c in e.calls].count("svc_create") == 1
+
+
+def test_compensation_continues_when_account_already_gone(env):
+    """계정 되돌리기에서 원장에 계정이 이미 없으면 멈추지 않고 Kerberos 정리까지 한다."""
+    e = env
+    ctx = {"request_id": "808", "node": "farm2", "pod_name": "ailab-exp-np-rw8-x"}
+    with main.app.app_context():
+        outcome = main._compensate_provision("provision", {"username": "exp-np-rw8"}, ctx,
+                                             done=[s.__name__ for s in main.ACCOUNT_CREATE_STEPS])
+    assert outcome == "account_removed"
+    calls = [c[0] for c in e.calls]
+    assert "krb5_principal_delete" in calls and "krb5_remove" in calls

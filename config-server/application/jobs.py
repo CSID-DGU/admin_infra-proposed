@@ -103,6 +103,13 @@ class _StepDegraded(Exception):
         self.step_name, self.reason, self.cause = step_name, reason, cause
         self.unknowable = unknowable  # True면 실행 여부 자체를 모름 → 작업 끝 행을 UNKNOWN으로
 
+class _StepRewind(Exception):
+    """단계가 앞 단계의 자원까지 정리하고 실패했다. 그 단계만 다시 돌리지 않고 restart_from부터 다시 한다."""
+
+    def __init__(self, step_name, restart_from, err):
+        super().__init__(f"{step_name} → {restart_from}")
+        self.step_name, self.restart_from, self.err = step_name, restart_from, err
+
 def _is_baseline():
     return _main.VERIFY_MODE == "baseline"
 
@@ -145,6 +152,10 @@ def _execute_step(step, ctx, kind, request_id, username):
         if not getattr(err, "retry", True):
             _main.app.logger.info(f"[JOB] {name} 다시 해도 같은 결과 — 재시도하지 않음")
             raise err
+        restart_from = getattr(err, "restart_from", None)
+        if restart_from:
+            # 앞 단계 자원이 이미 정리됐으므로 효과 확인·같은 단계 재시도는 의미가 없다. 실행기가 되감는다.
+            raise _StepRewind(name, restart_from, err) from err
         unknown = err.unknown if isinstance(err, _main.StepFailed) else _main._is_unknown_result(err)
         if unknown:
             observer = _main.STEP_OBSERVERS.get(name)
@@ -348,7 +359,13 @@ def _compensate_provision(kind, job, ctx, done):
             "node_name": ctx.get("node"), "pod_name": ctx.get("pod_name")}
     try:
         for step in (_main.step_check_account_revocable, _main.step_delete_account, _main.step_remove_krb5):
-            step(comp)
+            try:
+                step(comp)
+            except _main.StepFailed as e:
+                # 원장에 계정이 이미 없으면 되돌릴 목표에 도달한 것이다. 멈추면 뒤의 Kerberos 정리가 빠진다.
+                if step is _main.step_delete_account and e.status == 404:
+                    continue
+                raise
     except _main.StepFailed as e:
         code = e.body.get("error") if isinstance(e.body, dict) else "STEP_FAILED"
         _main.app.logger.warning(f"[JOB] 계정 되돌리기 {code}: request_id={ctx['request_id']}")
@@ -435,20 +452,50 @@ def _run_job(kind, request_id, username, job_id=None):
         _main.app.logger.info(f"[JOB] resume {kind} request_id={request_id} after {done[-1]}")
     else:
         _main.app.logger.info(f"[JOB] start {kind} request_id={request_id}")
+    steps = list(_main._job_steps(kind, job))
+    names = [s.__name__ for s in steps]
+    rewinds = 0
+    i = 0
     try:
-        for step in _main._job_steps(kind, job):
+        while i < len(steps):
+            step = steps[i]
+            i += 1
             if ctx.get("skipped"):
                 break  # 마이그레이션에서 옮길 이유가 없다고 판정되면 남은 단계를 돌리지 않는다
             name = step.__name__
-            if name in _main.ALWAYS_RERUN:
-                # 이어받기에서도 매번 다시 실행한다 — done에 넣지 않는다.
-                # 실행 자체는 공통 실행기를 거쳐야 재시도·사전 정리·결과 불명 처리가 똑같이 걸린다.
+            try:
+                if name in _main.ALWAYS_RERUN:
+                    # 이어받기에서도 매번 다시 실행한다 — done에 넣지 않는다.
+                    # 실행 자체는 공통 실행기를 거쳐야 재시도·사전 정리·결과 불명 처리가 똑같이 걸린다.
+                    _execute_step(step, ctx, kind, request_id, username)
+                    continue
+                partner = _main.DEFER_DONE.get(name)
+                if (partner in done) if partner else (name in done):
+                    continue
                 _execute_step(step, ctx, kind, request_id, username)
+            except _StepRewind as rw:
+                # 되감을 단계가 이 작업에 없으면 원래 실패로 끝낸다. 되감기 횟수를 다 쓰면 같은 단계 재시도를
+                # 다 쓴 것과 똑같이 관리자에게 넘긴다(계정은 점검용으로 보존).
+                if rw.restart_from not in names:
+                    raise rw.err
+                if rewinds >= _main.STEP_MAX_ATTEMPTS - 1:
+                    raise _StepDegraded(rw.step_name, "RETRIES_EXHAUSTED", rw.err, unknowable=False) from rw.err
+                rewinds += 1
+                i = names.index(rw.restart_from)
+                dropped = set(names[i:])
+                done = [d for d in done if d not in dropped]
+                err = rw.err
+                code = err.body.get("error") if isinstance(err.body, dict) else type(err).__name__
+                _main.log_operation(request_id=request_id, username=username, action=JOB_ACTIONS[kind],
+                                    phase=Phase.RETRY, attempt=rewinds + 1, resource_type=rw.step_name[-32:],
+                                    error_code=str(code)[:64],
+                                    error_detail=f"restart_from={rw.restart_from}: {str(err)[:900]}")
+                if job_id is not None:
+                    job_control.record_step(job_id, done, _saved_ctx(ctx))
+                _main.app.logger.info(f"[JOB] {rw.step_name} 실패 — {rw.restart_from}부터 다시 ({rewinds}회)")
+                if _main.RETRY_DELAY_SEC:
+                    time.sleep(_main.RETRY_DELAY_SEC)
                 continue
-            partner = _main.DEFER_DONE.get(name)
-            if (partner in done) if partner else (name in done):
-                continue
-            _execute_step(step, ctx, kind, request_id, username)
             if name not in _main.DEFER_DONE:
                 done.append(name)
                 if job_id is not None:
