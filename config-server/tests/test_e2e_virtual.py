@@ -175,6 +175,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "create_user_home_directory", create_home)
     monkeypatch.setattr(main, "delete_user_home_directory", delete_home)
     monkeypatch.setattr(main, "user_home_owner_uid", lambda name: e.homes.get(name))
+    monkeypatch.setattr(main, "other_homes_owned_by",
+                        lambda uid, name: sorted(n for n, o in e.homes.items() if o == uid and n != name))
     monkeypatch.setattr(main, "_create_krb5_principal_and_secret", rec("krb5_principal"))
     monkeypatch.setattr(main, "_delete_krb5_principal_and_secret", rec("krb5_principal_delete"))
     monkeypatch.setattr(main, "_deploy_krb5_to_farm", rec("krb5_deploy"))
@@ -957,3 +959,60 @@ def test_home_owner_lookup_failure_is_retried(env, monkeypatch):
     res = _provision(e, "1062", "exp-np-nas", expected_uid=old_uid)
     assert res["phase"] == "SUCCESS", rows(e, "1062")
     assert _uid_of("exp-np-nas") == old_uid
+
+
+def test_old_uid_shared_with_revoked_users_home_is_surfaced(env):
+    """#201 이전 재발급: 옛 번호를 받아 쓰던 사람도 회수돼 원장엔 없고 홈만 남은 경우 — 돌려주면 그 홈까지 넘겨받는다."""
+    e = env
+    old_uid = _provision_then_revoke(e, "1071", "exp-np-first")
+    e.homes["exp-np-second"] = old_uid
+    res = _provision(e, "1072", "exp-np-first", expected_uid=old_uid)
+    assert res["phase"] == "FAIL" and res["error_code"] == "EXPECTED_UID_CONFLICT", rows(e, "1072")
+    assert "exp-np-first" not in passwd_names()
+
+
+def test_existing_account_is_not_hidden_by_nas_failure(env, monkeypatch):
+    """원장에 이미 있는 이름이면 NAS 를 묻지 않는다 — NAS 장애가 USER_ALREADY_EXISTS 를 재시도 소진으로 가리지 않게."""
+    e = env
+    assert _provision(e, "1081", "exp-np-dup")["phase"] == "SUCCESS"
+
+    def down(name):
+        raise ConnectionError("nas down")
+    monkeypatch.setattr(main, "user_home_owner_uid", down)
+    ctx = {"request_id": "1082", "name": "exp-np-dup", "pg_name": "exp-np-dup", "supp_groups": [],
+           "gecos": "", "passwd_hash": "$6$x", "expected_uid": _uid_of("exp-np-dup") + 1}
+    with main.app.app_context(), pytest.raises(main.StepFailed) as err:
+        main.step_create_account(ctx)
+    assert err.value.status == 409
+
+
+def test_rewind_matches_expected_uid_even_after_a_new_uid_was_tried(env):
+    """되감기 전 시도가 새 번호를 받았어도, 홈이 expected_uid 소유면 그 번호를 돌려준다(후보 둘 다 비교)."""
+    e = env
+    old_uid = _provision_then_revoke(e, "1091", "exp-np-both")
+    ctx = {"request_id": "1092", "name": "exp-np-both", "pg_name": "exp-np-both", "supp_groups": [],
+           "gecos": "", "passwd_hash": "$6$x", "expected_uid": old_uid, "uid": old_uid + 50}
+    with main.app.app_context():
+        main.step_create_account(ctx)
+    assert _uid_of("exp-np-both") == old_uid
+
+
+def test_home_created_by_earlier_attempt_is_still_cleaned_up(env, monkeypatch):
+    """홈 단계가 홈을 만든 뒤 실패해 다시 돌면 두 번째엔 "이미 있음"으로 보인다 — 만든 사실은 유지해야 정리된다."""
+    e = env
+    real_create = main.create_user_home_directory
+    calls = {"n": 0}
+
+    def create_then_fail_once(name, uid, gid):
+        created = real_create(name, uid, gid)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = RuntimeError("chmod dropped")
+            err.home_created = created                                 # utils 가 새로 만들던 중 끊긴 경우와 같게
+            raise err
+        return created
+    monkeypatch.setattr(main, "create_user_home_directory", create_then_fail_once)
+    monkeypatch.setattr(main, "_create_krb5_principal_and_secret", _fail_first(e, "krb5_principal", n=99))
+    res = _provision(e, "1101", "exp-np-partial")
+    assert res["phase"] == "FAIL", rows(e, "1101")
+    assert "exp-np-partial" not in e.homes                             # 이 작업이 만든 빈 홈은 남지 않는다

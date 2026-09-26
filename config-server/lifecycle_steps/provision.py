@@ -1368,19 +1368,25 @@ def _allocate_next_gid(lines, min_gid: int = 20000, issued_max: int = 0) -> int:
     return candidate
 
 def _returning_owner_uid(ctx):
-    """이 사람이 예전에 쓰던 uid 이고 NAS 홈이 지금도 그 uid 소유면 그 번호, 아니면 None.
+    """이 사람이 예전에 쓰던 uid 이고 NAS 홈이 지금도 그 uid 소유면 (그 번호, 같은 번호를 가진 다른 홈 이름들).
+    아니면 (None, []).
 
     한 번호는 한 사람에게만 준다(#201). 같은 사람이 돌아왔을 때 그 번호를 되돌려 주는 것은 그 원칙
     안이고, 새 번호를 주면 보존해 둔 홈의 소유자와 어긋나 HOME_OWNER_MISMATCH 로 영영 막힌다.
-    후보는 같은 작업의 앞선 시도가 받은 uid(되감기 재시도) 또는 admin_be 가 보낸 expected_uid 다.
+    후보는 같은 작업의 앞선 시도가 받은 uid(되감기 재시도)와 admin_be 가 보낸 expected_uid 다.
     그 값만 믿지 않고 홈 소유자로 한 번 더 확인해, 기록이 틀려도 남의 홈을 넘겨받지 않게 한다.
     홈이 없으면 지킬 데이터가 없으므로 새 번호를 준다."""
-    candidate = ctx.get("uid") or ctx.get("expected_uid")
-    if candidate is None:
-        return None
+    candidates = [int(c) for c in (ctx.get("uid"), ctx.get("expected_uid")) if c is not None]
+    if not candidates:
+        return None, []
     request_id, name = ctx["request_id"], ctx["name"]
+    # 원장에 이미 있으면 계정 단계가 USER_ALREADY_EXISTS 로 바로 멈춘다 — NAS 장애가 그 원인을 가리지 않게 한다.
+    if any((_main.parse_passwd_line(l) or {}).get("name") == name for l in _main.read_passwd_lines()):
+        return None, []
     try:
         owner = _main.user_home_owner_uid(name)
+        uid = owner if owner in candidates else None
+        sharers = _main.other_homes_owned_by(uid, name) if uid is not None else []
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] home owner lookup failed for user=%s", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="account",
@@ -1388,13 +1394,16 @@ def _returning_owner_uid(ctx):
                       error_code="NAS_SSH_FAILED", error_detail=str(e))
         raise _main.StepFailed(_main.infra_error(
             "CREATE_ACCOUNT", "NAS_SSH_FAILED", f"failed to look up home owner for {name}"), 500, cause=e)
-    return int(candidate) if owner == int(candidate) else None
+    return uid, sharers
 
 
-def _reclaim_uid(request_id, name, uid, passwd_lines) -> int:
+def _reclaim_uid(ctx, uid, sharers, passwd_lines) -> int:
     """돌아온 사용자에게 예전 uid 를 되돌려 준다. 원장 잠금 안에서 부른다.
-    그 번호를 지금 다른 계정·그룹이 쓰고 있거나 대역 밖이면 되돌려 줄 수 없다 — #201 전에 번호가
-    재발급된 흔적이라 새 번호로 넘어가면 홈 소유자 불일치로 가려지므로, 재시도 없이 그대로 드러낸다."""
+    그 번호를 지금 다른 계정·그룹·홈이 쓰고 있거나 대역 밖이면 되돌려 줄 수 없다 — #201 전에 번호가
+    재발급된 흔적이라, 돌려주면 다른 사람의 홈까지 넘겨받는다. 새 번호로 넘어가면 홈 소유자 불일치로
+    가려지므로, 재시도 없이 그대로 드러낸다."""
+    request_id, name = ctx["request_id"], ctx["name"]
+    own_groups = {name, ctx.get("pg_name") or name}
     conflict = None
     if uid < _main.UID_MIN or (_main.UID_MAX is not None and uid > _main.UID_MAX):
         conflict = f"uid {uid} is outside {_main.UID_MIN}~{_main.UID_MAX}"
@@ -1403,9 +1412,12 @@ def _reclaim_uid(request_id, name, uid, passwd_lines) -> int:
                        if (r := _main.parse_passwd_line(l)) and r["uid"] == uid), None)
         if holder is None:
             holder = next((r["name"] for l in _main.read_group_lines()
-                           if (r := _main.parse_group_line(l)) and r["gid"] == uid and r["name"] != name), None)
+                           if (r := _main.parse_group_line(l)) and r["gid"] == uid and r["name"] not in own_groups),
+                          None)
         if holder is not None:
             conflict = f"uid {uid} of {name}'s home is now used by {holder}"
+        elif sharers:
+            conflict = f"uid {uid} of {name}'s home also owns the homes of {', '.join(sharers)}"
     if conflict:
         _main.log_operation(request_id=request_id, username=name, resource_type="account",
                       action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
@@ -1414,6 +1426,18 @@ def _reclaim_uid(request_id, name, uid, passwd_lines) -> int:
                                409, retry=False)
     _main.app.logger.warning(f"[ACCOUNTS] returning user: reclaimed uid={uid} for user={name}")
     return uid
+
+
+def _delete_home_if_created(ctx, name):
+    """이 작업이 새로 만든 빈 홈만 지운다. 이미 있던 홈(돌아온 사용자·재사용 계정)은 사용자 데이터라
+    절대 지우지 않는다. 홈을 지우는 되돌림은 모두 이 함수를 거친다."""
+    if not ctx.get("home_created"):
+        return
+    try:
+        _main.delete_user_home_directory(name)
+        ctx["home_created"] = False
+    except Exception:
+        _main.app.logger.warning(f"[ACCOUNTS] 롤백 중 새 홈 삭제 실패(무시): {name}")
 
 
 def step_create_account(ctx):
@@ -1430,7 +1454,7 @@ def step_create_account(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="account",
                   action=Action.CREATE_ACCOUNT, phase=Phase.START)
     # NAS 조회는 원장 잠금 밖에서 한다 — 잠금을 쥔 채 SSH 를 기다리면 다른 계정 작업이 모두 멈춘다.
-    returning_uid = _returning_owner_uid(ctx)
+    returning_uid, uid_sharers = _returning_owner_uid(ctx)
     try:
         with _main.ledger_lock(), _main.LockedFile(_main.app.config["PASSWD_PATH"], "r+") as f:
             content = f.read()
@@ -1443,23 +1467,22 @@ def step_create_account(ctx):
                 raise _main.StepFailed({"error": "user already exists"}, 409)
 
             if returning_uid is not None:
-                uid = _reclaim_uid(request_id, name, returning_uid, lines)
+                uid = _reclaim_uid(ctx, returning_uid, uid_sharers, lines)
             else:
                 uid = _main._allocate_next_uid(lines, min_uid=_main.UID_MIN,
                                                issued_max=_main.read_issued_id_max("uid"))
-            if returning_uid is None and _main.UID_MAX is not None and uid > _main.UID_MAX:
-                _main.log_operation(request_id=request_id, username=name, resource_type="account",
-                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
-                              error_code="UID_RANGE_EXHAUSTED",
-                              error_detail=f"next uid {uid} exceeds UID_MAX {_main.UID_MAX}")
-                raise _main.StepFailed(_main.infra_error(
-                    "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
-                    f"uid range {_main.UID_MIN}~{_main.UID_MAX} exhausted",
-                ), 500)
+                if _main.UID_MAX is not None and uid > _main.UID_MAX:
+                    _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                                  action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                                  error_code="UID_RANGE_EXHAUSTED",
+                                  error_detail=f"next uid {uid} exceeds UID_MAX {_main.UID_MAX}")
+                    raise _main.StepFailed(_main.infra_error(
+                        "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
+                        f"uid range {_main.UID_MIN}~{_main.UID_MAX} exhausted",
+                    ), 500)
+                _main.app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} for user={name}")
             gid = uid
             _main.record_issued_id("uid", uid)
-            if returning_uid is None:
-                _main.app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
 
             entry = {
                 "name": name,
@@ -1597,8 +1620,11 @@ def step_create_home(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="storage",
                   action=Action.CREATE_HOME, phase=Phase.START)
     try:
-        ctx["home_created"] = _main.create_user_home_directory(name, ctx["uid"], ctx["gid"])
+        # 앞선 시도가 만든 홈이면 이번 시도엔 "이미 있음"으로 보이므로 한 번 만든 사실은 유지한다.
+        created = _main.create_user_home_directory(name, ctx["uid"], ctx["gid"])
+        ctx["home_created"] = created or bool(ctx.get("home_created"))
     except Exception as e:
+        ctx["home_created"] = getattr(e, "home_created", False) or bool(ctx.get("home_created"))
         # 소유자 불일치는 NAS 장애가 아니라 사람이 uid 를 맞춰 줘야 하는 상황이다. 재시도해도
         # 같은 결과이므로 오류 코드를 갈라서, 감수자가 저널만 보고 원인을 알 수 있게 한다.
         mismatch = isinstance(e, _main.HomeOwnerMismatch)
@@ -1634,14 +1660,7 @@ def step_create_krb5_principal(ctx):
         _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
                       action=Action.CREATE_KRB5_PRINCIPAL, phase=_main._fail_phase(e),
                       error_code="KDC_FAILED", error_detail=str(e))
-        # 이 작업이 새로 만든 빈 홈만 지운다. 이미 있던 홈(돌아온 사용자·재사용 계정)은 사용자
-        # 데이터라 절대 지우지 않는다.
-        if ctx.get("home_created"):
-            try:
-                _main.delete_user_home_directory(name)
-                ctx["home_created"] = False
-            except Exception:
-                pass
+        _delete_home_if_created(ctx, name)
         # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
         # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
         # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이

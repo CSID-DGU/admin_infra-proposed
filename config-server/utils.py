@@ -1,4 +1,5 @@
 import os
+import posixpath
 import json
 import subprocess
 import shlex
@@ -1061,6 +1062,10 @@ def _ssh_capture(ssh, cmd: str) -> tuple:
     return exit_code, stdout.read().decode(errors="replace").strip()
 
 
+class HomeOwnerUnknown(RuntimeError):
+    """홈은 있는데 소유자를 읽지 못한 경우. NAS 일시 장애로 보고 재시도한다."""
+
+
 class HomeOwnerMismatch(RuntimeError):
     """이미 있는 홈의 소유자가 배정하려는 uid 와 달라서 덮어쓰지 않고 멈춘 경우."""
 
@@ -1115,15 +1120,35 @@ def create_team_directory(group_name: str, gid: int) -> None:
 
 def _home_owner_uid(ssh, quoted_path: str):
     """홈의 소유자 uid. 홈이 없으면 None.
-    상위 디렉터리가 755 라 홈이 700 이어도 조회는 된다. 없으면 0 이 아닌 코드가 온다."""
+    있는데 소유자를 읽지 못하면 HomeOwnerUnknown 이다 — "없음"으로 치면 이미 있는 홈에 다른 uid 로
+    chown 하거나, 이 작업이 새로 만든 홈으로 알고 지울 수 있다.
+    상위 디렉터리가 755 라 홈이 700 이어도 조회는 된다."""
+    code, _ = _ssh_capture(ssh, f"test -e {quoted_path}")
+    if code != 0:
+        return None
     code, current = _ssh_capture(ssh, f"stat -c %u {quoted_path}")
-    return int(current) if code == 0 and current.isdigit() else None
+    if code != 0 or not current.isdigit():
+        raise HomeOwnerUnknown(f"cannot read owner of existing home {quoted_path}: exit {code} {current!r}")
+    return int(current)
 
 
 def user_home_owner_uid(username: str):
     """NAS 에 남은 이 사용자 홈의 소유자 uid. 홈이 없으면 None, NAS 접속 실패는 예외로 올린다."""
     with _nas_ssh_client() as ssh:
         return _home_owner_uid(ssh, shlex.quote(_user_home_path(username)))
+
+
+def other_homes_owned_by(uid: int, username: str) -> list:
+    """username 말고 uid 소유인 홈 이름들. #201 이전에는 지워진 번호가 다른 사람에게 다시 나갔으므로,
+    그 사람들도 회수돼 원장에 없으면 홈 소유자만이 번호를 나눠 쓴 흔적이다."""
+    root = shlex.quote(os.environ["NFS_USER_SHARE_PATH"])
+    with _nas_ssh_client() as ssh:
+        code, out = _ssh_capture(ssh, f"stat -c '%u %n' {root}/*")
+    rows = [line.split(" ", 1) for line in out.splitlines() if " " in line]
+    if code != 0 and not rows:
+        raise RuntimeError(f"cannot list home owners under {root}: exit {code}")
+    return sorted(posixpath.basename(path) for owner, path in rows
+                  if owner == str(int(uid)) and posixpath.basename(path) != username)
 
 
 def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
@@ -1152,9 +1177,14 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
                 f"NAS 에서 id -u 'FARM\\{username}' 으로 실제 값을 확인한 뒤, "
                 f"계정 대장의 uid 를 그 값으로 맞추거나 홈을 옮기고 다시 시도하십시오."
             )
-        _ssh_run(ssh, f"sudo mkdir -p {quoted}")
-        _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
-        _ssh_run(ssh, f"sudo chmod 700 {quoted}")
+        try:
+            _ssh_run(ssh, f"sudo mkdir -p {quoted}")
+            _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
+            _ssh_run(ssh, f"sudo chmod 700 {quoted}")
+        except Exception as e:
+            # 없던 홈을 만들다 끊겼으면 빈 홈이 남았을 수 있다 — 되돌림이 이 홈을 지울 수 있게 알린다.
+            e.home_created = current is None
+            raise
     return current is None
 
 

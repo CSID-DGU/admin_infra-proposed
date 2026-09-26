@@ -51,6 +51,7 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
     create_user_home_directory,
     user_home_owner_uid,
+    other_homes_owned_by,
     delete_user_home_directory,
     HomeOwnerMismatch,
     create_team_directory,
