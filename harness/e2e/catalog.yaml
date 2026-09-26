@@ -233,7 +233,6 @@ cases:
 # 아직 어떤 시험도 일으키지 않는 오류 코드. 이유를 적어 두고, 시험을 만들면 여기서 뺀다.
 # (테스트가 새로 생겼는데 이 목록에 남아 있으면 test_e2e_catalog가 알려 준다.)
 waived_codes:
-  ACCOUNT_FILE_WRITE_FAILED: 원장 파일 쓰기 실패 — /kube_share 쓰기 장애를 만들 수단이 아직 없음
   ACCOUNT_PREFIX_MISMATCH: 접두어 가드 — stack-up 자체 점검이 403으로 확인(코드 문자열 단언은 없음)
   DELETE_POD_FAILED: Pod 삭제 API 실패 — 쿠버네티스 API 장애 주입 수단 없음
   GID_RANGE_EXHAUSTED: 공용 그룹 gid 대역 소진 — 대역을 다 쓰는 시험은 비용이 커서 보류

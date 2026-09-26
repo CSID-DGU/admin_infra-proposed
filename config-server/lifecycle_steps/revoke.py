@@ -290,6 +290,37 @@ def step_check_account_revocable(ctx):
             f"{len(remaining)} other pod(s) of {username!r} still use this account",
         ), 409)
 
+def _remove_account_leftovers(username):
+    """passwd에는 없는데 남은 계정 흔적(shadow 줄, 개인 그룹 줄, 그룹 멤버십)을 지우고 지운 것 목록을 돌려준다.
+    계정 삭제가 passwd를 쓴 뒤 멈추면 생긴다. 공용 그룹은 멤버만 빼고 줄은 남긴다(#180). 호출자가 원장 잠금을 쥔다."""
+    removed = []
+    sh_lines = _main.read_shadow_lines()
+    sh_new = [l for l in sh_lines if (_main.parse_shadow_line(l) or {}).get("name") != username]
+    if len(sh_new) != len(sh_lines):
+        _main.write_shadow_lines(sh_new)
+        removed.append("shadow")
+    g_lines = _main.read_group_lines()
+    g_new, changed = [], False
+    for gl in g_lines:
+        rec = _main.parse_group_line(gl)
+        if not rec:
+            g_new.append(gl)
+            continue
+        if username in rec["members"]:
+            rec["members"] = [m for m in rec["members"] if m != username]
+            removed.append(f"member:{rec['name']}")
+            changed = True
+        # passwd 줄이 없어 gid를 모르므로 개인 그룹은 사용자명과 같은 이름으로 찾는다. 공용 그룹 이름은
+        # 계정명과 겹칠 수 없다(#152·#199).
+        if rec["name"] == username and not rec["members"]:
+            removed.append(f"group:{rec['name']}")
+            changed = True
+            continue
+        g_new.append(_main.format_group_entry(rec))
+    if changed:
+        _main.write_group_lines(g_new)
+    return removed
+
 def step_delete_account(ctx):
     request_id, username, node_name = ctx["request_id"], ctx["username"], ctx.get("node_name")
 
@@ -310,10 +341,18 @@ def step_delete_account(ctx):
                 continue
             new_lines.append(line)
         if removed_user is None:
-            # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
-            # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
-            # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
-            # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
+            if ctx.get("account_absent_is_goal"):
+                # 목표 상태(계정 없음)에 이미 도달했다(#213). 노드마다 등록되는 계정 회수의 두 번째부터,
+                # 또는 삭제는 끝났는데 응답이 끊긴 재시도에서 생긴다. 실패로 끝내면 뒤의 Kerberos 정리
+                # (그 노드 keytab)와 회수 확인이 빠지므로, 반쯤 지워진 흔적만 치우고 성공으로 넘긴다.
+                # 실제로 지운 경우와 섞이지 않게 error_detail에 already_absent를 남긴다.
+                leftovers = _remove_account_leftovers(username)
+                _main.log_operation(request_id=request_id, username=username, node_name=node_name,
+                              resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS,
+                              error_detail=json.dumps({"already_absent": True, "leftovers_removed": leftovers}))
+                return
+            # baseline(운영 재현)과 작업 보상 경로: 404로 돌려준다. 운영 admin_be는 404를 "이미 삭제됨"으로
+            # 처리한다. 지표를 뽑을 때 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다.
             _main.log_operation(request_id=request_id, username=username, node_name=node_name,
                           resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
                           error_code="USER_NOT_FOUND",

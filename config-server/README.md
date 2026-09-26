@@ -180,3 +180,11 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 - 알려진 한계: 예전에 계정이 있던 사람은 동시에 승인된 두 신청이 같은 uid(`expected_uid`)를 되돌려 받을 수 있다. 표시만 남기고 죽은 작업이 다른 신청이 쓴 계정을 자기 것으로 보고 이어갈 수 있으며, 그 작업이 Kerberos 단계 뒤에 실패하면 보상이 그 계정을 지우려 할 수 있다(다른 컨테이너가 떠 있으면 `ACCOUNT_IN_USE`로 보류). uid만으로는 가릴 수 없어, 계정 생성 작업이 도는 동안 같은 사람의 승인을 막는 것은 admin_be 몫이다.
 
 baseline은 운영의 "죽으면 끝"을 재현해야 하므로 표시를 남기지 않고 판정도 하지 않는다.
+
+#### 계정 회수에서 계정이 이미 없을 때 (#213)
+
+회수 작업(`POST /operations/revoke`)은 요청 값에 따라 **컨테이너 회수**(`pod_name`, `delete_account=false`: 그 Pod·Service·포트·그 노드 keytab만, 계정은 그대로)와 **계정 회수**(`username`·`node_name`, `delete_account=true`: 회수 가능 확인 → 계정 삭제 → Kerberos 정리)로 나뉜다. admin_be는 컨테이너 회수가 모두 끝난 뒤 사용자가 쓴 노드마다 계정 회수를 하나씩 등록한다(admin_be #600). 계정 파일은 스택에 하나라, 두 번째 노드부터는 계정이 이미 없다.
+
+NoProbe·Full에서 계정 삭제(`step_delete_account`)는 계정 파일에 사용자가 없으면 목표 도달로 보고 성공으로 넘긴다. passwd만 지워지고 남은 shadow 줄·개인 그룹 줄·그룹 멤버십은 치운다(`_remove_account_leftovers`, 공용 그룹 줄은 남김). 작업 기록은 `DELETE_ACCOUNT SUCCESS`에 error_detail `{"already_absent": true, "leftovers_removed": [...]}`로 실제 삭제와 구분한다. 뒤의 Kerberos 정리(그 노드 keytab)와 Full의 회수 확인까지 진행한다. 회수 가능 확인(`ACCOUNT_IN_USE`·`ACCOUNT_NODE_UNKNOWN` 보류)은 그대로다.
+
+baseline과 생성 실패 보상 경로는 운영처럼 `USER_NOT_FOUND`(404)로 돌려준다(admin_be는 이를 "이미 삭제됨"으로 처리한다).
