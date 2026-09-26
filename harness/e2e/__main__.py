@@ -42,9 +42,11 @@ def new_run_id():
     return out[-5:]
 
 
-def connect(stack):
-    if stack == "operation":
-        raise SystemExit("operation 스택에서는 E2E를 돌리지 않는다")
+def connect(stack, allow_operation=False):
+    # 실사용자가 있는 운영에서는 시험 계정을 만들고 지우지 않는다. 사용자를 받기 전 점검처럼 운영에서 돌려야 할 때만
+    # --allow-operation으로 명시한다. 이름은 실행 접두어(e2e<runid>)로만 좁히므로 실사용자 이름과 겹치지 않는다.
+    if stack == "operation" and not allow_operation:
+        raise SystemExit("operation 스택에서는 --allow-operation 없이 E2E를 돌리지 않는다")
     env = load_env()
     cluster = Cluster(env, stack)
     url = env.get(f"URL_{stack.upper()}")
@@ -68,7 +70,7 @@ def cmd_run(args):
     unknown = set(args.case or []) - {c["id"] for c in cases}
     if unknown:
         raise SystemExit(f"실제로 돌릴 수 있는 사례가 아님: {sorted(unknown)}")
-    cluster, api = connect(args.stack)
+    cluster, api = connect(args.stack, args.allow_operation)
     run_id = new_run_id()
     faults = Faults(cluster, run_id)
     faults.clear_leftovers()
@@ -87,7 +89,8 @@ def cmd_run(args):
     finally:
         residue = None
         if not args.keep:
-            residue = Resetter(cluster, api, stack_prefix(args.stack), run_id).reset(run.admin_id)
+            residue = Resetter(cluster, api, stack_prefix(args.stack), run_id,
+                               allow_operation=args.allow_operation).reset(run.admin_id)
             print("  reset: " + ("clean" if not residue else f"남은 것 {len(residue)}건: {residue}"))
         report = {"run": run_id, "stack": args.stack, "results": results, "residue": residue}
         out = pathlib.Path(os.path.expanduser("~/.ailab-exp/e2e-reports"))
@@ -99,12 +102,13 @@ def cmd_run(args):
 
 
 def cmd_reset(args):
-    cluster, api = connect(args.stack)
+    cluster, api = connect(args.stack, args.allow_operation)
     rows = cluster.sql(f"SELECT user_id FROM users WHERE email='{admin_email(args.run)}';")
     run = Run(cluster, api, Faults(cluster, args.run), stack_prefix=stack_prefix(args.stack), run_id=args.run)
     admin_id = int(rows[0][0]) if rows else run._insert_user(email=admin_email(args.run), username=None, role="ADMIN")
     Faults(cluster, args.run).heal_all()
-    residue = Resetter(cluster, api, stack_prefix(args.stack), args.run).reset(admin_id)
+    residue = Resetter(cluster, api, stack_prefix(args.stack), args.run,
+                       allow_operation=args.allow_operation).reset(admin_id)
     print("clean" if not residue else f"남은 것 {len(residue)}건: {residue}")
     return 1 if residue else 0
 
@@ -117,11 +121,13 @@ def main(argv=None):
     run.add_argument("--stack", required=True)
     run.add_argument("--case", action="append")
     run.add_argument("--allow-faults", action="store_true")
+    run.add_argument("--allow-operation", action="store_true", help="운영 스택에서 돌린다(사용자를 받기 전 점검용)")
     run.add_argument("--keep", action="store_true", help="끝나고 정리하지 않는다(조사용). 나중에 reset으로 지운다")
     run.set_defaults(fn=cmd_run)
     reset = sub.add_parser("reset")
     reset.add_argument("--stack", required=True)
     reset.add_argument("--run", required=True)
+    reset.add_argument("--allow-operation", action="store_true")
     reset.set_defaults(fn=cmd_reset)
     args = parser.parse_args(argv)
     # 파일이나 파이프로 보내도 줄마다 바로 보이게 한다(기본은 끝날 때까지 버퍼에 쌓인다).
