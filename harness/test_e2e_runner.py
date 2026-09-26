@@ -95,6 +95,19 @@ def test_each_step_is_reported_before_it_runs():
     assert "expect_status" in lines[-1]
 
 
+def test_wait_job_tells_degraded_apart_from_plain_failure():
+    cluster, api = FakeCluster(), FakeApi()
+    cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])
+    cluster.on(r"SELECT phase, IFNULL\(error_code", [("FAIL", "DEGRADED")])
+    cluster.on(r"SELECT DISTINCT error_code", [("DEGRADED",), ("NAS_SSH_FAILED",)])
+    run = make_run(cluster, api)
+    steps = [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}]
+    ok = run.run_case({"id": "C09", "steps": steps + [{"wait_job": {"r1": "DEGRADED"}}]}, allow_faults=False)
+    assert ok["result"] == "PASS"
+    bad = run.run_case({"id": "C10", "steps": steps + [{"wait_job": {"r1": "FAIL"}}]}, allow_faults=False)
+    assert bad["result"] == "FAIL" and "DEGRADED" in bad["error"]
+
+
 def test_api_error_fails_unless_error_was_expected():
     cluster = FakeCluster()
     cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])

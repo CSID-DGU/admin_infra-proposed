@@ -147,33 +147,60 @@ cases:
       - fault: {kill: config-server}
       - wait: {r1: FULFILLED}
 
+  # 장애가 재시도 기간 안에 풀리면 스스로 회복하고, 끝까지 이어지면 관리자에게 넘긴다(DEGRADED — 신청은
+  # PROCESSING에 남고 admin_be는 되돌리지 않는다). 재시도가 없는 baseline은 실패로 끝나 PENDING으로 돌아간다 —
+  # 그 전이(PROCESSING>PENDING)는 V02가 가리키는 admin_be 시험이 맡는다.
   - id: F03
-    title: NAS 연결 차단 중 승인 — 작업이 실패하고 신청은 대기로 돌아오며, 복구 후 재승인은 된다
-    covers: ["PROCESSING>PENDING"]
+    title: NAS 연결이 재시도 기간 내내 막힘 — 작업은 DEGRADED로 넘겨지고 신청은 PROCESSING에 남는다
     codes: [NAS_SSH_FAILED]
     steps:
       - user: a
       - apply: {user: a, as: r1}
       - fault: {block: nas}
       - approve: r1
-      - wait: {r1: PENDING, timeout: 1500}
+      - wait_job: {r1: DEGRADED, timeout: 1500}
+      - expect_status: {r1: PROCESSING}
       - expect_codes: {r1: [NAS_SSH_FAILED]}
-      - heal: all
-      - approve: r1
-      - wait: {r1: FULFILLED}
 
   - id: F04
-    title: AD(=KDC) 연결 차단 중 승인 — 작업이 실패하고 신청은 대기로 돌아오며, 복구 후 재승인은 된다
-    covers: ["PROCESSING>PENDING"]
+    title: AD(=KDC) 연결이 재시도 기간 내내 막힘 — 작업은 DEGRADED로 넘겨지고 신청은 PROCESSING에 남는다
+    codes: [KDC_FAILED]
     steps:
       - user: a
       - apply: {user: a, as: r1}
       - fault: {block: ad}
       - approve: r1
-      - wait: {r1: PENDING, timeout: 1500}
-      - heal: all
+      - wait_job: {r1: DEGRADED, timeout: 1500}
+      - expect_status: {r1: PROCESSING}
+      - expect_codes: {r1: [KDC_FAILED]}
+
+  - id: F06
+    title: NAS 연결이 잠깐 막힘 — 실패를 겪은 뒤 연결이 돌아오면 재시도로 스스로 회복해 컨테이너가 뜬다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    codes: [NAS_SSH_FAILED]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - fault: {block: nas}
       - approve: r1
+      - wait_codes: {r1: [NAS_SSH_FAILED], timeout: 600}
+      - heal: all
       - wait: {r1: FULFILLED}
+      - expect_pod: {r1: present}
+
+  - id: F07
+    title: AD(=KDC) 연결이 잠깐 막힘 — 실패를 겪은 뒤 연결이 돌아오면 재시도로 스스로 회복해 컨테이너가 뜬다
+    covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
+    codes: [KDC_FAILED]
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - fault: {block: ad}
+      - approve: r1
+      - wait_codes: {r1: [KDC_FAILED], timeout: 600}
+      - heal: all
+      - wait: {r1: FULFILLED}
+      - expect_pod: {r1: present}
 
   - id: F05
     title: config-server가 내려간 동안 컨테이너 회수 — 회수는 실패하고 신청은 떠 있는 상태로 돌아온다
@@ -195,6 +222,11 @@ cases:
     covers: ["PROCESSING>DENIED"]
     junit: "AdminRequestCommandServiceTest#rejectRequest_success_whenProvisionJobFailed"
 
+  - id: V02
+    title: 생성 작업이 실패로 끝나면 신청은 대기로 돌아간다 — full·noprobe에서는 기반 장애가 DEGRADED로 넘겨져 실제 스택으로 만들기 어렵다
+    covers: ["PROCESSING>PENDING"]
+    junit: "AdminRequestCommandServiceTest#failRevertsToPending"
+
 # 아직 어떤 시험도 일으키지 않는 오류 코드. 이유를 적어 두고, 시험을 만들면 여기서 뺀다.
 # (테스트가 새로 생겼는데 이 목록에 남아 있으면 test_e2e_catalog가 알려 준다.)
 waived_codes:
@@ -207,7 +239,6 @@ waived_codes:
   JOB_LOG_UNAVAILABLE: 작업 기록 DB 조회 실패 — log DB 장애 주입 수단 없음
   JOB_STORE_UNAVAILABLE: 작업 저장소 실패 — log DB 장애 주입 수단 없음
   K8S_CLIENT_SETUP_FAILED: 쿠버네티스 클라이언트 초기화 실패 — 설정 파손 시험 없음
-  KDC_FAILED: KDC 실패 — F04(AD 차단)에서 나올 수 있으나 어느 단계에서 먼저 끊기는지 확정 전이라 단언하지 않음
   KRB5_FARM_CLEANUP_FAILED: farm keytab 정리 실패 — farm 노드 SSH 차단 장애 미구현
   KRB5_PRINCIPAL_DELETE_FAILED: principal 삭제 실패 — 회수 중 AD 차단 사례 미구현
   LOGIN_PASSWORD_MISSING: 로그인 비밀번호 없음 — admin_be가 항상 보내므로 API로 재현 불가

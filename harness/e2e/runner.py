@@ -185,6 +185,37 @@ class Context:
                 codes = sorted(observe.oplog_codes(self.run.cluster, self._req(alias)))
                 raise StepFailed(f"{alias}: {sorted(wanted)} 중 하나를 기다렸지만 {row and row['status']} (코드 {codes})")
 
+    def do_wait_job(self, arg):
+        """생성 작업이 원하는 결과(SUCCESS·FAIL·DEGRADED)로 끝날 때까지 기다린다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, wanted in arg.items():
+            if alias == "timeout":
+                continue
+            outcome = None
+
+            def done():
+                nonlocal outcome
+                outcome = observe.job_outcome(self.run.cluster, self._req(alias))
+                return outcome not in (None, "RUNNING")
+            observe.wait_until(done, timeout, self.run.interval)
+            self.observed.append({"step": self.step_no, "request": alias, "job": outcome})
+            if outcome != wanted:
+                codes = sorted(observe.oplog_codes(self.run.cluster, self._req(alias)))
+                raise StepFailed(f"{alias}: 작업이 {wanted}로 끝나야 하는데 {outcome} (코드 {codes})")
+
+    def do_wait_codes(self, arg):
+        """오류 코드가 작업 기록에 남을 때까지 기다린다 — 장애가 실제로 부딪힌 뒤에 복구하려고 쓴다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, codes in arg.items():
+            if alias == "timeout":
+                continue
+            seen = observe.wait_until(
+                lambda: set(codes) <= observe.oplog_codes(self.run.cluster, self._req(alias)) and True,
+                timeout, self.run.interval)
+            if not seen:
+                got = sorted(observe.oplog_codes(self.run.cluster, self._req(alias)))
+                raise StepFailed(f"{alias}: 오류 코드 {sorted(codes)}를 기다렸지만 {got}")
+
     def do_expect_status(self, arg):
         for alias, wanted in arg.items():
             row = observe.request_row(self.run.cluster, self._req(alias))

@@ -49,6 +49,31 @@ def job_ended_but_stuck(cluster, request_id, row):
     return bool(rows) and rows[0][0] in ("FAIL", "UNKNOWN") and rows[0][1] == "1"
 
 
+def job_outcome(cluster, request_id):
+    """이 신청의 가장 최근 생성 작업 결과. 아직 도는 중이면 RUNNING, 없으면 None.
+    재시도를 다 써 관리자에게 넘긴 작업은 끝 행의 오류 코드가 DEGRADED다."""
+    rows = cluster.sql(
+        f"SELECT phase, IFNULL(error_code,'') FROM operation_log WHERE request_id='{int(request_id)}' "
+        "AND action='PROVISION' AND resource_type IS NULL ORDER BY id DESC LIMIT 1;",
+        database="operation_state_db")
+    if not rows:
+        return None
+    phase, code = rows[0]
+    if phase == "START":
+        return "RUNNING"
+    return "DEGRADED" if code == "DEGRADED" else phase
+
+
+def wait_until(check, timeout, interval):
+    """check()가 참이 될 때까지 기다린다. 마지막 결과를 돌려준다."""
+    deadline = time.monotonic() + timeout
+    result = check()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = check()
+    return result
+
+
 def wait_status(cluster, request_id, wanted, timeout=900, interval=10):
     """상태가 wanted 중 하나가 될 때까지 기다린다. 돌려주는 값은 마지막으로 본 행이다.
     작업이 끝났는데 신청이 멈춰 있으면 제한 시간까지 기다리지 않고 바로 돌려준다."""
