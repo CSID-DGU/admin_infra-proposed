@@ -34,3 +34,11 @@ def test_no_deploy_when_identity_never_resolves(farm, monkeypatch):
     with main.app.app_context(), pytest.raises(RuntimeError):
         main._deploy_krb5_to_farm("exp-fu-a", 55123, "farm8")
     assert farm == ["wait-identity exp-fu-a 55123"]
+
+
+def test_ad_replication_wait_uses_longer_ssh_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main, "_farm_ad_ssh",
+                        lambda cmd, stdin_data="", timeout=30: seen.update(cmd=cmd, timeout=timeout))
+    main._await_ad_replicated("exp-fu-a", 55123)
+    assert seen == {"cmd": "await-replicated exp-fu-a 55123", "timeout": main.AD_REPLICATION_SSH_TIMEOUT_SEC}

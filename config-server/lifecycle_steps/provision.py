@@ -1682,6 +1682,30 @@ def step_create_krb5_principal(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="kerberos",
                   action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
 
+def step_await_ad_replication(ctx):
+    """새 AD 계정이 도메인의 모든 DC에 도착할 때까지 기다린다.
+
+    계정은 DC 하나에 만들어지고, 노드는 아무 DC에나 물을 수 있다. 복제 전에 노드가 사용자나 홈을
+    조회하면 "없는 사용자"가 노드에 캐시되어, 첫 컨테이너가 자기 홈에 쓰지 못한다(E2E C04·C08).
+    읽기만 하므로 실패해도 되돌릴 것이 없고, 같은 단계만 다시 돌리면 된다."""
+    request_id, name = ctx["request_id"], ctx["name"]
+    if not _main._ad_enabled():
+        return
+    _main.log_operation(request_id=request_id, username=name, resource_type="replication",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.START)
+    try:
+        _main._await_ad_replicated(name, ctx["uid"])
+    except Exception as e:
+        _main.app.logger.warning("[ACCOUNTS] AD 복제 대기 실패: user=%s: %s", name, e)
+        _main.log_operation(request_id=request_id, username=name, resource_type="replication",
+                      action=Action.CREATE_KRB5_PRINCIPAL, phase=_main._fail_phase(e),
+                      error_code="AD_REPLICATION_TIMEOUT", error_detail=str(e))
+        raise _main.StepFailed(_main.infra_error(
+            "AWAIT_AD_REPLICATION", "AD_REPLICATION_TIMEOUT",
+            f"AD account not replicated to all domain controllers: {name}"), 500, cause=e)
+    _main.log_operation(request_id=request_id, username=name, resource_type="replication",
+                  action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
+
 def step_add_user_groups(ctx):
     """기존 사용자에게 보충 그룹을 추가하는 단계 (Pod 재사용 시에만 호출).
     
@@ -1784,6 +1808,7 @@ ACCOUNT_CREATE_STEPS = [
     step_create_account,
     step_create_home,
     step_create_krb5_principal,
+    step_await_ad_replication,
     step_sync_ad_groups,
 ]
 

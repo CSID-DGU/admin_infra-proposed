@@ -576,7 +576,7 @@ def _ssh_host_key_options() -> list:
 SSH_TRANSPORT_ERROR = 255
 
 
-def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
+def _farm_ad_ssh(remote_command: str, stdin_data: str = "", timeout: float = 30) -> str:
     """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
     그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
     DC 하나가 실패하면 다음 DC로 넘어간다."""
@@ -594,7 +594,7 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
                f"{app.config['FARM_AD_SSH_USER']}@{node['host']}",
                remote_command]
         try:
-            result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as e:
             last_error = e
             app.logger.warning(f"[FARM AD SSH] {node['name']} 타임아웃")
@@ -628,6 +628,16 @@ def _create_krb5_principal_and_secret(username: str, uid: int, gid: int) -> None
         data={"krb5.keytab": keytab_b64},
     )
     v1.create_namespaced_secret(namespace=app.config["NAMESPACE"], body=secret)
+
+# DC 스크립트는 최대 45초 기다리고 마지막 조회에 15초를 더 쓸 수 있다. 그보다 먼저 끊으면 다음 DC 에서
+# 같은 대기를 처음부터 다시 한다.
+AD_REPLICATION_SSH_TIMEOUT_SEC = 75
+
+
+def _await_ad_replicated(username: str, uid: int) -> None:
+    """도메인의 모든 DC가 이 사용자를 uid로 돌려줄 때까지 기다린다. 읽기만 한다."""
+    _farm_ad_ssh(f"await-replicated {username} {int(uid)}", timeout=AD_REPLICATION_SSH_TIMEOUT_SEC)
+
 
 def _delete_krb5_principal_and_secret(username: str) -> None:
     try:
