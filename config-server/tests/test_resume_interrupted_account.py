@@ -266,4 +266,4 @@ def test_checkpoint_lease_lost_stops_before_writing(env, lease_env, monkeypatch)
 
     assert "exp-np-rb4" not in passwd_names()
     assert _end_row(e, "423") is None                                      # 끝 행을 남기지 않았다
-    assert ("FAIL", "PASSWD_WRITE_FAILED") not in _account_rows(e, "423")
+    assert all(phase != "FAIL" for phase, _code in _account_rows(e, "423"))   # 쓰기 실패로 기록하지 않았다
