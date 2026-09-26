@@ -613,6 +613,23 @@ check("제어기가 회수 작업을 실행함 (계정 대장에서 사라짐)",
 
 if account_status() != 404:
     print(f"    참고: 시험 계정 {name}이 계정 대장에 남음 — 다음 배포의 사전 정리에서 다시 회수한다")
+
+# 시험 작업의 단계 기록은 판정이 끝나면 쓸모가 없다. 배포마다 수십 행씩 쌓여 실사용자 기록 사이에
+# 섞이므로 이 실행이 쓴 신청 번호(사전 정리 rid-1 포함)와 시험 계정 이름이 둘 다 맞는 행만 지운다.
+from utils import get_log_db_connection
+with _main_mod.app.app_context():
+    try:
+        conn = get_log_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM operation_log WHERE username=%s AND request_id IN (%s, %s, %s)",
+                            (name, str(int(rid) - 1), rid, rid2))
+                print(f"OK  시험 작업 기록 {cur.rowcount}행 정리")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"시험 작업 기록 정리 실패(무시하고 계속): {e}")
 sys.exit(0 if ok else 1)
 PY
 
