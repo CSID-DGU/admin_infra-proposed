@@ -17,6 +17,7 @@ from kubernetes import client
 
 from typing import List, Optional
 
+from adapters.job_control import LeaseLost
 from adapters.operation_log import Action, Phase
 from request_models import SHA512_CRYPT_RE
 
@@ -1312,7 +1313,10 @@ def _build_sudoers_policy(username: str) -> Optional[str]:
         return None
     return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
 
-def _rollback_user(name: str) -> None:
+def _rollback_user(name: str, primary_gid: Optional[int] = None) -> None:
+    """계정 파일에서 사용자를 지운다. 개인 그룹은 이름이 사용자명과 같거나, primary_gid가 주어지면 그 gid인
+    줄을 멤버가 없을 때 지운다 — 개인 그룹 이름을 따로 받은 계정(primary_group_name)도 되감아 다시 만들 때
+    "primary group conflict"로 막히지 않게 한다(#210)."""
     with _main.ledger_lock():
         pw_lines = _main.read_passwd_lines()
         _main.write_passwd_lines([l for l in pw_lines if (_main.parse_passwd_line(l) or {}).get("name") != name])
@@ -1329,7 +1333,8 @@ def _rollback_user(name: str) -> None:
                 continue
             if name in rec["members"]:
                 rec["members"] = [m for m in rec["members"] if m != name]
-            if rec["name"] == name and not rec["members"]:
+            personal = rec["name"] == name or (primary_gid is not None and rec["gid"] == primary_gid)
+            if personal and not rec["members"]:
                 continue
             cleaned.append(_main.format_group_entry(rec))
         _main.write_group_lines(cleaned)
@@ -1484,6 +1489,25 @@ def step_create_account(ctx):
             gid = uid
             _main.record_issued_id("uid", uid)
 
+            # 쓰기 시작 표시(#210). 이 이름의 계정이 없음을 잠금 안에서 확인한 직후, 계정 파일에 쓰기 전에
+            # 이 작업의 진행 기록에 남긴다. 이 단계 도중 제어기가 죽으면 이어받은 쪽이 이 표시로 "이 작업이
+            # 쓴 계정"과 "예전 신청이 만든 계정"을 가린다. 제어기 밖(체크포인트 없음)에서는 아무것도 하지 않는다.
+            checkpoint = ctx.get("_checkpoint")
+            if checkpoint is not None:
+                ctx["account_write_started"] = uid
+                try:
+                    checkpoint()
+                except LeaseLost:
+                    raise
+                except Exception as e:
+                    # 아무것도 쓰기 전이다. 계정 파일 쓰기 실패와 섞이지 않게 따로 표시하고 재시도에 맡긴다.
+                    _main.log_operation(request_id=request_id, username=name, resource_type="account",
+                                  action=Action.CREATE_ACCOUNT, phase=_main._fail_phase(e),
+                                  error_code="CHECKPOINT_FAILED", error_detail=str(e))
+                    raise _main.StepFailed(_main.infra_error(
+                        "CREATE_ACCOUNT", "CHECKPOINT_FAILED", "failed to record account write marker"),
+                        500, cause=e)
+
             entry = {
                 "name": name,
                 "passwd": "x",
@@ -1498,7 +1522,7 @@ def step_create_account(ctx):
             f.seek(0)
             f.write(new_content)
             f.truncate()
-    except _main.StepFailed:
+    except (_main.StepFailed, LeaseLost):
         raise
     except Exception as e:
         _main.log_operation(request_id=request_id, username=name, resource_type="account",

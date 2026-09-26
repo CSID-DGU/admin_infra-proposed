@@ -41,7 +41,8 @@ def get_db_connection():
         raise
 
 # operation_log 전용 MySQL(log-mysql, operation_state_db) 접속을 위한 함수
-def get_log_db_connection():
+def get_log_db_connection(**timeouts):
+    """timeouts: pymysql의 connect_timeout/read_timeout/write_timeout. 기본은 제한 없음."""
     try:
         app.logger.debug("Creating log DB connection")
 
@@ -50,7 +51,8 @@ def get_log_db_connection():
             user=os.environ["LOG_DB_USER"],
             password=os.environ["LOG_DB_PASSWORD"],
             database=os.environ["LOG_DB_NAME"],
-            autocommit=False
+            autocommit=False,
+            **timeouts,
         )
 
         app.logger.debug("Log DB connection established")

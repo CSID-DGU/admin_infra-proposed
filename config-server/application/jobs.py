@@ -89,7 +89,7 @@ ALWAYS_RERUN = {"step_fetch_user_config", "step_migrate_inherit_password"}
 DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
 SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
-                  "verify_ports", "verify_node", "home_created",
+                  "verify_ports", "verify_node", "home_created", "account_write_started",
                   "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup")
 
 def _saved_ctx(ctx):
@@ -109,6 +109,82 @@ class _StepRewind(Exception):
     def __init__(self, step_name, restart_from, err):
         super().__init__(f"{step_name} → {restart_from}")
         self.step_name, self.restart_from, self.err = step_name, restart_from, err
+
+def _account_missing_parts(ctx, entry):
+    """계정 단계가 쓰는 것 중 계정 파일에 빠진 것. passwd 다음 순서(group → shadow → sudoers)로 본다."""
+    name = ctx["name"]
+    gid = int(entry["gid"])
+    groups = [g for line in _main.read_group_lines() if (g := _main.parse_group_line(line))]
+    missing = []
+    if not any(g["gid"] == gid and g["name"] == ctx["pg_name"] for g in groups):
+        missing.append("group:primary")
+    for sg in ctx.get("supp_groups") or []:
+        if not any(g["gid"] == int(sg["gid"]) and name in g["members"] for g in groups):
+            missing.append(f"group:{sg['name']}")
+    if not any((_main.parse_shadow_line(line) or {}).get("name") == name for line in _main.read_shadow_lines()):
+        missing.append("shadow")
+    if _main._build_sudoers_policy(name):
+        path = os.path.join(_main.app.config["SUDOERS_DIR"], name)
+        if not (os.path.exists(path) and os.path.getsize(path) > 0):
+            missing.append("sudoers")
+    return missing
+
+def _judge_interrupted_account(ctx):
+    """계정 단계를 다시 실행하기 전에, 중단된 시도가 계정을 이미 써 두었는지 판정한다(#210).
+    True면 이 작업이 끝까지 쓴 계정이므로 완료로 보고, False면 단계를 실행한다.
+
+    근거는 쓰기 시작 표시(account_write_started)다. 계정 단계는 이 이름의 계정이 없음을 잠금 안에서
+    확인한 직후에 표시를 남기고 나서야 쓴다. 표시가 없으면 이 작업은 아무것도 쓰지 않았으므로, 같은
+    이름의 계정은 예전 신청이 만든 것이다 — 단계를 그대로 실행해 지금처럼 USER_ALREADY_EXISTS로 멈춘다.
+    표시가 있는데 계정의 uid가 다르면, 이 작업은 쓰지 못했고 같은 사람의 다른 신청이 그 사이 만든 계정이다
+    (admin_be는 같은 사람의 신청을 동시에 승인할 수 있고, 뒤쪽 작업의 USER_ALREADY_EXISTS 실패 → PENDING →
+    재승인 때 재사용을 전제로 한다). 표시 없음과 똑같이 단계를 실행해 그 계정을 건드리지 않고 실패로 끝낸다.
+
+    남는 한계: 예전에 계정이 있던 사람은 두 신청이 같은 uid(expected_uid)를 되돌려 받을 수 있어, 표시만
+    남기고 죽은 작업이 다른 신청이 쓴 계정을 자기 것으로 볼 수 있다. uid만으로는 가릴 수 없다."""
+    marker = ctx.get("account_write_started")
+    if marker is None:
+        return False
+    name = ctx["name"]
+    # 판정과 치우기를 계정 파일 잠금 하나로 묶는다 — lease가 넘어간 뒤에도 옛 소유자가 아직 쓰는 중일 수 있다.
+    # 잠금은 같은 스레드에서 다시 잡을 수 있어 안의 _rollback_user도 그대로 부른다. 계정 파일을 읽지 못하면
+    # 판정하지 않고 넘긴다(기존 결과 불명 관찰 실패와 같은 규칙).
+    try:
+        with _main.ledger_lock():
+            entry = next((e for line in _main.read_passwd_lines()
+                          if (e := _main.parse_passwd_line(line)) and e["name"] == name), None)
+            if entry is None:
+                return False  # 표시만 남기고 쓰기 전에 죽었다
+            if int(entry["uid"]) != int(marker):
+                _main.app.logger.warning(
+                    f"[JOB] 쓰기 시작 표시 uid {marker}와 다른 uid {entry['uid']}의 계정 {name} — 다른 신청이 만든 계정, 건드리지 않음")
+                return False
+            missing = _account_missing_parts(ctx, entry)
+            if missing:
+                # 이 작업이 쓰다 만 계정이다. 치우고 처음부터 다시 쓴다. 앞선 시도의 uid를 후보로 두어, 그 번호의
+                # 홈이 이미 있으면 계정 단계가 같은 번호를 되돌려 준다(_returning_owner_uid).
+                _main.app.logger.warning(
+                    f"[JOB] 중단된 시도가 쓰다 만 계정 {name}(uid={marker}) — 빠진 것 {missing}, 치우고 다시 만든다")
+                _main._rollback_user(name, primary_gid=int(entry["gid"]))
+                ctx["uid"] = int(marker)
+                return False
+    except _StepDegraded:
+        raise
+    except Exception as oe:
+        raise _StepDegraded("step_create_account", "OBSERVE_FAILED", oe, unknowable=True) from oe
+    ctx.update(uid=int(entry["uid"]), gid=int(entry["gid"]), entry=entry,
+               added_supp=[{"name": sg["name"], "gid": int(sg["gid"])} for sg in ctx.get("supp_groups") or []])
+    _main.log_operation(request_id=ctx["request_id"], username=name, resource_type="account",
+                        action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS,
+                        error_detail=json.dumps({"resumed": "interrupted attempt wrote the account",
+                                                 "uid": ctx["uid"]}))
+    _main.app.logger.info(f"[JOB] 중단된 시도가 끝까지 쓴 계정 {name}(uid={ctx['uid']}) 확인 — 계정 단계 완료로 진행")
+    return True
+
+# 완료 기록이 없는 단계를 실행하기 전에 중단된 시도의 효과를 판정하는 함수. True면 실행하지 않는다.
+RESUME_JUDGES = {
+    "step_create_account": _judge_interrupted_account,
+}
 
 def _is_baseline():
     return _main.VERIFY_MODE == "baseline"
@@ -142,6 +218,8 @@ def _execute_step(step, ctx, kind, request_id, username):
         try:
             step(ctx)
             return
+        except LeaseLost:
+            raise  # 단계 안의 체크포인트가 소유권을 잃었다 — 재시도하지 않고 새 소유자에게 넘긴다
         except Exception as e:
             err = e
         finally:
@@ -448,6 +526,12 @@ def _run_job(kind, request_id, username, job_id=None):
         _interrupt_baseline_job(kind, request_id, username, job, ctx, done)
         _release_lease(job_id)
         return
+    if job_id is not None and not _is_baseline():
+        # 단계가 끝나기 전에 남겨야 하는 진행 기록(계정 쓰기 시작 표시, #210)을 단계가 직접 저장하게 한다.
+        # done은 되감기에서 다시 묶이므로 호출 시점의 값을 읽는다.
+        def _checkpoint():
+            job_control.record_step(job_id, done, _saved_ctx(ctx), timeouts=job_control.CHECKPOINT_DB_TIMEOUTS)
+        ctx["_checkpoint"] = _checkpoint
     if done:
         _main.app.logger.info(f"[JOB] resume {kind} request_id={request_id} after {done[-1]}")
     else:
@@ -472,7 +556,11 @@ def _run_job(kind, request_id, username, job_id=None):
                 partner = _main.DEFER_DONE.get(name)
                 if (partner in done) if partner else (name in done):
                     continue
-                _execute_step(step, ctx, kind, request_id, username)
+                # 완료 기록이 없는 단계라도 중단된 시도가 효과를 이미 남겼을 수 있다(#210). 판정할 수 있는
+                # 단계는 먼저 실제 상태를 보고, 이 작업이 끝까지 해 둔 일이면 다시 실행하지 않는다.
+                judge = None if _is_baseline() else _main.RESUME_JUDGES.get(name)
+                if judge is None or not judge(ctx):
+                    _execute_step(step, ctx, kind, request_id, username)
             except _StepRewind as rw:
                 # 되감을 단계가 이 작업에 없으면 원래 실패로 끝낸다. 되감기 횟수를 다 쓰면 같은 단계 재시도를
                 # 다 쓴 것과 똑같이 관리자에게 넘긴다(계정은 점검용으로 보존).

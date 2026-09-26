@@ -1487,6 +1487,7 @@ from application.jobs import (  # noqa: E402
     JOB_ACTIONS, _JOB_KIND, _job_steps, _job_ctx, find_unfinished_jobs, job_end_exists, _finish_job,
     _record_job_result, _compensate_provision, run_job, _release_lease, _run_job,
     _observe_account_created, _observe_krb5_principal, _observe_pod_created,
+    RESUME_JUDGES, _judge_interrupted_account, _account_missing_parts,
 )
 
 
