@@ -76,7 +76,7 @@ def test_creates_when_home_is_absent(nas):
     """홈이 없으면(stat 실패) 평소대로 만든다."""
     fake = nas(1, b"")
     with main.app.app_context():
-        utils.create_user_home_directory("newuser", 21005, 21005)
+        assert utils.create_user_home_directory("newuser", 21005, 21005) is True
     assert [c.split()[1] for c in fake.ran] == ["mkdir", "chown", "chmod"]
     assert "21005:21005" in fake.ran[1]
 
@@ -85,8 +85,18 @@ def test_creates_when_owner_already_matches(nas):
     """같은 uid 로 다시 프로비저닝하는 경우는 그대로 진행한다(재실행 안전)."""
     fake = nas(0, b"21001\n")
     with main.app.app_context():
-        utils.create_user_home_directory("csuhyeon", 21001, 21001)
+        # 이미 있던 홈이라 알려야 Kerberos 실패 정리가 사용자 데이터를 지우지 않는다
+        assert utils.create_user_home_directory("csuhyeon", 21001, 21001) is False
     assert len(fake.ran) == 3
+
+
+@pytest.mark.parametrize("code,out,owner", [(0, b"21001\n", 21001), (1, b"", None), (0, b"?\n", None)])
+def test_home_owner_lookup(nas, code, out, owner):
+    """돌아온 사용자 판별용 조회 — 홈이 없거나 읽을 수 없으면 None, 명령은 조회 하나만 보낸다."""
+    fake = nas(code, out)
+    with main.app.app_context():
+        assert utils.user_home_owner_uid("csuhyeon") == owner
+    assert fake.ran == []
 
 
 def test_ignores_unparsable_stat_output(nas):

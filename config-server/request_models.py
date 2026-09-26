@@ -73,7 +73,8 @@ class ProvisionAccount(RequestBody):
     supplementary_groups: List[SupplementaryGroup] = []
     expected_uid: Optional[int] = Field(
         default=None, ge=1,
-        description="이 사용자가 예전에 쓰던 UID. 원장에 같은 이름·UID의 계정이 남아 있으면 새로 만들지 않고 이어받는다")
+        description="이 사용자가 예전에 쓰던 UID. 원장에 같은 이름·UID의 계정이 남아 있으면 새로 만들지 않고 이어받는다. "
+                    "원장에 없으면 NAS 홈 소유자가 이 값과 같을 때 새 번호 대신 이 번호로 계정을 만든다")
 
     @field_validator("passwd_hash")
     @classmethod

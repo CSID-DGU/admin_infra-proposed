@@ -1113,9 +1113,22 @@ def create_team_directory(group_name: str, gid: int) -> None:
         _ssh_run(ssh, f"sudo chmod 2770 {quoted}")
 
 
-def create_user_home_directory(username: str, uid: int, gid: int) -> None:
-    """홈을 만들고 소유권을 배정한다. 이미 있는 홈의 소유자가 배정하려는 uid 와 다르면
-    덮어쓰지 않고 HomeOwnerMismatch 로 멈춘다.
+def _home_owner_uid(ssh, quoted_path: str):
+    """홈의 소유자 uid. 홈이 없으면 None.
+    상위 디렉터리가 755 라 홈이 700 이어도 조회는 된다. 없으면 0 이 아닌 코드가 온다."""
+    code, current = _ssh_capture(ssh, f"stat -c %u {quoted_path}")
+    return int(current) if code == 0 and current.isdigit() else None
+
+
+def user_home_owner_uid(username: str):
+    """NAS 에 남은 이 사용자 홈의 소유자 uid. 홈이 없으면 None, NAS 접속 실패는 예외로 올린다."""
+    with _nas_ssh_client() as ssh:
+        return _home_owner_uid(ssh, shlex.quote(_user_home_path(username)))
+
+
+def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
+    """홈을 만들고 소유권을 배정한다. 새로 만들었으면 True, 이 uid 소유로 이미 있었으면 False.
+    이미 있는 홈의 소유자가 배정하려는 uid 와 다르면 덮어쓰지 않고 HomeOwnerMismatch 로 멈춘다.
 
     NAS 가 Kerberos 주체를 푸는 값이 계정 대장의 uid 와 다를 수 있다. 실제로 구 운영에서
     넘어온 계정은 NAS 캐시에 옛 uid 가 남아 있어서, 대장이 준 새 uid 로 chown 하면
@@ -1128,9 +1141,8 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> None:
     quoted = shlex.quote(path)
     app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
     with _nas_ssh_client() as ssh:
-        # 상위 디렉터리가 755 라 홈이 700 이어도 조회는 된다. 없으면 0 이 아닌 코드가 온다.
-        code, current = _ssh_capture(ssh, f"stat -c %u {quoted}")
-        if code == 0 and current.isdigit() and int(current) != int(uid):
+        current = _home_owner_uid(ssh, quoted)
+        if current is not None and current != int(uid):
             app.logger.error(
                 f"[NAS SSH] home owner mismatch {path}: nas={current} requested={uid}"
             )
@@ -1143,6 +1155,7 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> None:
         _ssh_run(ssh, f"sudo mkdir -p {quoted}")
         _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
         _ssh_run(ssh, f"sudo chmod 700 {quoted}")
+    return current is None
 
 
 NAS_GSS_FLUSH_COMMAND = "sudo -n /usr/local/sbin/decs-nfs-flush-gss"
