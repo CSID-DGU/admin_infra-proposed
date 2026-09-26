@@ -152,7 +152,7 @@ def test_resetter_reclaims_accounts_through_the_product_and_reports_residue():
     cluster, api = FakeCluster(), FakeApi()
     state = {"reset": False}
     cluster.on(r"SELECT user_id, IFNULL\(ubuntu_username", lambda _: [] if state["reset"] else
-               [("7", "exp-fu-e2eabc12c01a", "1"), ("1", "", "0")])
+               [("7", "exp-fu-e2eabc12c01a", "ACTIVE"), ("1", "", "NONE")])
     cluster.on(r"START TRANSACTION", lambda _: state.update(reset=True))
     cluster.on(r"FROM nodeport_allocations", [("exp-fu-e2eabc12c01a",)])
     cluster.on(r"/kube_share/passwd", "홈 exp-fu-e2eabc12c01a\n")

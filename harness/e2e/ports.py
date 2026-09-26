@@ -112,12 +112,12 @@ class BeApi:
 
     def call(self, method: str, path: str, *, as_user: int, body=None) -> tuple:
         """(상태 코드, 응답 JSON) — 오류 응답도 예외 없이 돌려준다. 판정은 부르는 쪽이 한다.
-        계정 회수처럼 Pod 삭제까지 동기로 기다리는 API가 있어 응답 대기는 넉넉히(10분) 둔다."""
+        승인·회수는 작업만 등록하고 202로 돌아오므로 응답 대기는 짧게 둔다. 결과는 wait 단계가 DB로 본다."""
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers={
             "Authorization": "Bearer " + self._token(as_user), "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=600, context=self._ctx) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=self._ctx) as resp:
                 raw = resp.read()
                 return resp.status, json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:

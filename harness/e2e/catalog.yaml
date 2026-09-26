@@ -16,11 +16,11 @@ cases:
     covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
     steps:
       - user: a
-      - expect_user: {a: {active: false, uid: none}}
+      - expect_user: {a: {account: NONE, uid: none}}
       - apply: {user: a, as: r1}
       - approve: r1
       - wait: {r1: FULFILLED}
-      - expect_user: {a: {active: true, uid: issued}}
+      - expect_user: {a: {account: ACTIVE, uid: issued}}
       - expect_pod: {r1: present}
 
   - id: C02
@@ -31,7 +31,7 @@ cases:
       - apply: {user: a, as: r1}
       - reject: r1
       - expect_status: {r1: DENIED}
-      - expect_user: {a: {active: false, uid: none}}
+      - expect_user: {a: {account: NONE, uid: none}}
 
   - id: C03
     title: 사용자 취소 — 대기 중·거절된 신청을 지운다, 떠 있는 컨테이너는 취소로 못 지운다
@@ -61,7 +61,7 @@ cases:
       - wait: {r1: DELETED}
       - expect_status: {r2: FULFILLED}
       - expect_pod: {r1: absent, r2: present}
-      - expect_user: {a: {active: true}}
+      - expect_user: {a: {account: ACTIVE}}
 
   - id: C05
     title: 계정 회수 — 컨테이너가 전부 끝나고 계정은 비활성, UID는 그 사람 것으로 남는다
@@ -75,7 +75,8 @@ cases:
       - reclaim_account: a
       - wait: {r1: DELETED}
       - expect_pod: {r1: absent}
-      - expect_user: {a: {active: false, uid: {same_as: uid_a}}}
+      - wait_account: {a: NONE}
+      - expect_user: {a: {uid: {same_as: uid_a}}}
 
   - id: C06
     title: 회수 후 재신청 — 같은 UID·같은 홈으로 계정이 되살아난다
@@ -88,10 +89,11 @@ cases:
       - remember_uid: {user: a, as: uid_a}
       - reclaim_account: a
       - wait: {r1: DELETED}
+      - wait_account: {a: NONE}
       - apply: {user: a, as: r2}
       - approve: r2
       - wait: {r2: FULFILLED}
-      - expect_user: {a: {active: true, uid: {same_as: uid_a}}}
+      - expect_user: {a: {account: ACTIVE, uid: {same_as: uid_a}}}
 
   - id: C07
     title: 비활성화 → 재활성화 → 재승인 — 같은 UID로 돌아온다
@@ -104,12 +106,13 @@ cases:
       - remember_uid: {user: a, as: uid_a}
       - deactivate: a
       - wait: {r1: DELETED}
-      - expect_user: {a: {active: false, uid: {same_as: uid_a}}}
+      - wait_account: {a: NONE}
+      - expect_user: {a: {uid: {same_as: uid_a}}}
       - reactivate: a
       - apply: {user: a, as: r2}
       - approve: r2
       - wait: {r2: FULFILLED}
-      - expect_user: {a: {active: true, uid: {same_as: uid_a}}}
+      - expect_user: {a: {account: ACTIVE, uid: {same_as: uid_a}}}
 
   - id: C08
     title: 노드 이동 — 다른 farm 노드로 옮겨지고 컨테이너가 산다
@@ -134,7 +137,7 @@ cases:
       - sleep: 5
       - fault: {kill: controller}
       - wait: {r1: FULFILLED}
-      - expect_user: {a: {active: true, uid: issued}}
+      - expect_user: {a: {account: ACTIVE, uid: issued}}
 
   - id: F02
     title: 생성 중 config-server API Pod 사망 — 작업은 제어기가 계속 돌려 끝낸다

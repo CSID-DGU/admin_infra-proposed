@@ -10,7 +10,7 @@ CATALOG = pathlib.Path(__file__).with_name("catalog.yaml")
 VERBS = {
     "user", "apply", "approve", "reject", "cancel", "reclaim_container", "reclaim_account",
     "deactivate", "reactivate", "migrate", "wait", "expect_status", "expect_user", "remember_uid",
-    "expect_codes", "expect_pod", "expect_node_changed", "fault", "heal", "sleep", "wait_job", "wait_codes",
+    "expect_codes", "expect_pod", "expect_node_changed", "fault", "heal", "sleep", "wait_job", "wait_account", "wait_codes",
 }
 FAULT_VERBS = {"fault"}
 _TRANSITION = re.compile(r"^[A-Z]+>[A-Z]+$")
