@@ -77,6 +77,33 @@ def test_raise_errors_path_still_raises_and_counts(monkeypatch):
     assert fake.n == 1
 
 
+def test_timeouts_kwarg_is_forwarded_to_db_connection(monkeypatch):
+    """timeouts를 넘기면 그 값으로 DB에 연결한다(#213 후속) — 계정 파일 잠금을 쥔 채 기록하는 호출부가
+    로그 DB가 멈춰도 잠금을 무한정 쥐지 않게 시간 제한을 줄 수 있어야 한다. 안 넘기면(대부분의 호출부)
+    기존처럼 제한 없이 연결한다."""
+    seen = []
+
+    class FakeConn:
+        def cursor(self):
+            raise RuntimeError("cursor 안 씀 — 연결 인자만 본다")
+
+        def close(self):
+            pass
+
+    def fake_connect(**timeouts):
+        seen.append(timeouts)
+        return FakeConn()
+    monkeypatch.setattr(operation_log, "get_log_db_connection", fake_connect)
+
+    with main.app.app_context():
+        operation_log.log_operation(request_id=1, username="exp-np-t", action=Action.PROVISION, phase=Phase.START)
+        operation_log.log_operation(request_id=1, username="exp-np-t", action=Action.PROVISION, phase=Phase.START,
+                                     timeouts={"connect_timeout": 5, "read_timeout": 10, "write_timeout": 10})
+
+    assert seen[0] == {}
+    assert seen[1] == {"connect_timeout": 5, "read_timeout": 10, "write_timeout": 10}
+
+
 def test_counter_failure_never_breaks_the_flow(monkeypatch):
     """로그 DB 와 Redis 가 동시에 죽어도 생성 흐름은 계속된다. 최후 백업은 app.logger 행이다."""
     _fail_log_db(monkeypatch)
