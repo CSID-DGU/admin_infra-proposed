@@ -129,6 +129,7 @@ def log_operation(
     job_id=None,
     target_state=None,
     start_job=False,
+    timeouts=None,
 ):
     """
     operation_log에 한 줄 기록. 절대 예외를 밖으로 던지지 않음
@@ -142,6 +143,11 @@ def log_operation(
 
     raise_errors=True면 기록 실패를 호출자에게 다시 던진다. 작업 등록처럼 이 행 자체가
     이후 처리의 근거인 경우에만 쓴다.
+
+    timeouts=dict(connect_timeout=..., read_timeout=..., write_timeout=...)를 넘기면 그 값으로 DB에
+    연결한다. 기본(None)은 제한 없음 — 대부분의 호출부는 계정 파일 잠금 밖에서 실행돼 이 기록이
+    늦어져도 다른 작업을 막지 않는다. 잠금을 쥔 채 기록하는 호출부(계정 삭제 성공 등, #213)만 이 값을
+    넘겨, 로그 DB가 멈춰도 잠금을 오래 쥐고 있지 않게 한다.
     """
     action_value = action.value if isinstance(action, Action) else action
     phase_value = phase.value if isinstance(phase, Phase) else phase
@@ -156,7 +162,7 @@ def log_operation(
 
     conn = None
     try:
-        conn = get_log_db_connection()
+        conn = get_log_db_connection(**(timeouts or {}))
 
         if duration_ms is None and phase_value in (Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value):
             duration_ms = _lookup_elapsed_ms(conn, request_id, action_value, attempt)

@@ -339,8 +339,14 @@ def _query_deletion_evidence(conn, username):
         return cur.fetchone()
 
 
+class _EvidenceLookupFailed(Exception):
+    """삭제 기록 조회 자체가 실패함(DB 연결 끊김·시간 초과 등) — "증거 없음"과 다르다. 증거가 없다는
+    확정 판정이 아니라 "지금은 모른다"는 뜻이므로, 호출자가 재시도해야 한다(#213 후속)."""
+
+
 def _account_deletion_evidence(username):
-    """계정이 없는 것이 "누가 지웠기 때문"임을 보이는 작업 기록. 없거나 조회하지 못하면 None.
+    """계정이 없는 것이 "누가 지웠기 때문"임을 보이는 작업 기록. 없으면 None, 조회 자체가 실패하면
+    _EvidenceLookupFailed를 던진다(둘을 구분해야 조회 실패를 "증거 없음"으로 오인하지 않는다, #213 후속).
 
     계정 파일에 없다는 사실만으로는 회수됐다고 믿지 않는다 — 계정 파일이 비었거나 잘못 읽혔거나, 애초에
     없던 사용자를 회수하라는 요청일 수 있다. 계정 파일과 다른 정보원(작업 기록)에서, 이 사용자의 마지막
@@ -348,18 +354,16 @@ def _account_deletion_evidence(username):
     - DELETE_ACCOUNT SUCCESS(이미 없음으로 넘긴 것은 제외 — 증거 없는 "없음"이 서로를 증거로 삼지 않게)
     - ACCOUNT_FILE_WRITE_FAILED(passwd부터 쓰다가 멈춘 삭제 — 응답 끊김·반쪽 삭제)
     운영에서 넘어온 옛 계정처럼 생성 기록이 없어도 첫 삭제가 기록을 남기므로 두 번째 노드부터는 증거가 있다.
-    계정 파일을 쓴 뒤 기록을 남기기 전에 제어기가 죽은 삭제는 증거가 없어 기존처럼 404로 남는다."""
+    계정 파일을 쓴 뒤 기록을 남기기 전에 제어기가 죽은 삭제는 증거가 없어 기존처럼 실패로 남는다."""
     # 계정 파일 잠금 안에서 부르므로 로그 DB가 멈춰도 계정 작업 전체가 멈추지 않게 시간 제한을 둔다.
     try:
         conn = _main.get_log_db_connection(**job_control.CHECKPOINT_DB_TIMEOUTS)
-    except Exception:
-        _main.app.logger.warning(f"[ACCOUNTS] {username} 삭제 기록 조회 실패 — 이미 없음을 인정하지 않음", exc_info=True)
-        return None
+    except Exception as e:
+        raise _EvidenceLookupFailed(username) from e
     try:
         row = _query_deletion_evidence(conn, username)
-    except Exception:
-        _main.app.logger.warning(f"[ACCOUNTS] {username} 삭제 기록 조회 실패 — 이미 없음을 인정하지 않음", exc_info=True)
-        return None
+    except Exception as e:
+        raise _EvidenceLookupFailed(username) from e
     finally:
         conn.close()
     if row is None:
@@ -388,7 +392,15 @@ def step_delete_account(ctx):
                 continue
             new_lines.append(line)
         if removed_user is None:
-            evidence = _account_deletion_evidence(username) if ctx.get("account_absent_is_goal") else None
+            evidence = None
+            if ctx.get("account_absent_is_goal"):
+                try:
+                    evidence = _account_deletion_evidence(username)
+                except _EvidenceLookupFailed as e:
+                    # 조회 자체가 실패했을 뿐 "증거 없음"이 확정된 게 아니다(#213 후속) — 5xx로 올려
+                    # 기존 재시도(최대 STEP_MAX_ATTEMPTS)를 타게 한다. 다 써도 안 되면 DEGRADED로
+                    # 넘어가 자원을 임의로 결론짓지 않는다.
+                    raise _main.StepFailed({"error": "EVIDENCE_LOOKUP_FAILED"}, 503, cause=e) from e
             if evidence is not None:
                 # 목표 상태(계정 없음)에 이미 도달했다(#213). 노드마다 등록되는 계정 회수의 두 번째부터,
                 # 또는 삭제는 끝났는데 응답이 끊긴 재시도에서 생긴다. 실패로 끝내면 뒤의 Kerberos 정리
@@ -401,8 +413,17 @@ def step_delete_account(ctx):
                                                        "leftovers_removed": leftovers}))
                 return
             if ctx.get("account_absent_is_goal"):
+                # 계정이 없는데 지운 증거도 없다(계정 파일 손상, 없던 사용자, 또는 지운 뒤 기록을 남기기
+                # 전에 제어기가 죽은 경우) — 회수 완료로 믿지 않는다. baseline의 USER_NOT_FOUND와 같은
+                # 코드를 쓰면 admin_be(OperationJobService.isAccountAlreadyAbsent)가 이것도 무조건 회수
+                # 완료로 읽어 #213이 남긴 구분이 무력해진다(#213 후속) — noprobe·full 전용 코드로 갈린다.
                 _main.app.logger.warning(
                     f"[ACCOUNTS] {username}이(가) 계정 파일에 없지만 지운 기록이 없어 회수 완료로 보지 않음")
+                _main.log_operation(request_id=request_id, username=username, node_name=node_name,
+                              resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="ACCOUNT_ABSENT_UNVERIFIED",
+                              error_detail=f"user {username!r} not present in passwd and no deletion evidence found")
+                raise _main.StepFailed({"error": "ACCOUNT_ABSENT_UNVERIFIED"}, 404)
             # baseline(운영 재현)과 작업 보상 경로: 404로 돌려준다. 운영 admin_be는 404를 "이미 삭제됨"으로
             # 처리한다. 지표를 뽑을 때 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다.
             _main.log_operation(request_id=request_id, username=username, node_name=node_name,
@@ -456,8 +477,12 @@ def step_delete_account(ctx):
         # 삭제 기록은 잠금 안에서 남긴다(#213). 노드별 계정 회수가 동시에 돌 때, 이 잠금을 이어받은 다른
         # 노드의 작업은 계정이 없음을 보고 이 기록을 지운 증거로 찾는다 — 잠금 밖에서 남기면 그 사이에
         # 조회해 증거를 못 찾고 실패한다.
+        # 잠금을 쥔 채 쓰므로 시간 제한을 둔다(#213 후속) — 로그 DB가 멈추면 이 기록만 못 남기고 잠금은
+        # 풀려야, 계정 생성·비밀번호 교체·그룹 변경 등 잠금을 기다리는 다른 작업 전체가 물리지 않는다.
+        # 기록이 실패하면 다음 노드는 증거를 못 찾아 위 _EvidenceLookupFailed 재시도 경로를 탄다.
         _main.log_operation(request_id=request_id, username=username, node_name=node_name,
-                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS,
+                      timeouts=job_control.CHECKPOINT_DB_TIMEOUTS)
 
 def step_remove_krb5(ctx):
     """keytab을 지울 노드: 호출자가 준 node_name, 없으면 같은 작업에서 지운 Pod가 떠 있던 노드."""

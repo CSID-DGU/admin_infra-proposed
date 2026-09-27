@@ -187,6 +187,10 @@ baseline은 운영의 "죽으면 끝"을 재현해야 하므로 표시를 남기
 
 NoProbe·Full에서 계정 삭제(`step_delete_account`)는 계정 파일에 사용자가 없고 **지운 증거**가 있으면 목표 도달로 보고 성공으로 넘긴다. passwd만 지워지고 남은 shadow 줄·개인 그룹 줄·그룹 멤버십은 치운다(`_remove_account_leftovers`, 공용 그룹 줄은 남김). 작업 기록은 `DELETE_ACCOUNT SUCCESS`에 error_detail `{"already_absent": true, "deleted_by": {...}, "leftovers_removed": [...]}`로 실제 삭제와 구분한다. 뒤의 Kerberos 정리(그 노드 keytab)와 Full의 회수 확인까지 진행한다. 회수 가능 확인(`ACCOUNT_IN_USE`·`ACCOUNT_NODE_UNKNOWN` 보류)은 그대로다.
 
-지운 증거(`_account_deletion_evidence`): 계정 파일에 없다는 사실만으로는 믿지 않는다 — 계정 파일이 비었거나 잘못 읽혔거나, 없던 사용자를 회수하라는 요청일 수 있다. 계정 파일과 다른 정보원인 작업 기록에서, 이 사용자의 마지막 계정 생성(`CREATE_ACCOUNT SUCCESS`, 없으면 처음부터) 이후 계정 파일을 실제로 고친 삭제 — `DELETE_ACCOUNT SUCCESS`(이미 없음으로 넘긴 것 제외) 또는 쓰기 도중 실패 `ACCOUNT_FILE_WRITE_FAILED` — 가 있어야 한다. 증거가 없거나 작업 기록을 조회하지 못하면 기존처럼 `USER_NOT_FOUND`로 실패한다. 조회는 계정 파일 잠금 안에서 하므로 `CHECKPOINT_DB_TIMEOUTS`를 쓴다. 계정 파일을 쓴 뒤 기록을 남기기 전에 제어기가 죽은 삭제는 증거가 없어 404로 남는다.
+지운 증거(`_account_deletion_evidence`): 계정 파일에 없다는 사실만으로는 믿지 않는다 — 계정 파일이 비었거나 잘못 읽혔거나, 없던 사용자를 회수하라는 요청일 수 있다. 계정 파일과 다른 정보원인 작업 기록에서, 이 사용자의 마지막 계정 생성(`CREATE_ACCOUNT SUCCESS`, 없으면 처음부터) 이후 계정 파일을 실제로 고친 삭제 — `DELETE_ACCOUNT SUCCESS`(이미 없음으로 넘긴 것 제외) 또는 쓰기 도중 실패 `ACCOUNT_FILE_WRITE_FAILED` — 가 있어야 한다. 계정 파일을 쓴 뒤 기록을 남기기 전에 제어기가 죽은 삭제는 증거가 없어 실패로 남는다.
+
+조회 자체(로그 DB 연결·쿼리)가 실패하면 "증거 없음"으로 확정하지 않는다 — `_EvidenceLookupFailed`를 던져 503으로 올리고, 이 단계의 일반 재시도(`STEP_MAX_ATTEMPTS`)를 그대로 태운다. 다 써도 안 되면 자원을 임의로 결론짓지 않고 DEGRADED로 관리자에게 넘긴다. 증거를 못 찾았을 때(조회는 됐지만 기록이 없음)는 NoProbe·Full에서 baseline과 다른 코드 `ACCOUNT_ABSENT_UNVERIFIED`(404)로 실패한다 — baseline과 같은 `USER_NOT_FOUND`를 쓰면 admin_be(`OperationJobService.isAccountAlreadyAbsent`)가 이것도 회수 완료로 읽어 이 구분이 무력해지기 때문이다.
+
+성공 기록(`DELETE_ACCOUNT SUCCESS`)은 계정 파일 잠금을 쥔 채 남기므로(#213, 동시 실행 시 다음 노드의 증거로 쓰기 위해) `log_operation`에 `CHECKPOINT_DB_TIMEOUTS`를 준다 — 로그 DB가 멈춰도 잠금을 무한정 쥐고 있지 않는다(그 외 대부분의 `log_operation` 호출은 잠금 밖이라 시간 제한이 없다).
 
 baseline과 생성 실패 보상 경로는 운영처럼 `USER_NOT_FOUND`(404)로 돌려준다(admin_be는 이를 "이미 삭제됨"으로 처리한다).
