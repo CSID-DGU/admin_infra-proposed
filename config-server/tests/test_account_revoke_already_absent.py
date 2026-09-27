@@ -202,7 +202,10 @@ def test_evidence_lookup_failure_does_not_accept_absence(env, monkeypatch):
 
     assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED", rows(e, "593")
     assert res["error_code"] not in ("user not found", "USER_NOT_FOUND", "ACCOUNT_ABSENT_UNVERIFIED")
-    assert len([1 for a, p in rows(e, "593") if a == "REVOKE" and p == "RETRY"]) == 2  # 3회 시도
+    retries = e.db.execute(
+        "SELECT error_code FROM operation_log WHERE request_id='593' AND action='REVOKE' AND phase='RETRY'"
+        ).fetchall()
+    assert [c for (c,) in retries] == ["EVIDENCE_LOOKUP_FAILED"] * 2  # 3회 시도 — 조회 실패가 재시도 사유로 남음
     assert ("krb5_remove", (USER, "farm7")) not in e.calls
 
 
