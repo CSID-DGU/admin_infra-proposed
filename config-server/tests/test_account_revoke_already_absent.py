@@ -7,7 +7,12 @@
 
 단, "계정 파일에 없음"만으로는 믿지 않는다. 마지막 계정 생성 이후에 계정 파일을 실제로 고친 삭제 기록
 (지운 증거)이 있어야 성공으로 본다. 계정 파일이 비었거나, 없던 사용자를 회수하라는 요청이면 증거가 없어
-기존처럼 USER_NOT_FOUND로 실패한다.
+실패한다.
+
+#213 후속: 증거가 없을 때 baseline과 같은 USER_NOT_FOUND를 쓰면 admin_be
+(OperationJobService.isAccountAlreadyAbsent)가 이것도 회수 완료로 읽어 이 구분이 로그에만 남는다.
+그래서 NoProbe·Full은 별도 코드 ACCOUNT_ABSENT_UNVERIFIED로 실패한다. 증거 조회 자체가 실패(로그 DB
+시간 초과 등)하면 "증거 없음"으로 확정하지 않고 5xx로 재시도한다(다 써도 안 되면 DEGRADED).
 baseline은 운영 시절처럼 USER_NOT_FOUND로 실패한다. 컨테이너 회수는 바뀌지 않는다.
 """
 import json
@@ -128,14 +133,15 @@ def _drop_from_passwd(name):
 
 def test_absent_without_deletion_record_fails_like_before(env):
     """계정 파일에서 사라졌는데 누가 지운 기록이 없다(계정 파일 손상·잘못 읽음) — 회수 완료로 보지 않고
-    기존처럼 USER_NOT_FOUND로 실패한다. Kerberos 정리도 하지 않는다."""
+    ACCOUNT_ABSENT_UNVERIFIED로 실패한다(#213 후속 — baseline의 USER_NOT_FOUND와 코드를 나눠 admin_be가
+    이 실패를 회수 완료로 잘못 읽지 않게 한다). Kerberos 정리도 하지 않는다."""
     e = env
     node = _provision_and_revoke_container(e, "571")
     _drop_from_passwd(USER)
 
     res = _revoke_account(e, "572", node)
 
-    assert res["phase"] == "FAIL" and "not found" in res["error_code"], rows(e, "572")
+    assert res["phase"] == "FAIL" and res["error_code"] == "ACCOUNT_ABSENT_UNVERIFIED", rows(e, "572")
     assert ("REMOVE_KRB5", "START") not in rows(e, "572")
 
 
@@ -152,7 +158,8 @@ def test_absent_record_is_not_evidence_for_the_next_absent(env):
 
 
 def test_never_existing_user_revoke_fails(env):
-    """한 번도 만들어진 적 없는 사용자의 계정 회수 요청 — 성공으로 기록하지 않는다."""
+    """한 번도 만들어진 적 없는 사용자의 계정 회수 요청 — 성공으로 기록하지 않는다(증거가 있을 수 없으니
+    ACCOUNT_ABSENT_UNVERIFIED, #213 후속)."""
     e = env
 
     e.api.post("/operations/revoke", json={"request_id": "576", "username": "exp-np-ghost", "node_name": "farm2",
@@ -160,7 +167,7 @@ def test_never_existing_user_revoke_fails(env):
     tick(e)
 
     res = result(e, "revoke", "576")
-    assert res["phase"] == "FAIL" and "not found" in res["error_code"], rows(e, "576")
+    assert res["phase"] == "FAIL" and res["error_code"] == "ACCOUNT_ABSENT_UNVERIFIED", rows(e, "576")
 
 
 def test_deletion_before_recreation_is_not_evidence(env):
@@ -179,7 +186,9 @@ def test_deletion_before_recreation_is_not_evidence(env):
 
 
 def test_evidence_lookup_failure_does_not_accept_absence(env, monkeypatch):
-    """작업 기록을 조회하지 못하면 판단하지 않고 기존처럼 실패로 남긴다."""
+    """조회 자체가 실패(로그 DB 다운 등)하면 "증거 없음"으로 확정하지 않는다(#213 후속) — 5xx로 올려
+    이 단계의 일반 재시도를 태우고, 다 써도 안 되면 DEGRADED로 넘긴다. baseline의 USER_NOT_FOUND나
+    회수 완료로 오인될 수 있는 코드는 쓰지 않는다."""
     from lifecycle_steps import revoke
     e = env
     node = _provision_and_revoke_container(e, "591")
@@ -191,7 +200,35 @@ def test_evidence_lookup_failure_does_not_accept_absence(env, monkeypatch):
 
     res = _revoke_account(e, "593", "farm7")
 
-    assert res["phase"] == "FAIL", rows(e, "593")
+    assert res["phase"] == "FAIL" and res["error_code"] == "DEGRADED", rows(e, "593")
+    assert res["error_code"] not in ("user not found", "USER_NOT_FOUND", "ACCOUNT_ABSENT_UNVERIFIED")
+    assert len([1 for a, p in rows(e, "593") if a == "REVOKE" and p == "RETRY"]) == 2  # 3회 시도
+    assert ("krb5_remove", (USER, "farm7")) not in e.calls
+
+
+def test_evidence_lookup_recovers_on_retry(env, monkeypatch):
+    """조회 실패가 일시적이면(다음 시도에 로그 DB가 살아남) 증거를 찾아 성공한다 — 조회 실패 자체를
+    영구 실패로 확정하지 않는다는 뜻이다(#213 후속)."""
+    from lifecycle_steps import revoke
+    e = env
+    node = _provision_and_revoke_container(e, "595")
+    assert _revoke_account(e, "596", node)["phase"] == "SUCCESS"
+
+    real_query = revoke._query_deletion_evidence
+    calls = {"n": 0}
+
+    def flaky(conn, username):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("log db read timeout")
+        return real_query(conn, username)
+    monkeypatch.setattr(revoke, "_query_deletion_evidence", flaky)
+
+    res = _revoke_account(e, "597", "farm7")
+
+    assert res["phase"] == "SUCCESS", rows(e, "597")
+    assert ("krb5_remove", (USER, "farm7")) in e.calls
+    assert len([1 for a, p in rows(e, "597") if a == "REVOKE" and p == "RETRY"]) == 1
 
 
 def test_full_mode_runs_account_revoke_check_when_already_absent(full, lease_env):
