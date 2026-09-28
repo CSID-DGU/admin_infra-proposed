@@ -11,18 +11,19 @@
 operation_log 는 측정 원자료라서 잔재로 세지 않는다. 원장·NAS 홈·AD·노드 keytab 은 노드 단위
 명령이 생긴 뒤에 더한다.
 """
-import json
 
 import system
 
 KEYTAB_SECRET_PREFIX = "krb5-keytab-"
 
+# 이름과 username 라벨만 받는다. -o json 이면 Secret 의 data(비밀번호 해시, DB 비밀번호)까지 딸려 온다.
+COLUMNS = ["-o", "custom-columns=NAME:.metadata.name,USER:.metadata.labels.username", "--no-headers"]
 # kind -> kubectl get 인자. 각 객체에서 사용자 이름을 꺼내는 방법은 _kube_owner 가 정한다.
 KUBE_KINDS = {
-    "pod": ["get", "pods", "-l", "app=ailab-guest", "-o", "json"],
-    "service": ["get", "services", "-l", "app=ailab-nodeport", "-o", "json"],
-    "account_secret": ["get", "secrets", "-l", "app=ailab-account", "-o", "json"],
-    "keytab_secret": ["get", "secrets", "-o", "json"],
+    "pod": ["get", "pods", "-l", "app=ailab-guest", *COLUMNS],
+    "service": ["get", "services", "-l", "app=ailab-nodeport", *COLUMNS],
+    "account_secret": ["get", "secrets", "-l", "app=ailab-account", *COLUMNS],
+    "keytab_secret": ["get", "secrets", *COLUMNS],
 }
 
 # kind -> (데이터베이스, 문장). 첫 칸이 username, 둘째 칸이 목록에 적을 이름이다.
@@ -33,12 +34,10 @@ SQL_KINDS = {
 }
 
 
-def _kube_owner(kind, item):
-    meta = item.get("metadata") or {}
+def _kube_owner(kind, name, label):
     if kind == "keytab_secret":
-        name = meta.get("name", "")
         return name[len(KEYTAB_SECRET_PREFIX):] if name.startswith(KEYTAB_SECRET_PREFIX) else None
-    return (meta.get("labels") or {}).get("username")
+    return None if label == "<none>" else label
 
 
 def _kube_items(host, namespace, kind):
@@ -49,11 +48,15 @@ def _kube_items(host, namespace, kind):
         return str(e)
     if row.get("rc") != 0:
         return f"rc={row.get('rc')}: {row.get('stderr', '')}"
-    try:
-        items = json.loads(row.get("stdout") or "").get("items") or []
-    except (ValueError, AttributeError):
-        return f"kubectl 출력이 JSON 이 아니다: {(row.get('stdout') or '')[:200]!r}"
-    return [(_kube_owner(kind, it), (it.get("metadata") or {}).get("name")) for it in items]
+    items = []
+    for line in (row.get("stdout") or "").splitlines():
+        cols = line.split()
+        if not cols:
+            continue
+        if len(cols) != 2:
+            return f"kubectl 출력 줄이 이름과 라벨 두 칸이 아니다: {line[:200]!r}"
+        items.append((_kube_owner(kind, *cols), cols[0]))
+    return items
 
 
 def _sql_items(host, namespace, kind):

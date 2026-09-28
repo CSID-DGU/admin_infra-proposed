@@ -1,5 +1,4 @@
 """inventory 계약 검증. system.stack_kube 와 stack_sql 을 가짜 스택으로 바꾼다."""
-import json
 import sys
 from pathlib import Path
 
@@ -21,6 +20,7 @@ class FakeStack:
     def __init__(self):
         self.kube_fail = set()
         self.statements = []
+        self.requested = []
         self.objects = {
             "pods": [_obj(f"ailab-{ME}-0a1b2c3d", app="ailab-guest", username=ME),
                      _obj(f"ailab-{OTHER}-11111111", app="ailab-guest", username=OTHER),
@@ -42,11 +42,15 @@ class FakeStack:
         resource = args[1]
         if resource in self.kube_fail:
             return {"rc": 1, "stdout": "", "stderr": "connection refused"}
+        assert "json" not in " ".join(args), "Secret data 가 딸려 오는 -o json 을 쓰면 안 된다"
+        self.requested.append(args)
         items = self.objects[resource]
         if "-l" in args:
             key, value = args[args.index("-l") + 1].split("=")
             items = [i for i in items if i["metadata"]["labels"].get(key) == value]
-        return {"rc": 0, "stdout": json.dumps({"items": items}), "stderr": ""}
+        lines = [f"{i['metadata']['name']}   {i['metadata']['labels'].get('username', '<none>')}"
+                 for i in items]
+        return {"rc": 0, "stdout": "\n".join(lines), "stderr": ""}
 
     def sql(self, host, namespace, database, statement):
         self.statements.append(statement)
