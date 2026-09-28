@@ -169,3 +169,32 @@ def test_saved_record_round_trips_through_trial_results(conn, env, tmp_path):
     loaded = trial_results.load(tmp_path, "trial-saved")
     assert loaded.pop("schema_version") == trial_results.SCHEMA_VERSION
     assert loaded == json.loads(json.dumps(out))
+
+
+def test_pair_runs_revoke_right_after_creation_on_the_same_request(conn, env):
+    """R2: 정상 생성에 이어 같은 신청으로 회수 trial 을 돌리면 회수 기록이 생성 판정을 물려받는다."""
+    create = _create_ports(env, "810")
+    revoke = None
+
+    def revoke_submit(request_id):
+        # 회수 신청에는 Pod 이름이 필요하므로 생성 trial 이 끝난 뒤에 가상 계층에서 찾는다.
+        nonlocal revoke
+        revoke = _revoke_ports(env, request_id, next(iter(env.v1.pods)))
+        return revoke.submit()
+
+    created, revoked = trial_runner.run_pair(
+        conn, create_trial_id="trial-pair-c", revoke_trial_id="trial-pair-r", method="full",
+        server_group="A", horizon_sec=HORIZON_SEC, repetition=1,
+        revisions={"config-server": "virtual"}, username=USER,
+        create_submit=create.submit, create_declaration=create.declaration,
+        revoke_submit=revoke_submit,
+        revoke_declaration=lambda: revoke.declaration(),
+        advance=create.advance, collect=create.collect, clock=create.clock,
+        environment=lambda: (trial_runner.CLEAN, {}), save=create.save)
+
+    assert revoked["request_id"] == created["request_id"] == "810"
+    assert revoked["start_state"] == {"creation_trial_id": "trial-pair-c",
+                                      "creation_verdict_at_horizon": evaluator.PASS}
+    assert revoked["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
+    assert revoked["independent_verdict"]["at_horizon"]["verdict"] == evaluator.PASS
+    assert "REVOKE" in {e["action"] for e in trial.events_of(conn, "trial-pair-r")}

@@ -247,3 +247,75 @@ def test_environment_is_required(conn):
             horizon_sec=500, repetition=1, revisions={}, username="exp-user",
             submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
             collect=ports.collect, clock=ports.clock, save=ports.save)
+
+
+def _pair(conn, create_ports, revoke_ports, **kw):
+    kw.setdefault("revoke_submit", lambda request_id: request_id)
+    kw.setdefault("save", create_ports.save)
+    return trial_runner.run_pair(
+        conn, create_trial_id="trial-c", revoke_trial_id="trial-r", method="full",
+        server_group="A", horizon_sec=500, repetition=1, revisions={"config-server": "abc1234"},
+        username="exp-user", create_submit=create_ports.submit,
+        create_declaration=create_ports.declaration,
+        revoke_declaration=revoke_ports.declaration, advance=create_ports.advance,
+        collect=create_ports.collect, clock=create_ports.clock,
+        environment=lambda: (trial_runner.CLEAN, {}), **kw)
+
+
+def _manifest(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT trial_id, operation, request_id FROM trial_manifest ORDER BY rowid")
+        return cur.fetchall()
+
+
+def test_pair_opens_create_then_revoke_on_the_same_request(conn):
+    ports = Ports(declare_after=1)
+    _pair(conn, ports, ports)
+    assert _manifest(conn) == [("trial-c", "CREATE", "req-1"), ("trial-r", "REVOKE", "req-1")]
+
+
+@pytest.mark.parametrize("verdict", [evaluator.PASS, evaluator.FAIL])
+def test_revoke_start_state_carries_the_creation_horizon_verdict(conn, verdict):
+    # 생성 trial 의 두 평가(선언 시점, H 끝) 뒤에 회수 trial 의 평가가 이어진다.
+    ports = Ports(declare_after=1, rounds=[evaluator.PASS, verdict])
+    created, revoked = _pair(conn, ports, ports)
+    assert created["independent_verdict"]["at_horizon"]["verdict"] == verdict
+    assert revoked["start_state"] == {"creation_trial_id": "trial-c",
+                                      "creation_verdict_at_horizon": verdict}
+    assert created["start_state"] is None
+
+
+def test_revoke_runs_even_without_a_creation_declaration(conn):
+    create_ports = Ports(declare_after=None)
+    revoke_ports = Ports(declare_after=1)
+    created, revoked = _pair(conn, create_ports, revoke_ports)
+    assert created["system_declaration"]["value"] is None
+    assert revoked["operation"] == "REVOKE"
+    assert [r[0] for r in _manifest(conn)] == ["trial-c", "trial-r"]
+
+
+def test_revoke_submit_returning_another_request_is_rejected(conn):
+    ports = Ports(declare_after=1)
+    with pytest.raises(trial.TrialStateError, match="req-2"):
+        _pair(conn, ports, ports, revoke_submit=lambda request_id: "req-2")
+
+
+def test_a_failing_creation_save_stops_the_pair(conn):
+    def save(record):
+        raise OSError("disk full")
+
+    ports = Ports(declare_after=1)
+    with pytest.raises(OSError, match="disk full"):
+        _pair(conn, ports, ports, save=save)
+    assert [r[0] for r in _manifest(conn)] == ["trial-c"]
+
+
+def test_start_state_on_a_create_trial_is_rejected_before_opening(conn):
+    with pytest.raises(ValueError, match="start_state"):
+        _run(conn, Ports(declare_after=1), start_state={"creation_verdict_at_horizon": "PASS"})
+    assert _manifest(conn) == []
+
+
+def test_an_unpaired_revoke_trial_keeps_start_state_none(conn):
+    result = _run(conn, Ports(declare_after=1), operation="REVOKE")
+    assert result["start_state"] is None
