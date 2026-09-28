@@ -164,7 +164,7 @@ def test_revoke_trial_binds_manifest_and_journal_under_one_trial_id(conn, env):
 def test_saved_record_round_trips_through_trial_results(conn, env, tmp_path):
     """생산자(run_trial)와 소비자(trial_results)의 계약을 한곳에서 교차 확인한다."""
     out = _run(conn, _create_ports(env, "809"), trial_id="trial-saved", operation="CREATE",
-               save=functools.partial(trial_results.save, tmp_path))
+               save=functools.partial(trial_results.save, tmp_path, secrets=()))
 
     loaded = trial_results.load(tmp_path, "trial-saved")
     assert loaded.pop("schema_version") == trial_results.SCHEMA_VERSION
