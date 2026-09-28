@@ -106,7 +106,7 @@ def _run(conn, ports, *, trial_id, operation, save=None):
         horizon_sec=HORIZON_SEC, repetition=1, revisions={"config-server": "virtual"},
         username=USER, submit=ports.submit, advance=ports.advance,
         declaration=ports.declaration, collect=ports.collect, clock=ports.clock,
-        save=save or ports.save)
+        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}))
 
 
 def test_normal_creation_trial_verifies_at_the_declaration(conn, env):

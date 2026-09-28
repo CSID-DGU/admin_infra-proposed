@@ -76,6 +76,7 @@ def _run(conn, ports, **kw):
     kw.setdefault("revisions", {"config-server": "abc1234"})
     kw.setdefault("username", "exp-user")
     kw.setdefault("save", ports.save)
+    kw.setdefault("environment", lambda: (trial_runner.CLEAN, {}))
     return trial_runner.run_trial(
         conn, submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
         collect=ports.collect, clock=ports.clock, **kw)
@@ -196,4 +197,53 @@ def test_save_is_required(conn):
             conn, trial_id="trial-0001", method="full", server_group="A", operation="CREATE",
             horizon_sec=500, repetition=1, revisions={}, username="exp-user",
             submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
-            collect=ports.collect, clock=ports.clock)
+            collect=ports.collect, clock=ports.clock,
+            environment=lambda: (trial_runner.CLEAN, {}))
+
+
+def test_environment_is_judged_once_before_the_trial_is_opened(conn):
+    seen = []
+
+    def environment():
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM trial_manifest WHERE trial_id = %s", ("trial-0001",))
+            seen.append(cur.fetchone()[0])
+        return trial_runner.CLEAN, {}
+
+    _run(conn, Ports(declare_after=1), environment=environment)
+    assert seen == [0]
+
+
+@pytest.mark.parametrize("verdict", [trial_runner.CLEAN, trial_runner.DIRTY, evaluator.UNKNOWN])
+def test_every_environment_verdict_is_recorded_and_the_trial_still_runs(conn, verdict):
+    ports = Ports(declare_after=1)
+    result = _run(conn, ports, environment=lambda: (verdict, {"leftover_pods": []}))
+    assert result["environment"] == {"verdict": verdict, "evidence": {"leftover_pods": []}}
+    assert ports.saved == [result]
+
+
+def test_a_broken_environment_judge_is_unknown_and_the_trial_still_runs(conn):
+    def environment():
+        raise ConnectionError("kube api unreachable")
+
+    ports = Ports(declare_after=1)
+    result = _run(conn, ports, environment=environment)
+    assert result["environment"]["verdict"] == evaluator.UNKNOWN
+    assert result["environment"]["evidence"]["collector_error"] == "ConnectionError"
+    assert ports.saved == [result]
+
+
+def test_an_unexpected_environment_value_is_unknown(conn):
+    result = _run(conn, Ports(declare_after=1), environment=lambda: ("OK", {"x": 1}))
+    assert result["environment"]["verdict"] == evaluator.UNKNOWN
+    assert result["environment"]["evidence"] == {"unexpected_result": "'OK'", "detail": {"x": 1}}
+
+
+def test_environment_is_required(conn):
+    ports = Ports(declare_after=1)
+    with pytest.raises(TypeError, match="environment"):
+        trial_runner.run_trial(
+            conn, trial_id="trial-0001", method="full", server_group="A", operation="CREATE",
+            horizon_sec=500, repetition=1, revisions={}, username="exp-user",
+            submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
+            collect=ports.collect, clock=ports.clock, save=ports.save)

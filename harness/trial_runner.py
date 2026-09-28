@@ -24,11 +24,19 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 접근 가능성은 두 번 확인한다. 첫 완료 선언 시점과 관측 구간 H 의 끝이다. 한 번만 재면
 "선언 시점에는 됐는데 H 안에 무너진" 경우와 "선언 시점부터 틀린" 경우를 가를 수 없다.
 
-Fault Injector 와 Environment Resetter 는 아직 없다. 붙을 자리는 정해져 있다. 장애 등록은
-submit 을 부르기 앞이고, 환경 복원과 잔재 검사는 close_trial 을 부른 뒤다.
+Fault Injector 는 아직 없다. 장애 등록이 붙을 자리는 submit 을 부르기 앞이다.
+
+환경 판정은 포트 environment 로 받아서 기록의 environment 칸에 남긴다. open_trial 앞에서 한
+번 부르므로 환경 확인이 스택에 남기는 흔적이 trial 의 시간창에 들어가지 않는다. 판정이 DIRTY
+나 UNKNOWN 이어도 trial 은 그대로 진행한다. 그런 trial 은 버리지 않고 표시해서 따로 세며(R4),
+세는 일은 Metrics Analyzer 가 한다. environment 에도 기본값을 두지 않는다. 기본값이 있으면
+환경을 확인하지 않은 trial 이 CLEAN 처럼 보여서 R4 의 구분이 조용히 사라진다. 복원과 잔재
+검사를 하는 Environment Resetter 본체는 아직 없고, 붙을 자리는 close_trial 을 부른 뒤다.
 """
 import evaluator
 import trial
+
+CLEAN, DIRTY = "CLEAN", "DIRTY"
 
 _EVALUATORS = {
     "CREATE": evaluator.evaluate_creation,
@@ -36,9 +44,25 @@ _EVALUATORS = {
 }
 
 
+def _judge_environment(environment):
+    """환경 판정을 한 번 받는다. 판정기의 고장은 DIRTY 가 아니라 UNKNOWN 이다.
+
+    확인하지 못한 환경을 DIRTY 로 세면 없는 오염을 만들어 낸다 (evaluator._evaluate 와 같은 규칙).
+    """
+    try:
+        verdict, evidence = environment()
+    except Exception as e:
+        return {"verdict": evaluator.UNKNOWN,
+                "evidence": {"collector_error": type(e).__name__, "message": str(e)}}
+    if verdict not in (CLEAN, DIRTY, evaluator.UNKNOWN):
+        return {"verdict": evaluator.UNKNOWN,
+                "evidence": {"unexpected_result": repr(verdict), "detail": evidence}}
+    return {"verdict": verdict, "evidence": evidence}
+
+
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
-              submit, advance, declaration, collect, clock, save):
+              submit, advance, declaration, collect, clock, save, environment):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
@@ -49,6 +73,8 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
     except KeyError:
         raise ValueError(
             f"operation 은 {sorted(_EVALUATORS)} 중 하나여야 한다: {operation!r}") from None
+
+    environment_record = _judge_environment(environment)
 
     trial.open_trial(conn, trial_id=trial_id, method=method, server_group=server_group,
                      operation=operation, horizon_sec=horizon_sec, repetition=repetition,
@@ -102,6 +128,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         },
         "system_declaration": {"value": declared_value, "at": t_declared},
         "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon},
+        "environment": environment_record,
     }
     # 저장이 실패하면 삼키지 않고 올린다. 저장하지 못한 trial 을 성공처럼 끝내면 결측이 보이지 않는다.
     save(record)
