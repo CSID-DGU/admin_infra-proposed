@@ -38,6 +38,10 @@ class Ports:
         self.eval_times = []                # 평가가 시작된 시각
         self.in_round = 0
         self.current = evaluator.PASS
+        self.saved = []                     # save 가 받은 기록
+
+    def save(self, record):
+        self.saved.append(record)
 
     def clock(self):
         return self.now
@@ -71,6 +75,7 @@ def _run(conn, ports, **kw):
     kw.setdefault("repetition", 1)
     kw.setdefault("revisions", {"config-server": "abc1234"})
     kw.setdefault("username", "exp-user")
+    kw.setdefault("save", ports.save)
     return trial_runner.run_trial(
         conn, submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
         collect=ports.collect, clock=ports.clock, **kw)
@@ -157,3 +162,38 @@ def test_result_is_json_serialisable(conn):
 def test_an_unknown_operation_raises(conn):
     with pytest.raises(ValueError, match="operation"):
         _run(conn, Ports(), operation="MIGRATE")
+
+
+def test_save_is_called_once_with_the_returned_record(conn):
+    ports = Ports(declare_after=1)
+    result = _run(conn, ports)
+    assert len(ports.saved) == 1
+    assert ports.saved[0] is result
+
+
+def test_save_runs_after_the_manifest_row_is_closed(conn):
+    ended = []
+
+    def save(record):
+        ended.append(_row(conn, record["trial_id"])["ended_at"])
+
+    _run(conn, Ports(declare_after=1), save=save)
+    assert len(ended) == 1 and ended[0]
+
+
+def test_a_failing_save_is_not_swallowed(conn):
+    def save(record):
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        _run(conn, Ports(declare_after=1), save=save)
+
+
+def test_save_is_required(conn):
+    ports = Ports(declare_after=1)
+    with pytest.raises(TypeError, match="save"):
+        trial_runner.run_trial(
+            conn, trial_id="trial-0001", method="full", server_group="A", operation="CREATE",
+            horizon_sec=500, repetition=1, revisions={}, username="exp-user",
+            submit=ports.submit, advance=ports.advance, declaration=ports.declaration,
+            collect=ports.collect, clock=ports.clock)

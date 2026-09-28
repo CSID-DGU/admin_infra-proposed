@@ -10,6 +10,8 @@ operation_log 도 같은 정의로 다시 세워서, 저널 스키마가 시험�
 어긋남은 평가 결과를 손으로 바꿔 넣어서 만들지 않는다. 대상 시스템 몰래 Pod 를 없애서
 실제로 접근할 수 없는 상태를 만들고, 수집기가 그 상태를 읽게 둔다.
 """
+import functools
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluator  # noqa: E402
 import test_trial  # noqa: E402
 import trial  # noqa: E402
+import trial_results  # noqa: E402
 import trial_runner  # noqa: E402
 from test_evaluator_fixtures import USER, _provision  # noqa: E402
 from virtual_probe import virtual_collector  # noqa: E402
@@ -59,6 +62,10 @@ class VirtualPorts:
         self.now = 1000.0
         self.steps = 0
         self.collect = virtual_collector(e)
+        self.saved = []
+
+    def save(self, record):
+        self.saved.append(record)
 
     def clock(self):
         return self.now
@@ -93,12 +100,13 @@ def _revoke_ports(e, request_id, pod_name):
                               "pod_name": pod_name, "delete_account": True})
 
 
-def _run(conn, ports, *, trial_id, operation):
+def _run(conn, ports, *, trial_id, operation, save=None):
     return trial_runner.run_trial(
         conn, trial_id=trial_id, method="full", server_group="A", operation=operation,
         horizon_sec=HORIZON_SEC, repetition=1, revisions={"config-server": "virtual"},
         username=USER, submit=ports.submit, advance=ports.advance,
-        declaration=ports.declaration, collect=ports.collect, clock=ports.clock)
+        declaration=ports.declaration, collect=ports.collect, clock=ports.clock,
+        save=save or ports.save)
 
 
 def test_normal_creation_trial_verifies_at_the_declaration(conn, env):
@@ -151,3 +159,13 @@ def test_revoke_trial_binds_manifest_and_journal_under_one_trial_id(conn, env):
     events = trial.events_of(conn, "trial-revoke")
     assert events
     assert "REVOKE" in {e["action"] for e in events}
+
+
+def test_saved_record_round_trips_through_trial_results(conn, env, tmp_path):
+    """생산자(run_trial)와 소비자(trial_results)의 계약을 한곳에서 교차 확인한다."""
+    out = _run(conn, _create_ports(env, "809"), trial_id="trial-saved", operation="CREATE",
+               save=functools.partial(trial_results.save, tmp_path))
+
+    loaded = trial_results.load(tmp_path, "trial-saved")
+    assert loaded.pop("schema_version") == trial_results.SCHEMA_VERSION
+    assert loaded == json.loads(json.dumps(out))

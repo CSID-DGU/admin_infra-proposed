@@ -10,8 +10,8 @@
 -- 하네스다. 계측 지점이 비교군마다 달라지면 지표가 오염되므로 대상 시스템 바깥에서 쓴다.
 --
 -- 작업 식별자를 새로 만들지 않는다. operation_log의 job_id와 attempt가 그 역할을 이미 한다.
--- 다만 baseline은 동기 경로여서 job_id가 NULL이므로, baseline의 작업 경계는 job_id가 아니라
--- trial의 시간창(started_at ~ ended_at)으로만 정해진다. 이것이 baseline 쪽 분해능의 한계다.
+-- trial의 경계는 시간창(started_at ~ ended_at)으로 정한다. 같은 신청에 생성 trial과 회수
+-- trial을 따로 돌릴 때 두 trial의 행을 가르기 위해서다.
 --
 -- 조인 규칙: 어떤 operation_log 행이 어느 trial에 속하는지는 request_id가 같고
 -- created_at이 started_at 이상이며 ended_at 이하일 때로 정한다. ended_at이 NULL이면
