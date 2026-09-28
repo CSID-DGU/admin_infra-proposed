@@ -41,6 +41,10 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   value: "{{ .Values.nodeport.max }}"
 - name: VERIFY_MODE
   value: "{{ .Values.verifyMode }}"
+{{- if .Values.faultInjection }}
+- name: FAULT_INJECTION
+  value: "1"
+{{- end }}
 - name: DB_HOST
   value: "{{ .Values.db.host }}"
 - name: DB_NAME
