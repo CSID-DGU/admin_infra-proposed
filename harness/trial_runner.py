@@ -24,7 +24,10 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 접근 가능성은 두 번 확인한다. 첫 완료 선언 시점과 관측 구간 H 의 끝이다. 한 번만 재면
 "선언 시점에는 됐는데 H 안에 무너진" 경우와 "선언 시점부터 틀린" 경우를 가를 수 없다.
 
-Fault Injector 는 아직 없다. 장애 등록이 붙을 자리는 submit 을 부르기 앞이다.
+장애는 포트 fault 로 받는다(harness/fault_injector.py). submit 바로 앞에서 장전하고, close_trial
+바로 뒤에 발동 여부를 읽어 기록의 fault 칸에 남긴다. fault 칸은 장애를 걸었다는 사실이라 평가에
+쓰지 않는다(ADR-004). 도중에 예외가 나도 장전이 스택에 남아 다음 trial 에 걸리지 않게 finally 에서
+푼다.
 
 환경 판정은 포트 environment 로 받아서 기록의 environment 칸에 남긴다. open_trial 앞에서 한
 번 부르므로 환경 확인이 스택에 남기는 흔적이 trial 의 시간창에 들어가지 않는다. 판정이 DIRTY
@@ -63,7 +66,7 @@ def _judge_environment(environment):
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
               submit, advance, declaration, collect, clock, save, environment,
-              start_state=None):
+              start_state=None, fault=None):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
@@ -86,35 +89,41 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
                      operation=operation, horizon_sec=horizon_sec, repetition=repetition,
                      revisions=revisions, scenario_id=scenario_id)
 
-    # 장애 등록 자리. Fault Injector 가 생기면 여기서 시나리오를 켠다.
-    t_submitted = clock()
-    request_id = submit()
-    trial.bind_request(conn, trial_id, request_id)
+    if fault is not None:
+        fault.arm()
+    try:
+        t_submitted = clock()
+        request_id = submit()
+        trial.bind_request(conn, trial_id, request_id)
 
-    declared_value = None
-    t_declared = None
-    at_declaration = None
-    while clock() - t_submitted < horizon_sec:
-        advance()
-        if declared_value is None:
-            value = declaration()
-            if value is not None:
-                declared_value = value
-                t_declared = clock()
-                at_declaration = evaluate(collect, username=username)
+        declared_value = None
+        t_declared = None
+        at_declaration = None
+        while clock() - t_submitted < horizon_sec:
+            advance()
+            if declared_value is None:
+                value = declaration()
+                if value is not None:
+                    declared_value = value
+                    t_declared = clock()
+                    at_declaration = evaluate(collect, username=username)
 
-    t_horizon_end = clock()
-    at_horizon = evaluate(collect, username=username)
+        t_horizon_end = clock()
+        at_horizon = evaluate(collect, username=username)
 
-    # 선언이 성립한 상태에서 판정이 PASS 인 첫 확인 지점이다. 두 시각의 최대값이 아니다.
-    # 나중의 복구가 앞서 있었던 잘못된 선언을 지우지 않으므로 at_declaration 은 그대로 둔다.
-    t_verified = None
-    if at_declaration is not None and at_declaration["verdict"] == evaluator.PASS:
-        t_verified = t_declared
-    elif declared_value is not None and at_horizon["verdict"] == evaluator.PASS:
-        t_verified = t_horizon_end
+        # 선언이 성립한 상태에서 판정이 PASS 인 첫 확인 지점이다. 두 시각의 최대값이 아니다.
+        # 나중의 복구가 앞서 있었던 잘못된 선언을 지우지 않으므로 at_declaration 은 그대로 둔다.
+        t_verified = None
+        if at_declaration is not None and at_declaration["verdict"] == evaluator.PASS:
+            t_verified = t_declared
+        elif declared_value is not None and at_horizon["verdict"] == evaluator.PASS:
+            t_verified = t_horizon_end
 
-    trial.close_trial(conn, trial_id)
+        trial.close_trial(conn, trial_id)
+        fault_record = fault.report() if fault is not None else None
+    finally:
+        if fault is not None:
+            fault.disarm()
     # 환경 복원과 잔재 검사 자리. Environment Resetter 가 생기면 여기서 되돌린다.
 
     record = {
@@ -136,6 +145,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon},
         "environment": environment_record,
         "start_state": start_state,
+        "fault": fault_record,
     }
     # 저장이 실패하면 삼키지 않고 올린다. 저장하지 못한 trial 을 성공처럼 끝내면 결측이 보이지 않는다.
     save(record)
@@ -145,6 +155,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
 def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
              horizon_sec, repetition, revisions, username,
              create_scenario_id=None, revoke_scenario_id=None,
+             create_fault=None, revoke_fault=None,
              create_submit, create_declaration, revoke_submit, revoke_declaration,
              advance, collect, clock, environment, save):
     """생성 trial 에 이어서 같은 신청으로 회수 trial 을 돌리고 (생성 기록, 회수 기록) 을 돌려준다.
@@ -165,7 +176,7 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
                   environment=environment)
 
     created = run_trial(conn, trial_id=create_trial_id, operation="CREATE",
-                        scenario_id=create_scenario_id, submit=create_submit,
+                        scenario_id=create_scenario_id, fault=create_fault, submit=create_submit,
                         declaration=create_declaration, **common)
     request_id = created["request_id"]
 
@@ -178,7 +189,7 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
         return returned
 
     revoked = run_trial(conn, trial_id=revoke_trial_id, operation="REVOKE",
-                        scenario_id=revoke_scenario_id, submit=submit,
+                        scenario_id=revoke_scenario_id, fault=revoke_fault, submit=submit,
                         declaration=revoke_declaration,
                         start_state={
                             "creation_trial_id": create_trial_id,

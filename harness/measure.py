@@ -1,6 +1,6 @@
 """사람이 실스택에서 측정을 돌리고, 한 신청의 진행을 보고, 남은 잠금을 푸는 명령.
 
-    python3 harness/measure.py pair    --stack full --reps 3 --horizon 600 --poll 10 [--out DIR]
+    python3 harness/measure.py pair    --stack full --reps 3 --horizon 600 --poll 10 [--scenario C06] [--out DIR]
     python3 harness/measure.py logs    --stack full --request 812 [--since 30m]
     python3 harness/measure.py release --stack full --run <run_id> | --force
 
@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fault_injector  # noqa: E402
 import measure_ports  # noqa: E402
 import stack_lock  # noqa: E402
 import system  # noqa: E402
@@ -139,10 +140,19 @@ def cmd_pair(args, cfg):
                          f"declaration={record['system_declaration']['value']}",
                          f"verdict={record['independent_verdict']['at_horizon']['verdict']}")
 
+                faults = {}
+                if args.scenario:
+                    # 장애는 시나리오의 operation 에 맞는 trial 에만 건다. 짝의 다른 trial 은 장애 없이 돈다.
+                    kind = "create" if fault_injector.SCENARIOS[args.scenario][0] == "CREATE" else "revoke"
+                    faults = {f"{kind}_scenario_id": args.scenario,
+                              f"{kind}_fault": fault_injector.Fault(journal, scenario=args.scenario,
+                                                                     username=username)}
+
                 trial_runner.run_pair(
                     journal, create_trial_id=f"{base}-c", revoke_trial_id=f"{base}-r",
                     method=args.stack, server_group=SERVER_GROUP, horizon_sec=args.horizon,
-                    repetition=rep, revisions=revs, username=username, save=save_and_say, **ports)
+                    repetition=rep, revisions=revs, username=username, save=save_and_say,
+                    **faults, **ports)
     except stack_lock.LockError as e:
         print(f"잠금 문제로 멈췄다: {e}", file=sys.stderr)
         print(f"남은 잠금이면: python3 harness/measure.py release --stack {args.stack} --force", file=sys.stderr)
@@ -244,6 +254,8 @@ def parser():
     pair.add_argument("--reps", type=_positive, default=1)
     pair.add_argument("--horizon", type=_positive, default=600, help="관측 구간 H (초)")
     pair.add_argument("--poll", type=_positive, default=10, help="선언 확인 간격 (초)")
+    pair.add_argument("--scenario", choices=sorted(fault_injector.SCENARIOS),
+                      help="장애 시나리오. 스택이 FAULT_INJECTION=1 로 떠 있어야 발동한다")
     pair.add_argument("--out", help="결과 디렉터리. 레포 밖이어야 한다")
     pair.set_defaults(func=cmd_pair)
 
