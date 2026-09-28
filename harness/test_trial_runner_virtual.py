@@ -106,7 +106,7 @@ def _run(conn, ports, *, trial_id, operation, save=None):
         horizon_sec=HORIZON_SEC, repetition=1, revisions={"config-server": "virtual"},
         username=USER, submit=ports.submit, advance=ports.advance,
         declaration=ports.declaration, collect=ports.collect, clock=ports.clock,
-        save=save or ports.save)
+        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}))
 
 
 def test_normal_creation_trial_verifies_at_the_declaration(conn, env):
@@ -164,8 +164,37 @@ def test_revoke_trial_binds_manifest_and_journal_under_one_trial_id(conn, env):
 def test_saved_record_round_trips_through_trial_results(conn, env, tmp_path):
     """생산자(run_trial)와 소비자(trial_results)의 계약을 한곳에서 교차 확인한다."""
     out = _run(conn, _create_ports(env, "809"), trial_id="trial-saved", operation="CREATE",
-               save=functools.partial(trial_results.save, tmp_path))
+               save=functools.partial(trial_results.save, tmp_path, secrets=()))
 
     loaded = trial_results.load(tmp_path, "trial-saved")
     assert loaded.pop("schema_version") == trial_results.SCHEMA_VERSION
     assert loaded == json.loads(json.dumps(out))
+
+
+def test_pair_runs_revoke_right_after_creation_on_the_same_request(conn, env):
+    """R2: 정상 생성에 이어 같은 신청으로 회수 trial 을 돌리면 회수 기록이 생성 판정을 물려받는다."""
+    create = _create_ports(env, "810")
+    revoke = None
+
+    def revoke_submit(request_id):
+        # 회수 신청에는 Pod 이름이 필요하므로 생성 trial 이 끝난 뒤에 가상 계층에서 찾는다.
+        nonlocal revoke
+        revoke = _revoke_ports(env, request_id, next(iter(env.v1.pods)))
+        return revoke.submit()
+
+    created, revoked = trial_runner.run_pair(
+        conn, create_trial_id="trial-pair-c", revoke_trial_id="trial-pair-r", method="full",
+        server_group="A", horizon_sec=HORIZON_SEC, repetition=1,
+        revisions={"config-server": "virtual"}, username=USER,
+        create_submit=create.submit, create_declaration=create.declaration,
+        revoke_submit=revoke_submit,
+        revoke_declaration=lambda: revoke.declaration(),
+        advance=create.advance, collect=create.collect, clock=create.clock,
+        environment=lambda: (trial_runner.CLEAN, {}), save=create.save)
+
+    assert revoked["request_id"] == created["request_id"] == "810"
+    assert revoked["start_state"] == {"creation_trial_id": "trial-pair-c",
+                                      "creation_verdict_at_horizon": evaluator.PASS}
+    assert revoked["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
+    assert revoked["independent_verdict"]["at_horizon"]["verdict"] == evaluator.PASS
+    assert "REVOKE" in {e["action"] for e in trial.events_of(conn, "trial-pair-r")}

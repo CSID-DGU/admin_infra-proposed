@@ -24,11 +24,19 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 접근 가능성은 두 번 확인한다. 첫 완료 선언 시점과 관측 구간 H 의 끝이다. 한 번만 재면
 "선언 시점에는 됐는데 H 안에 무너진" 경우와 "선언 시점부터 틀린" 경우를 가를 수 없다.
 
-Fault Injector 와 Environment Resetter 는 아직 없다. 붙을 자리는 정해져 있다. 장애 등록은
-submit 을 부르기 앞이고, 환경 복원과 잔재 검사는 close_trial 을 부른 뒤다.
+Fault Injector 는 아직 없다. 장애 등록이 붙을 자리는 submit 을 부르기 앞이다.
+
+환경 판정은 포트 environment 로 받아서 기록의 environment 칸에 남긴다. open_trial 앞에서 한
+번 부르므로 환경 확인이 스택에 남기는 흔적이 trial 의 시간창에 들어가지 않는다. 판정이 DIRTY
+나 UNKNOWN 이어도 trial 은 그대로 진행한다. 그런 trial 은 버리지 않고 표시해서 따로 세며(R4),
+세는 일은 Metrics Analyzer 가 한다. environment 에도 기본값을 두지 않는다. 기본값이 있으면
+환경을 확인하지 않은 trial 이 CLEAN 처럼 보여서 R4 의 구분이 조용히 사라진다. 복원과 잔재
+검사를 하는 Environment Resetter 본체는 아직 없고, 붙을 자리는 close_trial 을 부른 뒤다.
 """
 import evaluator
 import trial
+
+CLEAN, DIRTY = "CLEAN", "DIRTY"
 
 _EVALUATORS = {
     "CREATE": evaluator.evaluate_creation,
@@ -36,19 +44,43 @@ _EVALUATORS = {
 }
 
 
+def _judge_environment(environment):
+    """환경 판정을 한 번 받는다. 판정기의 고장은 DIRTY 가 아니라 UNKNOWN 이다.
+
+    확인하지 못한 환경을 DIRTY 로 세면 없는 오염을 만들어 낸다 (evaluator._evaluate 와 같은 규칙).
+    """
+    try:
+        verdict, evidence = environment()
+    except Exception as e:
+        return {"verdict": evaluator.UNKNOWN,
+                "evidence": {"collector_error": type(e).__name__, "message": str(e)}}
+    if verdict not in (CLEAN, DIRTY, evaluator.UNKNOWN):
+        return {"verdict": evaluator.UNKNOWN,
+                "evidence": {"unexpected_result": repr(verdict), "detail": evidence}}
+    return {"verdict": verdict, "evidence": evidence}
+
+
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
-              submit, advance, declaration, collect, clock, save):
+              submit, advance, declaration, collect, clock, save, environment,
+              start_state=None):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
     작업의 시도이고, 재전송을 별도 trial 로 세면 모든 비율의 분모가 부풀어 오른다.
+
+    start_state 는 회수 trial 에만 있다. run_pair 가 앞선 생성 trial 의 판정을 넘기고, 짝 없이
+    돈 회수 trial 은 None 으로 남아서 그 사실이 기록에 드러난다.
     """
     try:
         evaluate = _EVALUATORS[operation]
     except KeyError:
         raise ValueError(
             f"operation 은 {sorted(_EVALUATORS)} 중 하나여야 한다: {operation!r}") from None
+    if operation == "CREATE" and start_state is not None:
+        raise ValueError(f"start_state 는 회수 trial 에만 있다. CREATE 에 넘어왔다: {start_state!r}")
+
+    environment_record = _judge_environment(environment)
 
     trial.open_trial(conn, trial_id=trial_id, method=method, server_group=server_group,
                      operation=operation, horizon_sec=horizon_sec, repetition=repetition,
@@ -102,7 +134,55 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         },
         "system_declaration": {"value": declared_value, "at": t_declared},
         "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon},
+        "environment": environment_record,
+        "start_state": start_state,
     }
     # 저장이 실패하면 삼키지 않고 올린다. 저장하지 못한 trial 을 성공처럼 끝내면 결측이 보이지 않는다.
     save(record)
     return record
+
+
+def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
+             horizon_sec, repetition, revisions, username,
+             create_scenario_id=None, revoke_scenario_id=None,
+             create_submit, create_declaration, revoke_submit, revoke_declaration,
+             advance, collect, clock, environment, save):
+    """생성 trial 에 이어서 같은 신청으로 회수 trial 을 돌리고 (생성 기록, 회수 기록) 을 돌려준다.
+
+    근거는 docs/domains/experiment-records.md 의 "회수 trial 은 생성 trial 에 바로 이어 붙입니다 (R2)".
+    생성 trial 이 선언 없이 끝났거나 판정이 FAIL 이어도 회수 trial 은 돈다. 회수는 측정이면서
+    자원을 거두는 일이고, PASS 가 아닌 시작을 어떻게 셀지는 Metrics Analyzer 가 정한다. 생성
+    trial 이 예외로 끝나면 그 예외를 그대로 올리고 회수 trial 은 시작하지 않는다.
+
+    순서는 run_trial 두 번의 호출 순서로만 보장한다. 생성 trial 은 close_trial 과 save 까지 마친
+    뒤에 돌아오므로 회수 trial 은 그 뒤에 열린다. 다만 두 시간창이 같은 밀리초에 맞닿는 경우는
+    따로 막지 않는다. 회수 trial 앞의 환경 확인이 걸리는 시간으로 벌어진다고 보며, 가상 계층의
+    sqlite 는 시각이 1초 단위라서 이 겹침을 시험으로 확인할 수도 없다.
+    """
+    common = dict(method=method, server_group=server_group, horizon_sec=horizon_sec,
+                  repetition=repetition, revisions=revisions, username=username,
+                  advance=advance, collect=collect, clock=clock, save=save,
+                  environment=environment)
+
+    created = run_trial(conn, trial_id=create_trial_id, operation="CREATE",
+                        scenario_id=create_scenario_id, submit=create_submit,
+                        declaration=create_declaration, **common)
+    request_id = created["request_id"]
+
+    def submit():
+        # 두 trial 이 다른 신청을 가리키면 R2 의 짝이 성립하지 않는다.
+        returned = revoke_submit(request_id)
+        if returned != request_id:
+            raise trial.TrialStateError(
+                f"회수 제출이 신청 {returned} 를 돌려줬다. 생성 trial {create_trial_id} 의 신청은 {request_id} 다.")
+        return returned
+
+    revoked = run_trial(conn, trial_id=revoke_trial_id, operation="REVOKE",
+                        scenario_id=revoke_scenario_id, submit=submit,
+                        declaration=revoke_declaration,
+                        start_state={
+                            "creation_trial_id": create_trial_id,
+                            "creation_verdict_at_horizon":
+                                created["independent_verdict"]["at_horizon"]["verdict"],
+                        }, **common)
+    return created, revoked
