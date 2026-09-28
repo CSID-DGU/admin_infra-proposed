@@ -78,6 +78,7 @@ def stack(monkeypatch):
     fake = FakeStack()
     monkeypatch.setattr(system, "stack_sql", fake.sql)
     monkeypatch.setattr(system, "stack_http", fake.http_call)
+    monkeypatch.setattr(system, "stack_kube", lambda *a, **k: {"rc": 1, "stdout": "", "stderr": "fake"})
     return fake
 
 
@@ -149,7 +150,7 @@ def _ports(stack, clock_box):
 
     be = mp.BeClient(HOST, NS, "s3cret", clock=lambda: 1000)
     return mp.real_ports(be=be, web_sql=mp.StackSql(HOST, NS, "web_admin"), user_id=7, admin_id=1,
-                         expires_at="2026-10-02T00:00:00", sleep=sleep, clock=lambda: clock_box[0],
+                         prefix="exp-fu-", username="exp-fu-m01", expires_at="2026-10-02T00:00:00", sleep=sleep, clock=lambda: clock_box[0],
                          poll_sec=10)
 
 

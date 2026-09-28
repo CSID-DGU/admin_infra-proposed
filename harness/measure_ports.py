@@ -1,7 +1,7 @@
 """trial_runner.run_pair 에 꽂는 실스택 포트 묶음.
 
 신청과 승인과 선언 조회와 회수는 실제 스택에 한다. 모든 SQL 과 HTTP 는 system.py 의 server-state
-stack 명령을 거친다. 환경 판정과 수집기는 아직 없으므로 UNKNOWN 을 돌려주는 자리만 둔다. 수집기를
+stack 명령을 거친다. 환경 판정은 resetter 가 한다. 수집기는 아직 없으므로 UNKNOWN 을 돌려주는 자리만 둔다. 수집기를
 admin_be 나 config-server 의 기록으로 채우면 측정 장치가 대상 시스템의 자기 선언을 정답으로 쓰게
 된다 (ADR-004).
 
@@ -14,6 +14,7 @@ import json
 
 from pymysql.converters import escape_item
 
+import resetter
 import system
 from sha512_crypt import sha512_crypt
 
@@ -150,7 +151,7 @@ def _ok(status, body):
     return body
 
 
-def real_ports(*, be, web_sql, user_id, admin_id, expires_at, sleep, clock, poll_sec):
+def real_ports(*, be, web_sql, user_id, admin_id, prefix, username, expires_at, sleep, clock, poll_sec):
     """run_pair 의 포트를 dict 로 돌려준다. 신청 번호는 create_submit 이 정한다.
 
     expires_at 은 admin_be 가 받는 'YYYY-MM-DDTHH:MM:SS' 문자열이다. 시계를 여기서 읽지 않으려고
@@ -185,6 +186,6 @@ def real_ports(*, be, web_sql, user_id, admin_id, expires_at, sleep, clock, poll
         "revoke_declaration": lambda: status_if("DELETED"),
         "advance": lambda: sleep(poll_sec),
         "clock": clock,
-        "environment": lambda: ("UNKNOWN", {"reason": "Environment Resetter 미구현"}),
+        "environment": resetter.environment_for(be.host, be.namespace, prefix, username=username),
         "collect": lambda name, username: ("UNKNOWN", {"reason": "실스택 수집기 미구현"}),
     }
