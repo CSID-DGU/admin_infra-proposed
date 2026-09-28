@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fault_injector  # noqa: E402
+import inventory  # noqa: E402
 import measure_ports  # noqa: E402
 import stack_lock  # noqa: E402
 import system  # noqa: E402
@@ -122,7 +123,8 @@ def cmd_pair(args, cfg):
                 _say(base, f"user={username} 를 만들었다")
                 expires = (_now_kst() + dt.timedelta(days=EXPIRES_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
                 ports = measure_ports.real_ports(
-                    be=be, web_sql=web, user_id=user_id, admin_id=admin_id, expires_at=expires,
+                    be=be, web_sql=web, user_id=user_id, admin_id=admin_id, prefix=prefix, username=username,
+                    expires_at=expires,
                     sleep=time.sleep, clock=time.monotonic, poll_sec=args.poll)
                 submit = ports["create_submit"]
 
@@ -153,6 +155,12 @@ def cmd_pair(args, cfg):
                     method=args.stack, server_group=SERVER_GROUP, horizon_sec=args.horizon,
                     repetition=rep, revisions=revs, username=username, save=save_and_say,
                     **faults, **ports)
+                # 기록은 이미 저장했다. 여기서는 남은 것을 보여 주기만 한다.
+                inv = inventory.collect_inventory(host, ns, prefix)
+                left = inv["by_user"].get(username, {})
+                _say(base, f"user={username} 짝 실행 뒤 남은 자원:",
+                     json.dumps(left, ensure_ascii=False) if left else "없음",
+                     f"조회 실패={sorted(inv['errors'])}" if inv["errors"] else "")
     except stack_lock.LockError as e:
         print(f"잠금 문제로 멈췄다: {e}", file=sys.stderr)
         print(f"남은 잠금이면: python3 harness/measure.py release --stack {args.stack} --force", file=sys.stderr)
