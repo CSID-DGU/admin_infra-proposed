@@ -73,6 +73,9 @@ nodeport:
 # 두 실험 스택의 차이는 이 값 하나여야 한다.
 verifyMode: noprobe
 
+# 장애 주입 훅(adapters/fault_injection.py). 실험 스택 셋에서만 stack-up.sh 가 켠다. 운영은 항상 끈다.
+faultInjection: false
+
 # 사용자 이미지 커밋·재시작에 쓰는 저장소 PVC. 비우면 임시 디스크(emptyDir)를 쓴다.
 # 실험 스택은 이 기능이 필요 없어 비워 둔다.
 imageStore:

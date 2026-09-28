@@ -319,3 +319,68 @@ def test_start_state_on_a_create_trial_is_rejected_before_opening(conn):
 def test_an_unpaired_revoke_trial_keeps_start_state_none(conn):
     result = _run(conn, Ports(declare_after=1), operation="REVOKE")
     assert result["start_state"] is None
+
+
+class FakeFault:
+    """장전 포트 흉내. 호출 순서를 trial 모듈 호출과 함께 한 목록에 적는다."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def arm(self):
+        self.log.append("arm")
+
+    def report(self):
+        self.log.append("report")
+        return {"scenario": "C06", "step_name": "s", "armed_at": "t0", "fired_at": "t1"}
+
+    def disarm(self):
+        self.log.append("disarm")
+
+
+def _logged(monkeypatch, log, ports):
+    for name in ("bind_request", "close_trial"):
+        original = getattr(trial, name)
+        monkeypatch.setattr(trial, name, lambda *a, _n=name, _o=original, **kw: (log.append(_n), _o(*a, **kw))[1])
+    submit = ports.submit
+    ports.submit = lambda: (log.append("submit"), submit())[1]
+
+
+def test_fault_is_armed_before_submit_and_reported_after_close(conn, monkeypatch):
+    log = []
+    ports = Ports(declare_after=1)
+    _logged(monkeypatch, log, ports)
+    result = _run(conn, ports, fault=FakeFault(log))
+    assert log == ["arm", "submit", "bind_request", "close_trial", "report", "disarm"]
+    assert result["fault"]["fired_at"] == "t1"
+
+
+def test_without_a_fault_the_record_has_none(conn):
+    assert _run(conn, Ports(declare_after=1))["fault"] is None
+
+
+def test_fault_is_disarmed_when_submit_raises(conn):
+    log = []
+    ports = Ports(declare_after=1)
+
+    def submit():
+        raise RuntimeError("be down")
+    ports.submit = submit
+    with pytest.raises(RuntimeError, match="be down"):
+        _run(conn, ports, fault=FakeFault(log))
+    assert log == ["arm", "disarm"]
+
+
+def test_pair_passes_each_fault_only_to_its_trial(conn):
+    create_log, revoke_log = [], []
+    ports = Ports(declare_after=1)
+    created, revoked = _pair(conn, ports, ports, create_fault=FakeFault(create_log),
+                             revoke_fault=FakeFault(revoke_log))
+    assert create_log == revoke_log == ["arm", "report", "disarm"]
+    assert created["fault"] is not None and revoked["fault"] is not None
+
+
+def test_pair_without_faults_records_none(conn):
+    ports = Ports(declare_after=1)
+    created, revoked = _pair(conn, ports, ports, revoke_fault=FakeFault([]))
+    assert created["fault"] is None and revoked["fault"] is not None

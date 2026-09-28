@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluator  # noqa: E402
+import fault_injector  # noqa: E402
 import test_trial  # noqa: E402
 import trial  # noqa: E402
 import trial_results  # noqa: E402
@@ -100,13 +101,13 @@ def _revoke_ports(e, request_id, pod_name):
                               "pod_name": pod_name, "delete_account": True})
 
 
-def _run(conn, ports, *, trial_id, operation, save=None):
+def _run(conn, ports, *, trial_id, operation, save=None, fault=None):
     return trial_runner.run_trial(
         conn, trial_id=trial_id, method="full", server_group="A", operation=operation,
         horizon_sec=HORIZON_SEC, repetition=1, revisions={"config-server": "virtual"},
         username=USER, submit=ports.submit, advance=ports.advance,
         declaration=ports.declaration, collect=ports.collect, clock=ports.clock,
-        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}))
+        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}), fault=fault)
 
 
 def test_normal_creation_trial_verifies_at_the_declaration(conn, env):
@@ -198,3 +199,62 @@ def test_pair_runs_revoke_right_after_creation_on_the_same_request(conn, env):
     assert revoked["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
     assert revoked["independent_verdict"]["at_horizon"]["verdict"] == evaluator.PASS
     assert "REVOKE" in {e["action"] for e in trial.events_of(conn, "trial-pair-r")}
+
+
+@pytest.fixture
+def armed(conn, env, monkeypatch):
+    """장전 표를 DDL 정의로 같은 연결 위에 세우고, 대상 시스템의 주입 훅이 그 연결을 읽게 한다."""
+    env.db.execute(test_trial._sqlite_ddl("operation_log.sql", "fault_arming"))
+    env.db.commit()
+    from adapters import fault_injection
+    from test_fault_injection import Sql as ArmingSql  # 훅이 쓰는 rowcount 와 close 까지 흉내 낸다
+    monkeypatch.setattr(fault_injection, "get_log_db_connection", lambda **kw: ArmingSql(env.db))
+    monkeypatch.setenv("FAULT_INJECTION", "1")
+    return conn
+
+
+def test_c06_creation_trial_records_the_fired_fault(armed, env, monkeypatch):
+    """C06: 효과는 적용되고 응답만 사라져도 관찰기가 확인해서 선언은 SUCCESS 이고, 발동 시각이 기록에 남는다."""
+    main = sys.modules["main"]
+
+    def create(name, uid, gid):
+        # principal 생성 대역이 keytab Secret 도 남겨야 관찰기가 효과를 확인할 수 있다.
+        env.calls.append(("krb5_principal", (name,)))
+        env.v1.secrets[f"krb5-keytab-{name}"] = {"data": {}, "owners": []}
+    monkeypatch.setattr(main, "_create_krb5_principal_and_secret", create)
+
+    fault = fault_injector.Fault(armed, scenario="C06", username=USER)
+    out = _run(armed, _create_ports(env, "820"), trial_id="trial-c06", operation="CREATE", fault=fault)
+
+    assert out["fault"]["scenario"] == "C06"
+    assert out["fault"]["fired_at"] is not None
+    assert out["system_declaration"]["value"] == "SUCCESS"
+    assert env.db.execute("SELECT COUNT(*) FROM fault_arming").fetchone()[0] == 0
+
+
+def test_c12_pair_records_the_fault_on_the_revoke_trial(armed, env):
+    """C12: 짝 실행에서 장애는 회수 trial 에만 걸리고, 회수 기록에 발동 시각이 남는다."""
+    create = _create_ports(env, "821")
+    revoke = None
+
+    def revoke_submit(request_id):
+        nonlocal revoke
+        revoke = _revoke_ports(env, request_id, next(iter(env.v1.pods)))
+        return revoke.submit()
+
+    created, revoked = trial_runner.run_pair(
+        armed, create_trial_id="trial-c12-c", revoke_trial_id="trial-c12-r", method="full",
+        server_group="A", horizon_sec=HORIZON_SEC, repetition=1,
+        revisions={"config-server": "virtual"}, username=USER,
+        revoke_scenario_id="C12",
+        revoke_fault=fault_injector.Fault(armed, scenario="C12", username=USER),
+        create_submit=create.submit, create_declaration=create.declaration,
+        revoke_submit=revoke_submit, revoke_declaration=lambda: revoke.declaration(),
+        advance=create.advance, collect=create.collect, clock=create.clock,
+        environment=lambda: (trial_runner.CLEAN, {}), save=create.save)
+
+    assert created["fault"] is None
+    assert created["system_declaration"]["value"] == "SUCCESS"
+    assert revoked["scenario_id"] == "C12"
+    assert revoked["fault"]["fired_at"] is not None
+    assert env.db.execute("SELECT COUNT(*) FROM fault_arming").fetchone()[0] == 0
