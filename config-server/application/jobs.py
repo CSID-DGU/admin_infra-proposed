@@ -8,10 +8,11 @@ import os
 import time
 
 from kubernetes import client
+from requests.exceptions import ReadTimeout
 
-from adapters import job_control
+from adapters import fault_injection, job_control
 from adapters.job_control import LeaseLost
-from adapters.operation_log import Action, Phase, current_job_id, current_attempt
+from adapters.operation_log import Action, Phase, current_job_id, current_attempt, current_step
 from lifecycle_steps import verify
 
 class _MainProxy:
@@ -214,9 +215,15 @@ def _execute_step(step, ctx, kind, request_id, username):
                 hook(ctx)
             except Exception:
                 _main.app.logger.warning(f"[JOB] {name} 사전 정리 실패 — 단계는 계속", exc_info=True)
-        token = current_attempt.set(attempt)
+        token, step_token = current_attempt.set(attempt), current_step.set(name)
         try:
+            if (c12 := fault_injection.armed(username, name, "C12")) is not None:  # C12: 효과 없이 계속 실패
+                if c12["fired_at"] is None:
+                    fault_injection.mark_fired(c12["id"])
+                raise RuntimeError("fault C12")
             step(ctx)
+            if (c06 := fault_injection.armed(username, name, "C06")) and fault_injection.mark_fired(c06["id"]):
+                raise RuntimeError("fault C06") from ReadTimeout("fault C06")  # C06: 효과는 적용, 응답만 유실
             return
         except LeaseLost:
             raise  # 단계 안의 체크포인트가 소유권을 잃었다 — 재시도하지 않고 새 소유자에게 넘긴다
@@ -224,6 +231,7 @@ def _execute_step(step, ctx, kind, request_id, username):
             err = e
         finally:
             current_attempt.reset(token)
+            current_step.reset(step_token)
 
         if baseline:
             raise err
