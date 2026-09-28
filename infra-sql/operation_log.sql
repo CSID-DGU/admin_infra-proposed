@@ -55,3 +55,15 @@ CREATE TABLE IF NOT EXISTS job_control (
   saved_ctx   TEXT,                    -- 이어하기 컨텍스트 JSON (pod_name·uid·포트 등)
   updated_at  DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- 장애 주입 장전 표 (실험 스택 전용). 하네스가 trial 앞에 (사용자, 단계, 시나리오)를 걸어 두고,
+-- config-server 가 FAULT_INJECTION=1 일 때만 읽는다. 운영에서는 스위치가 꺼져 있어 표가 비어 있어도 된다.
+-- 신청 번호가 아니라 사용자 이름으로 건다: 장전은 신청 제출 앞에 하므로 신청 번호가 아직 없다.
+CREATE TABLE IF NOT EXISTS fault_arming (
+  id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  username   VARCHAR(64) NOT NULL,
+  step_name  VARCHAR(64) NOT NULL,      -- application/jobs.py 의 단계 함수 이름 (예: step_remove_krb5)
+  scenario   VARCHAR(8)  NOT NULL,      -- C06 / C08 / C12
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  fired_at   DATETIME(3) NULL           -- 발동 시각. NULL 이면 아직 발동하지 않았다
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
