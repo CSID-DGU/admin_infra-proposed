@@ -7,8 +7,8 @@ trial 의 식별자는 대상 시스템 바깥에서 붙인다. 계측을 하네
 
 어떤 operation_log 행이 어느 trial 에 속하는지는 신청 번호와 시간창으로 정한다. request_id
 가 같고 created_at 이 started_at 이상이며, ended_at 이 있으면 그 이하인 행을 그 trial 의
-이벤트로 본다. baseline 은 동기 경로여서 job_id 가 NULL 이라 작업 경계를 job_id 로 정할 수
-없고, 시간창이 유일하게 세 비교군에 똑같이 적용되는 규칙이기 때문이다.
+이벤트로 본다. 같은 신청에 생성 trial 과 회수 trial 을 따로 돌릴 때 두 trial 의 행을
+시간창으로 가르기 때문이다.
 
 연결 객체는 부르는 쪽이 넘겨 준다. 이 모듈은 연결을 만들지 않으므로 MySQL 접속 설정을
 갖지 않고, 테스트는 같은 DDL 을 sqlite 위에 올려서 그대로 검증할 수 있다.

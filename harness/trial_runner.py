@@ -17,6 +17,10 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 돌려야 하고, 그러려면 시간을 앞으로 보내는 책임이 이 모듈 바깥의 advance 구현에 있어야
 한다.
 
+저장도 포트로 받는다. 시스템 선언과 독립 판정은 반환 기록에만 있으므로, 부르는 쪽이 넘긴 save
+를 반환 직전에 한 번 부른다. save 에 기본값을 두지 않는다. 기본값이 있으면 저장을 빠뜨린 호출이
+조용히 통과하고, 그 trial 의 측정값은 흔적 없이 사라진다.
+
 접근 가능성은 두 번 확인한다. 첫 완료 선언 시점과 관측 구간 H 의 끝이다. 한 번만 재면
 "선언 시점에는 됐는데 H 안에 무너진" 경우와 "선언 시점부터 틀린" 경우를 가를 수 없다.
 
@@ -34,7 +38,7 @@ _EVALUATORS = {
 
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
-              submit, advance, declaration, collect, clock):
+              submit, advance, declaration, collect, clock, save):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
@@ -81,7 +85,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
     trial.close_trial(conn, trial_id)
     # 환경 복원과 잔재 검사 자리. Environment Resetter 가 생기면 여기서 되돌린다.
 
-    return {
+    record = {
         "trial_id": trial_id,
         "method": method,
         "server_group": server_group,
@@ -99,3 +103,6 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         "system_declaration": {"value": declared_value, "at": t_declared},
         "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon},
     }
+    # 저장이 실패하면 삼키지 않고 올린다. 저장하지 못한 trial 을 성공처럼 끝내면 결측이 보이지 않는다.
+    save(record)
+    return record
