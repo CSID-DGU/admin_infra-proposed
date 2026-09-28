@@ -13,6 +13,9 @@ from .catalog import is_fault_case
 from .ports import safe
 from .resetter import admin_email, run_prefix
 
+# glibc SHA-512 crypt 공개 시험 벡터("Hello world!", salt "saltstring"). 형식만 맞으면 되는 자리라 비밀이 아니다.
+SSH_PASSWORD_HASH = "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1"
+
 
 class StepFailed(AssertionError):
     pass
@@ -71,10 +74,13 @@ class Run:
     # ---- 사용자 만들기 ----
     def _insert_user(self, *, email, username, role="USER"):
         name = f"'{safe(username)}'" if username else "NULL"
+        # SSH 비밀번호는 웹 계정 비밀번호 하나이고, admin_be는 가입·로그인 때 그 해시를 만든다. 여기서는 가입을
+        # 건너뛰고 행을 직접 넣으므로 해시도 직접 넣는다. 시험은 비밀번호로 접속하지 않아 값은 의미가 없다.
         self.cluster.sql(
             "INSERT INTO users (created_at, updated_at, department, email, is_active, name, password, phone, role, "
-            "student_id, ubuntu_username, ubuntu_account_status) VALUES (NOW(6), NOW(6), 'e2e', "
-            f"'{safe(email)}', b'1', 'e2e', 'x', '010-0000-0000', '{safe(role)}', '0000000000', {name}, 'NONE');")
+            "student_id, ubuntu_username, ubuntu_account_status, ubuntu_password_hash) VALUES (NOW(6), NOW(6), 'e2e', "
+            f"'{safe(email)}', b'1', 'e2e', 'x', '010-0000-0000', '{safe(role)}', '0000000000', {name}, 'NONE', "
+            f"'{SSH_PASSWORD_HASH}');")
         return int(self.cluster.sql(f"SELECT user_id FROM users WHERE email='{safe(email)}';")[0][0])
 
 
@@ -122,8 +128,7 @@ class Context:
         user = self.users[arg["user"]]
         expires = (dt.datetime.now() + dt.timedelta(days=arg.get("days", 3))).strftime("%Y-%m-%dT%H:%M:%S")
         body = {"resourceGroupId": self.run.resource_group, "imageId": self.run.image,
-                "usagePurpose": f"e2e {self.case}", "formAnswers": {}, "expiresAt": expires,
-                "ubuntuPassword": "E2e-" + os.urandom(8).hex()}
+                "usagePurpose": f"e2e {self.case}", "formAnswers": {}, "expiresAt": expires}
         payload = self._call("POST", "/api/requests", as_user=user["id"], body=body)
         self.requests[arg["as"]] = int(payload["data"]["requestId"])
         self.memo[f"{arg['as']}.owner"] = user["id"]
