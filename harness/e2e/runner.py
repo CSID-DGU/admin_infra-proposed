@@ -6,6 +6,9 @@
 import datetime as dt
 import json
 import os
+import re
+import secrets
+import subprocess
 import time
 
 from . import observe
@@ -13,8 +16,19 @@ from .catalog import is_fault_case
 from .ports import safe
 from .resetter import admin_email, run_prefix
 
-# glibc SHA-512 crypt 공개 시험 벡터("Hello world!", salt "saltstring"). 형식만 맞으면 되는 자리라 비밀이 아니다.
-SSH_PASSWORD_HASH = "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1"
+_CRYPT_HASH = re.compile(r"^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
+
+
+def random_ssh_password_hash() -> str:
+    """사용자마다 버리는 무작위 비밀번호의 SHA-512 crypt 해시. 시험은 비밀번호로 접속하지 않지만 실제 스택에
+    SSH로 닿는 컨테이너가 생기므로, 알려진 값을 쓰면 시험하는 동안 누구나 들어올 수 있다. 평문은 표준입력으로만
+    넘기고 어디에도 남기지 않는다."""
+    proc = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=secrets.token_urlsafe(24),
+                          capture_output=True, text=True, timeout=10, check=True)
+    digest = proc.stdout.strip()
+    if not _CRYPT_HASH.match(digest):
+        raise RuntimeError("openssl이 SHA-512 crypt 해시를 만들지 못함")
+    return digest
 
 
 class StepFailed(AssertionError):
@@ -75,12 +89,12 @@ class Run:
     def _insert_user(self, *, email, username, role="USER"):
         name = f"'{safe(username)}'" if username else "NULL"
         # SSH 비밀번호는 웹 계정 비밀번호 하나이고, admin_be는 가입·로그인 때 그 해시를 만든다. 여기서는 가입을
-        # 건너뛰고 행을 직접 넣으므로 해시도 직접 넣는다. 시험은 비밀번호로 접속하지 않아 값은 의미가 없다.
+        # 건너뛰고 행을 직접 넣으므로 해시도 직접 넣는다(형식은 random_ssh_password_hash가 확인한다).
         self.cluster.sql(
             "INSERT INTO users (created_at, updated_at, department, email, is_active, name, password, phone, role, "
             "student_id, ubuntu_username, ubuntu_account_status, ubuntu_password_hash) VALUES (NOW(6), NOW(6), 'e2e', "
             f"'{safe(email)}', b'1', 'e2e', 'x', '010-0000-0000', '{safe(role)}', '0000000000', {name}, 'NONE', "
-            f"'{SSH_PASSWORD_HASH}');")
+            f"'{random_ssh_password_hash()}');")
         return int(self.cluster.sql(f"SELECT user_id FROM users WHERE email='{safe(email)}';")[0][0])
 
 
