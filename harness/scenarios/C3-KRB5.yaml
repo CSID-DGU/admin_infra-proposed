@@ -1,0 +1,17 @@
+scenario_id: C3-KRB5
+aliases: [C12]
+group: C
+operation: {type: reclamation, pair_role: revoke}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: code_hook
+  boundary: X2
+  step: step_remove_krb5
+  action: fail_persistent
+  occurrence: 1
+  verify: journal_fail_row
+analysis:
+  recoverable: false
+  expected_ground_truth: {final_state: DEGRADED}
+  forbidden_behavior: [premature_revoked]
+  metrics: [incorrect_completion, residual_access]

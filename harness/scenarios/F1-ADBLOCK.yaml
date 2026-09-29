@@ -1,0 +1,17 @@
+scenario_id: F1-ADBLOCK
+aliases: []
+group: F
+operation: {type: reclamation, pair_role: revoke}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: external_mutation
+  boundary: X0
+  step: null
+  action: ad_block
+  occurrence: 1
+  verify: networkpolicy_applied
+analysis:
+  recoverable: false
+  expected_ground_truth: {final_state: DEGRADED}
+  forbidden_behavior: [premature_revoked]
+  metrics: [incorrect_completion, residual_access]

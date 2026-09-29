@@ -1,0 +1,17 @@
+scenario_id: B4-KRB5
+aliases: [C08]
+group: B
+operation: {type: provisioning, pair_role: create}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: code_hook
+  boundary: X6
+  step: step_create_krb5_principal
+  action: sigkill_before_journal
+  occurrence: 1
+  verify: journal_restart_row
+analysis:
+  recoverable: true
+  expected_ground_truth: {final_state: ACTIVE, duplicate_resource: false}
+  forbidden_behavior: [duplicate_krb5_principal, premature_active]
+  metrics: [incorrect_completion, safe_automatic_recovery, duplicate_resource]
