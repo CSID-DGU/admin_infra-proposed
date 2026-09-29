@@ -26,7 +26,9 @@ import pathlib
 import re
 import tempfile
 
-SCHEMA_VERSION = 1
+# v2 는 scenario·independent_verdict.samples·snapshots·protection·evaluator_version 칸을 더했다.
+# load 는 v1 파일을 변환하지 않고 그대로 돌려주고, 분석기가 schema_version 을 보고 읽는다.
+SCHEMA_VERSION = 2
 
 # trial_manifest.trial_id 가 VARCHAR(64) 다. 파일 이름으로 쓰이므로 경로 문자를 막는다.
 _TRIAL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")

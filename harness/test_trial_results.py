@@ -137,3 +137,9 @@ def test_saves_normally_when_secret_absent(tmp_path):
 def test_secrets_argument_is_required(tmp_path):
     with pytest.raises(TypeError):
         trial_results.save(tmp_path, _record())
+
+
+def test_a_v1_file_is_loaded_unchanged(tmp_path):
+    v1 = {**_record(), "fault": None, "schema_version": 1}
+    (tmp_path / "trial-0001.json").write_text(json.dumps(v1), encoding="utf-8")
+    assert trial_results.load(tmp_path, "trial-0001") == v1

@@ -35,6 +35,11 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 세는 일은 Metrics Analyzer 가 한다. environment 에도 기본값을 두지 않는다. 기본값이 있으면
 환경을 확인하지 않은 trial 이 CLEAN 처럼 보여서 R4 의 구분이 조용히 사라진다. 복원과 잔재
 검사를 하는 Environment Resetter 본체는 아직 없고, 붙을 자리는 close_trial 을 부른 뒤다.
+
+기록 스키마 v2 의 보조 칸(scenario, samples, snapshots, protection)은 모두 선택 인자로 받고,
+안 넘기면 None 이나 빈 목록이다. snapshot 과 bystanders 쪽 측정이 예외를 올리면 그 칸에
+{"error", "message"} 를 적고 trial 은 계속한다. 측정 보조 장치의 고장 때문에 trial 을 잃지 않기
+위해서다. 명세의 analysis 는 옮기지 않는다. scenario 칸에는 id, aliases, spec_hash 만 적는다.
 """
 import evaluator
 import trial
@@ -63,10 +68,19 @@ def _judge_environment(environment):
     return {"verdict": verdict, "evidence": evidence}
 
 
+def _auxiliary(call):
+    """보조 측정을 한 번 부른다. 예외는 칸에 적고 올리지 않는다."""
+    try:
+        return call()
+    except Exception as e:
+        return {"error": type(e).__name__, "message": str(e)}
+
+
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
               submit, advance, declaration, collect, clock, save, environment,
-              start_state=None, fault=None, expected=None):
+              start_state=None, fault=None, expected=None,
+              scenario=None, sample_every=None, snapshot=None, bystanders=None):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
@@ -78,6 +92,11 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
     expected 는 평가자가 관계 판정에 쓰는 기대값이다. 하네스가 제출한 신청과 사용자 이름에서
     나온 값만 담고, 대상 시스템이 기록한 값으로 채우지 않는다 (ADR-004). uid 는 AD 에서 독립적으로
     읽는 경로가 생기기 전까지 None 이다.
+
+    scenario 는 scenario_spec.Spec 이다. sample_every 를 주면 선언 뒤 그 걸음 수마다 한 번 평가해서
+    independent_verdict.samples 에 쌓는다. snapshot 은 자원 목록을 돌려주는 포트로 open_trial 앞과
+    close_trial 뒤에 한 번씩 부른다. bystanders 는 방관자 target 목록이고, 보호 판정을 submit 앞과
+    H 끝에 한 번씩 낸다.
     """
     try:
         evaluate = _EVALUATORS[operation]
@@ -87,10 +106,25 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
     if operation == "CREATE" and start_state is not None:
         raise ValueError(f"start_state 는 회수 trial 에만 있다. CREATE 에 넘어왔다: {start_state!r}")
 
+    if sample_every is not None and (not isinstance(sample_every, int) or sample_every < 1):
+        raise ValueError(f"sample_every 는 1 이상의 정수여야 한다: {sample_every!r}")
+    scenario_record = None
+    if scenario is not None:
+        view = scenario.run_view()
+        if scenario_id is not None and scenario_id != view["scenario_id"]:
+            raise ValueError(f"scenario_id {scenario_id!r} 가 명세 {view['scenario_id']!r} 와 다르다")
+        scenario_record = {"id": view["scenario_id"], "aliases": view["aliases"],
+                           "spec_hash": scenario.spec_hash}
+
+    def protection():
+        return _auxiliary(lambda: evaluator.evaluate_protection(collect, bystanders=bystanders))
+
     target = {"username": username,
               "expected": {"home_suffix": f"/{username}", "uid": None, **(expected or {})}}
 
     environment_record = _judge_environment(environment)
+    snapshot_before = _auxiliary(snapshot) if snapshot is not None else None
+    protection_before = protection() if bystanders is not None else None
 
     trial.open_trial(conn, trial_id=trial_id, method=method, server_group=server_group,
                      operation=operation, horizon_sec=horizon_sec, repetition=repetition,
@@ -106,6 +140,8 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         declared_value = None
         t_declared = None
         at_declaration = None
+        samples = []
+        steps_after = 0
         while clock() - t_submitted < horizon_sec:
             advance()
             if declared_value is None:
@@ -114,9 +150,14 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
                     declared_value = value
                     t_declared = clock()
                     at_declaration = evaluate(collect, target=target)
+            elif sample_every is not None:
+                steps_after += 1
+                if steps_after % sample_every == 0:
+                    samples.append({"at": clock(), "verdict": evaluate(collect, target=target)})
 
         t_horizon_end = clock()
         at_horizon = evaluate(collect, target=target)
+        protection_after = protection() if bystanders is not None else None
 
         # 선언이 성립한 상태에서 판정이 PASS 인 첫 확인 지점이다. 두 시각의 최대값이 아니다.
         # 나중의 복구가 앞서 있었던 잘못된 선언을 지우지 않으므로 at_declaration 은 그대로 둔다.
@@ -127,6 +168,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
             t_verified = t_horizon_end
 
         trial.close_trial(conn, trial_id)
+        snapshot_after = _auxiliary(snapshot) if snapshot is not None else None
         fault_record = fault.report() if fault is not None else None
     finally:
         if fault is not None:
@@ -149,10 +191,17 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
             "horizon_end": t_horizon_end,
         },
         "system_declaration": {"value": declared_value, "at": t_declared},
-        "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon},
+        "independent_verdict": {"at_declaration": at_declaration, "at_horizon": at_horizon,
+                                "samples": samples},
         "environment": environment_record,
         "start_state": start_state,
         "fault": fault_record,
+        "scenario": scenario_record,
+        "snapshots": (None if snapshot is None
+                      else {"before": snapshot_before, "after": snapshot_after}),
+        "protection": (None if bystanders is None
+                       else {"before": protection_before, "after": protection_after}),
+        "evaluator_version": evaluator.VERSION,
     }
     # 저장이 실패하면 삼키지 않고 올린다. 저장하지 못한 trial 을 성공처럼 끝내면 결측이 보이지 않는다.
     save(record)

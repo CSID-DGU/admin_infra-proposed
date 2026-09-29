@@ -29,6 +29,9 @@ kubectl exec 로 자기 자신을 확인하고 이쪽은 Ansible SSH 로 확인�
 
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
 
+# trial 기록의 evaluator_version 칸에 적힌다. 판정 규칙이나 결과 구조를 바꾸면 올린다.
+VERSION = 2
+
 # 생성 판정의 도메인 검사 일곱 종. 각 검사의 evidence 에는 관계 판정에 쓸 식별자를 담는다.
 # login 과 compute_* 는 pod_uid, endpoint 는 backend_pod_uid, compute_uid 는 runtime_uid,
 # compute_nfs 는 mount_source 다.
