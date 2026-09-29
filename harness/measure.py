@@ -1,6 +1,6 @@
 """사람이 실스택에서 측정을 돌리고, 한 신청의 진행을 보고, 남은 잠금을 푸는 명령.
 
-    python3 harness/measure.py pair    --stack full --reps 3 --horizon 600 --poll 10 [--scenario C06] [--out DIR]
+    python3 harness/measure.py pair    --stack full --reps 3 --horizon 600 --poll 10 [--scenario A3-KRB5] [--out DIR]
     python3 harness/measure.py logs    --stack full --request 812 [--since 30m]
     python3 harness/measure.py release --stack full --run <run_id> | --force
 
@@ -26,12 +26,14 @@ import inventory  # noqa: E402
 import measure_ports  # noqa: E402
 import real_collector  # noqa: E402
 import resetter  # noqa: E402
+import scenario_spec  # noqa: E402
 import stack_lock  # noqa: E402
 import system  # noqa: E402
 import trial_results  # noqa: E402
 import trial_runner  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+SCENARIO_DIR = Path(__file__).resolve().parent / "scenarios"
 KST = dt.timezone(dt.timedelta(hours=9))
 STACKS = {"noprobe": "exp-np-", "full": "exp-fu-", "baseline": "exp-bl-"}  # ops/proposed-stack/uid-ranges.yaml
 CONFIG_KEYS = ("KUBE_HOST", "ADMIN_INFRA_SERVER")
@@ -116,6 +118,10 @@ def _start_bystander(args, ports, name):
 
 def cmd_pair(args, cfg):
     out = _out_dir(args.out, args.stack)
+    spec = scenario_spec.load_all(SCENARIO_DIR)[args.scenario] if args.scenario else None
+    view = spec.run_view() if spec else None
+    if view and args.stack not in view["applies_to"]:
+        raise ConfigError(f"{args.scenario} 는 {view['applies_to']} 에만 적용한다: --stack {args.stack}")
     host, ns, prefix = cfg["KUBE_HOST"], _namespace(args.stack), STACKS[args.stack]
     # 사용자 이름이 AD sAMAccountName 20자 제한 안에 들도록 run_id 를 짧게 둔다.
     run_id = secrets.token_hex(3)
@@ -187,12 +193,14 @@ def cmd_pair(args, cfg):
                              f"verdict={record['independent_verdict']['at_horizon']['verdict']}")
 
                     faults = {}
-                    if args.scenario:
-                        # 장애는 시나리오의 operation 에 맞는 trial 에만 건다. 짝의 다른 trial 은 장애 없이 돈다.
-                        kind = "create" if fault_injector.SCENARIOS[args.scenario][0] == "CREATE" else "revoke"
-                        faults = {f"{kind}_scenario_id": args.scenario,
-                                  f"{kind}_fault": fault_injector.Fault(journal, scenario=args.scenario,
-                                                                         username=username)}
+                    if view:
+                        # 장애는 명세의 pair_role 에 맞는 trial 에만 건다. 짝의 다른 trial 은 장애 없이 돈다.
+                        # mutate 의 run 은 소문자·16자 이하라서 run_id(6자)와 반복 번호로 만든다.
+                        role = view["operation"]["pair_role"]
+                        faults = {f"{role}_scenario_id": args.scenario, f"{role}_scenario": spec,
+                                  f"{role}_injector": fault_injector.from_spec(
+                                      view, username=username, journal=journal, host=host, namespace=ns,
+                                      run_id=f"{run_id}{rep:02d}")}
 
                     trial_runner.run_pair(
                         journal, create_trial_id=f"{base}-c", revoke_trial_id=f"{base}-r",
@@ -311,8 +319,8 @@ def parser():
     pair.add_argument("--reps", type=_positive, default=1)
     pair.add_argument("--horizon", type=_positive, default=600, help="관측 구간 H (초)")
     pair.add_argument("--poll", type=_positive, default=10, help="선언 확인 간격 (초)")
-    pair.add_argument("--scenario", choices=sorted(fault_injector.SCENARIOS),
-                      help="장애 시나리오. 스택이 FAULT_INJECTION=1 로 떠 있어야 발동한다")
+    pair.add_argument("--scenario", choices=sorted(f.stem for f in SCENARIO_DIR.glob("*.yaml")),
+                      help="harness/scenarios 의 명세 ID. 코드 훅은 스택이 FAULT_INJECTION=1 로 떠 있어야 발동한다")
     pair.add_argument("--out", help="결과 디렉터리. 레포 밖이어야 한다")
     pair.set_defaults(func=cmd_pair)
 

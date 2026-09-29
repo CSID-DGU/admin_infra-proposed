@@ -24,10 +24,10 @@ VASC 는 네 개의 결과 축을 각각 다른 칸에 적고 한 칸을 다른 
 접근 가능성은 두 번 확인한다. 첫 완료 선언 시점과 관측 구간 H 의 끝이다. 한 번만 재면
 "선언 시점에는 됐는데 H 안에 무너진" 경우와 "선언 시점부터 틀린" 경우를 가를 수 없다.
 
-장애는 포트 fault 로 받는다(harness/fault_injector.py). submit 바로 앞에서 장전하고, close_trial
-바로 뒤에 발동 여부를 읽어 기록의 fault 칸에 남긴다. fault 칸은 장애를 걸었다는 사실이라 평가에
-쓰지 않는다(ADR-004). 도중에 예외가 나도 장전이 스택에 남아 다음 trial 에 걸리지 않게 finally 에서
-푼다.
+장애는 포트 injector 로 받는다(harness/fault_injector.py). submit 바로 앞에서 arm, advance 뒤마다
+poll, close_trial 바로 뒤에 report 를 불러 기록의 injection 칸에 남긴다. injection 칸은 장애를 걸었다는
+사실과 그 성립 확인이라 평가에 쓰지 않는다(ADR-004). 도중에 예외가 나도 장전이 스택에 남아 다음
+trial 에 걸리지 않게 finally 에서 disarm 한다.
 
 환경 판정은 포트 environment 로 받아서 기록의 environment 칸에 남긴다. open_trial 앞에서 한
 번 부르므로 환경 확인이 스택에 남기는 흔적이 trial 의 시간창에 들어가지 않는다. 판정이 DIRTY
@@ -79,7 +79,7 @@ def _auxiliary(call):
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
               submit, advance, declaration, collect, clock, save, environment,
-              start_state=None, fault=None, expected=None,
+              start_state=None, injector=None, expected=None,
               scenario=None, sample_every=None, snapshot=None, bystanders=None):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
@@ -130,8 +130,8 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
                      operation=operation, horizon_sec=horizon_sec, repetition=repetition,
                      revisions=revisions, scenario_id=scenario_id)
 
-    if fault is not None:
-        fault.arm()
+    if injector is not None:
+        injector.arm()
     try:
         t_submitted = clock()
         request_id = submit()
@@ -144,6 +144,8 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
         steps_after = 0
         while clock() - t_submitted < horizon_sec:
             advance()
+            if injector is not None:
+                injector.poll()
             if declared_value is None:
                 value = declaration()
                 if value is not None:
@@ -169,10 +171,10 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
 
         trial.close_trial(conn, trial_id)
         snapshot_after = _auxiliary(snapshot) if snapshot is not None else None
-        fault_record = fault.report() if fault is not None else None
+        injection_record = injector.report() if injector is not None else None
     finally:
-        if fault is not None:
-            fault.disarm()
+        if injector is not None:
+            injector.disarm()
     # 환경 복원과 잔재 검사 자리. Environment Resetter 가 생기면 여기서 되돌린다.
 
     record = {
@@ -195,7 +197,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
                                 "samples": samples},
         "environment": environment_record,
         "start_state": start_state,
-        "fault": fault_record,
+        "injection": injection_record,
         "scenario": scenario_record,
         "snapshots": (None if snapshot is None
                       else {"before": snapshot_before, "after": snapshot_after}),
@@ -211,7 +213,7 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
 def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
              horizon_sec, repetition, revisions, username,
              create_scenario_id=None, revoke_scenario_id=None,
-             create_fault=None, revoke_fault=None,
+             create_injector=None, revoke_injector=None, create_scenario=None, revoke_scenario=None,
              create_submit, create_declaration, revoke_submit, revoke_declaration,
              advance, collect, clock, environment, save, snapshot=None, bystanders=None):
     """생성 trial 에 이어서 같은 신청으로 회수 trial 을 돌리고 (생성 기록, 회수 기록) 을 돌려준다.
@@ -232,7 +234,8 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
                   environment=environment, snapshot=snapshot, bystanders=bystanders)
 
     created = run_trial(conn, trial_id=create_trial_id, operation="CREATE",
-                        scenario_id=create_scenario_id, fault=create_fault, submit=create_submit,
+                        scenario_id=create_scenario_id, injector=create_injector, scenario=create_scenario,
+                        submit=create_submit,
                         declaration=create_declaration, **common)
     request_id = created["request_id"]
 
@@ -245,7 +248,8 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
         return returned
 
     revoked = run_trial(conn, trial_id=revoke_trial_id, operation="REVOKE",
-                        scenario_id=revoke_scenario_id, fault=revoke_fault, submit=submit,
+                        scenario_id=revoke_scenario_id, injector=revoke_injector, scenario=revoke_scenario,
+                        submit=submit,
                         declaration=revoke_declaration,
                         start_state={
                             "creation_trial_id": create_trial_id,

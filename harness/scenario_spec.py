@@ -22,6 +22,8 @@ KINDS = frozenset({"none", "code_hook", "external_mutation"})
 ACTIONS = frozenset({"none", "response_loss", "sigkill_before_journal", "fail_persistent",
                      "endpoint_block", "ad_block"})
 BOUNDARIES = frozenset(f"X{i}" for i in range(12))
+# 주입 성립 확인 방법. 뜻은 fault_injector 에 있다.
+VERIFIES = frozenset({"none", "fired_after_success", "fired_before_success", "policy_present"})
 
 _TOP = {"scenario_id", "aliases", "group", "operation", "applies_to", "injection", "analysis"}
 _OPERATION = {"type", "pair_role"}
@@ -75,8 +77,7 @@ def _validate(raw):
     _one_of("injection.action", inj["action"], ACTIONS)
     if not isinstance(inj["occurrence"], int) or isinstance(inj["occurrence"], bool):
         raise SpecError(f"injection.occurrence 는 정수여야 한다: {inj['occurrence']!r}")
-    if not isinstance(inj["verify"], str):
-        raise SpecError(f"injection.verify 는 문자열이어야 한다: {inj['verify']!r}")
+    _one_of("injection.verify", inj["verify"], VERIFIES)
     if inj["step"] is not None and not isinstance(inj["step"], str):
         raise SpecError(f"injection.step 은 문자열이나 null 이어야 한다: {inj['step']!r}")
     if inj["kind"] == "none":

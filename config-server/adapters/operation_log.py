@@ -41,18 +41,18 @@ current_job_id = ContextVar("current_job_id", default=None)
 # 실행 중 단계의 시도 번호(v2.1). 재시도 엔진이 단계를 다시 돌릴 때 올려 두면, 단계 안의 모든
 # log_operation 호출이 attempt 인자 없이도 그 시도 번호로 기록된다.
 current_attempt = ContextVar("current_attempt", default=1)
-# 실행 중 단계의 함수 이름. 재시도 엔진이 단계를 부르는 동안 둔다. 장애 주입(C08)이 이 기록이
+# 실행 중 단계의 함수 이름. 재시도 엔진이 단계를 부르는 동안 둔다. 장애 주입(X6)이 이 기록이
 # 어느 단계 안에서 나왔는지 알기 위해 쓴다.
 current_step = ContextVar("current_step", default=None)
 
 
-def _fault_c08(username):
-    """C08: 장전된 단계의 자원 SUCCESS 행을 쓰기 직전에 제어기를 끝낸다. 발동 표시가 kill 보다 먼저 커밋된다.
+def _fault_x6(username):
+    """X6 sigkill_before_journal: 장전된 단계의 자원 SUCCESS 행을 쓰기 직전에 제어기를 끝낸다. 발동 표시가 kill 보다 먼저 커밋된다.
     스위치가 꺼져 있으면 fault_injection 이 DB 를 보지 않고 곧바로 돌아온다."""
     step = current_step.get()
     if step is None:
         return
-    row = fault_injection.armed(username, step, "C08")
+    row = fault_injection.armed(username, step, "X6", "sigkill_before_journal")
     if row is not None and fault_injection.mark_fired(row["id"]):
         fault_injection.kill_process()
 
@@ -175,7 +175,7 @@ def log_operation(
     if attempt == 1:
         attempt = current_attempt.get()
     if phase_value == Phase.SUCCESS.value and resource_type:
-        _fault_c08(username)
+        _fault_x6(username)
 
     conn = None
     try:
