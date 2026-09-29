@@ -28,7 +28,7 @@ def conn():
 class Ports:
     """가짜 포트 묶음. 시계는 advance 가 밀어 준다."""
 
-    def __init__(self, *, declare_after=None, rounds=(), step=200.0, checks=5):
+    def __init__(self, *, declare_after=None, rounds=(), step=200.0, checks=len(evaluator.CREATION_CHECKS)):
         self.now = 1000.0
         self.step = step
         self.checks = checks
@@ -58,12 +58,14 @@ class Ports:
             return None
         return "FULFILLED"
 
-    def collect(self, name, username):
+    def collect(self, name, target):
         if self.in_round == 0:
             self.current = self.rounds.pop(0) if self.rounds else evaluator.PASS
             self.eval_times.append(self.now)
         self.in_round = (self.in_round + 1) % self.checks
-        return self.current, {"check": name}
+        # 관계 판정이 회차 결과를 흐리지 않도록 식별자는 늘 서로 맞게 돌려준다.
+        return self.current, {"check": name, "pod_uid": "pod-1", "backend_pod_uid": "pod-1",
+                              "mount_source": "nas:/share" + target["expected"]["home_suffix"]}
 
 
 def _run(conn, ports, **kw):

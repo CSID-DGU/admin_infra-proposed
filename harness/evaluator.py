@@ -29,49 +29,114 @@ kubectl exec 로 자기 자신을 확인하고 이쪽은 Ansible SSH 로 확인�
 
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
 
-# 생성 판정의 필수 검사 다섯 종. 논문이 정한 접근 경로와 1:1 로 대응한다.
-CREATION_CHECKS = ("login", "home_read_write", "container_identity",
-                   "storage_access", "endpoint")
+# 생성 판정의 도메인 검사 일곱 종. 각 검사의 evidence 에는 관계 판정에 쓸 식별자를 담는다.
+# login 과 compute_* 는 pod_uid, endpoint 는 backend_pod_uid, compute_uid 는 runtime_uid,
+# compute_nfs 는 mount_source 다.
+CREATION_CHECKS = ("login", "compute_uid", "storage_rw", "credential",
+                   "compute_gpu", "compute_nfs", "endpoint")
 
-# 회수 판정의 필수 검사 네 종. 각각 "막혔음" 을 확인했을 때 PASS 다.
+# 회수 판정의 도메인 검사 네 종. 각각 "막혔음" 을 확인했을 때 PASS 다. 관계 판정은 없다.
 RECLAMATION_CHECKS = ("login_blocked", "credential_blocked",
-                      "container_blocked", "endpoint_blocked")
+                      "compute_blocked", "endpoint_blocked")
+
+# access_verdict 에 접는 관계. runtime_uid_vs_expected 는 기록만 하고 접지 않는다. 기대 uid 를
+# 대상 시스템 기록이 아니라 AD 에서 독립적으로 읽는 경로(vasc-16)가 아직 없어서, 지금 접으면
+# 모든 trial 이 UNKNOWN 이 된다. 그 경로가 생기면 여기에 더한다.
+REQUIRED_RELATIONS = ("endpoint_to_pod", "mount_target")
 
 
-def _evaluate(collect, names, username):
-    checks, evidence = {}, {}
+def _fold(results):
+    values = set(results)
+    if FAIL in values:
+        return FAIL  # 위반을 이미 확인했으므로 UNKNOWN 이 섞여도 FAIL 이다
+    if values == {PASS}:
+        return PASS
+    return UNKNOWN
+
+
+def _collect_all(collect, names, target):
+    domains = {}
     for name in names:
         try:
-            result, detail = collect(name, username)
+            result, detail = collect(name, target)
         except Exception as e:  # 평가자 쪽 고장. 차단으로 읽으면 없는 위반을 만든다
-            checks[name] = UNKNOWN
-            evidence[name] = {"collector_error": type(e).__name__, "message": str(e)}
+            domains[name] = {"result": UNKNOWN,
+                             "evidence": {"collector_error": type(e).__name__, "message": str(e)}}
             continue
         if result not in (PASS, FAIL, UNKNOWN):
-            checks[name] = UNKNOWN
-            evidence[name] = {"unexpected_result": repr(result), "detail": detail}
+            domains[name] = {"result": UNKNOWN,
+                             "evidence": {"unexpected_result": repr(result), "detail": detail}}
             continue
-        checks[name] = result
-        evidence[name] = detail
-    values = set(checks.values())
-    if FAIL in values:
-        verdict = FAIL  # 위반을 이미 확인했으므로 UNKNOWN 이 섞여도 FAIL 이다
-    elif values == {PASS}:
-        verdict = PASS
-    else:
-        verdict = UNKNOWN
-    return {"verdict": verdict, "checks": checks, "evidence": evidence}
+        domains[name] = {"result": result, "evidence": detail}
+    return domains
 
 
-def evaluate_creation(collect, *, username):
-    """생성 판정. 다섯 경로가 전부 실제로 열려 있을 때만 PASS 다."""
-    return _evaluate(collect, CREATION_CHECKS, username)
+def _id(domains, name, key):
+    evidence = domains[name]["evidence"]
+    return evidence.get(key) if isinstance(evidence, dict) else None
 
 
-def evaluate_reclamation(collect, *, username):
+def _relation(ok, evidence):
+    """ok 가 None 이면 비교할 식별자를 얻지 못한 것이므로 UNKNOWN 이다."""
+    result = UNKNOWN if ok is None else (PASS if ok else FAIL)
+    return {"result": result, "evidence": evidence}
+
+
+def _relations(domains, expected):
+    """관계 판정. 수집기를 다시 부르지 않고 도메인 evidence 끼리만 비교한다."""
+    backend = _id(domains, "endpoint", "backend_pod_uid")
+    login_pod = _id(domains, "login", "pod_uid")
+    source = _id(domains, "compute_nfs", "mount_source")
+    suffix = expected.get("home_suffix")
+    runtime_uid = _id(domains, "compute_uid", "runtime_uid")
+    expected_uid = expected.get("uid")
+    return {
+        "endpoint_to_pod": _relation(
+            None if backend is None or login_pod is None else backend == login_pod,
+            {"backend_pod_uid": backend, "login_pod_uid": login_pod}),
+        "mount_target": _relation(
+            None if source is None or suffix is None else str(source).endswith(suffix),
+            {"mount_source": source, "home_suffix": suffix}),
+        "runtime_uid_vs_expected": _relation(
+            None if runtime_uid is None or expected_uid is None
+            else str(runtime_uid) == str(expected_uid),
+            {"runtime_uid": runtime_uid, "expected_uid": expected_uid}),
+    }
+
+
+def evaluate_creation(collect, *, target):
+    """생성 판정. 일곱 도메인과 필수 관계가 전부 PASS 일 때만 PASS 다.
+
+    target 은 {"username", "expected"} 이다. expected 에는 하네스가 제출한 신청과 그 사용자에게서
+    나온 값만 담고, 대상 시스템이 기록한 값을 담지 않는다 (ADR-004). 도메인이 전부 PASS 여도
+    endpoint 가 다른 Pod 에 닿으면 사용자는 그 신청을 쓸 수 없으므로 FAIL 이다.
+    """
+    domains = _collect_all(collect, CREATION_CHECKS, target)
+    relations = _relations(domains, target.get("expected") or {})
+    verdict = _fold([d["result"] for d in domains.values()]
+                    + [relations[name]["result"] for name in REQUIRED_RELATIONS])
+    # verdict 는 v1 호환 키다. trial_runner 와 분석 경로가 이 키를 읽는다.
+    return {"access_verdict": verdict, "domains": domains, "relations": relations,
+            "verdict": verdict}
+
+
+def evaluate_reclamation(collect, *, target):
     """회수 판정. 네 경로가 전부 막혔음을 확인했을 때만 PASS 다.
 
     보존 정책으로 홈 데이터가 남는 것은 회수 위반이 아니므로 데이터 존재 여부를 검사
     목록에 넣지 않는다. 보존 때문에 접근 경로가 살아 있다면 그것은 접근 검사가 잡는다.
     """
-    return _evaluate(collect, RECLAMATION_CHECKS, username)
+    domains = _collect_all(collect, RECLAMATION_CHECKS, target)
+    verdict = _fold([d["result"] for d in domains.values()])
+    return {"access_verdict": verdict, "domains": domains, "relations": {},
+            "verdict": verdict}
+
+
+def evaluate_protection(collect, *, bystanders):
+    """보호 판정. 방관자 대상마다 생성 판정을 돌려 전부 PASS 일 때만 PASS 다.
+
+    접근 판정과 다른 칸에 둔다. 방관자가 없으면 판정할 것이 없으므로 None 이다.
+    """
+    results = {b["username"]: evaluate_creation(collect, target=b) for b in bystanders}
+    verdict = _fold([r["access_verdict"] for r in results.values()]) if results else None
+    return {"protection_verdict": verdict, "bystanders": results}

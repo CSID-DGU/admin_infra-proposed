@@ -187,5 +187,5 @@ def real_ports(*, be, web_sql, user_id, admin_id, prefix, username, expires_at, 
         "advance": lambda: sleep(poll_sec),
         "clock": clock,
         "environment": resetter.environment_for(be.host, be.namespace, prefix, username=username),
-        "collect": lambda name, username: ("UNKNOWN", {"reason": "실스택 수집기 미구현"}),
+        "collect": lambda name, target: ("UNKNOWN", {"reason": "실스택 수집기 미구현"}),
     }

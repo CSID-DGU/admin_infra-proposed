@@ -110,17 +110,28 @@ def _run(conn, ports, *, trial_id, operation, save=None, fault=None):
         save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}), fault=fault)
 
 
-def test_normal_creation_trial_verifies_at_the_declaration(conn, env):
-    """정상 생성: 네 시각이 모두 채워지고 두 판정이 모두 PASS 다."""
+# 평가자 v2 에서 생성 판정의 기대가 바뀌었다. 가상 계층에는 GPU 실체가 없어서 compute_gpu 가
+# UNKNOWN 이고 PASS 를 지어내지 않으므로(virtual_probe 첫머리 주석), 정상 생성도 판정이 UNKNOWN
+# 이고 검증 시각이 서지 않는다. 검증 시각을 정하는 규칙은 test_trial_runner.py 의 가짜 포트가
+# 계속 시험한다. 아래 두 시험은 GPU 를 뺀 나머지 검사가 PASS 인지를 따로 본다.
+
+
+def _only_gpu_unknown(verdict):
+    results = {name: d["result"] for name, d in verdict["domains"].items()}
+    return (verdict["verdict"] == evaluator.UNKNOWN
+            and results.pop("compute_gpu") == evaluator.UNKNOWN
+            and set(results.values()) == {evaluator.PASS})
+
+
+def test_normal_creation_trial_fills_every_timestamp_but_verified(conn, env):
+    """정상 생성: 검증 시각을 뺀 세 시각이 채워지고, 두 판정은 GPU 를 뺀 검사가 전부 PASS 다."""
     out = _run(conn, _create_ports(env, "801"), trial_id="trial-normal", operation="CREATE")
 
     ts = out["timestamps"]
     assert ts["submitted"] is not None and ts["horizon_end"] is not None
-    assert ts["declared"] is not None and ts["verified"] is not None
-    assert out["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
-    assert out["independent_verdict"]["at_horizon"]["verdict"] == evaluator.PASS
-    # 선언 시점에 이미 접근이 확인되었으므로 검증 시각이 H 끝까지 미뤄지지 않는다.
-    assert ts["verified"] == ts["declared"]
+    assert ts["declared"] is not None and ts["verified"] is None
+    assert _only_gpu_unknown(out["independent_verdict"]["at_declaration"])
+    assert _only_gpu_unknown(out["independent_verdict"]["at_horizon"])
 
 
 def test_wrong_declaration_keeps_both_axes_as_observed(conn, env):
@@ -136,14 +147,13 @@ def test_wrong_declaration_keeps_both_axes_as_observed(conn, env):
     assert out["system_declaration"]["at"] == out["timestamps"]["declared"]
 
 
-def test_collapse_after_declaration_does_not_erase_the_verification(conn, env):
-    """선언 뒤 붕괴: 선언이 잡힌 뒤에 Pod 를 없애면 앞서 성립한 확인이 그대로 남는다."""
+def test_collapse_after_declaration_does_not_erase_the_earlier_observation(conn, env):
+    """선언 뒤 붕괴: 선언이 잡힌 뒤에 Pod 를 없애면 H 끝 판정만 FAIL 이 되고 앞선 관측은 그대로 남는다."""
     out = _run(conn, _create_ports(env, "803", sabotage_after=2),
                trial_id="trial-collapse", operation="CREATE")
 
-    assert out["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
+    assert _only_gpu_unknown(out["independent_verdict"]["at_declaration"])
     assert out["independent_verdict"]["at_horizon"]["verdict"] == evaluator.FAIL
-    assert out["timestamps"]["verified"] == out["timestamps"]["declared"]
 
 
 def test_revoke_trial_binds_manifest_and_journal_under_one_trial_id(conn, env):
@@ -194,8 +204,9 @@ def test_pair_runs_revoke_right_after_creation_on_the_same_request(conn, env):
         environment=lambda: (trial_runner.CLEAN, {}), save=create.save)
 
     assert revoked["request_id"] == created["request_id"] == "810"
+    # 생성 판정이 UNKNOWN 인 까닭은 파일 위쪽 주석에 있다 (가상 계층의 compute_gpu).
     assert revoked["start_state"] == {"creation_trial_id": "trial-pair-c",
-                                      "creation_verdict_at_horizon": evaluator.PASS}
+                                      "creation_verdict_at_horizon": evaluator.UNKNOWN}
     assert revoked["independent_verdict"]["at_declaration"]["verdict"] == evaluator.PASS
     assert revoked["independent_verdict"]["at_horizon"]["verdict"] == evaluator.PASS
     assert "REVOKE" in {e["action"] for e in trial.events_of(conn, "trial-pair-r")}

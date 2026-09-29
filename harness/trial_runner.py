@@ -66,7 +66,7 @@ def _judge_environment(environment):
 def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
               repetition, revisions, username, scenario_id=None,
               submit, advance, declaration, collect, clock, save, environment,
-              start_state=None, fault=None):
+              start_state=None, fault=None, expected=None):
     """trial 하나를 끝까지 진행하고 관측 기록을 돌려준다.
 
     open_trial 은 trial 하나에 한 번만 부른다. 대상 시스템이 몇 번 재시도하든 그것은 같은
@@ -74,6 +74,10 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
 
     start_state 는 회수 trial 에만 있다. run_pair 가 앞선 생성 trial 의 판정을 넘기고, 짝 없이
     돈 회수 trial 은 None 으로 남아서 그 사실이 기록에 드러난다.
+
+    expected 는 평가자가 관계 판정에 쓰는 기대값이다. 하네스가 제출한 신청과 사용자 이름에서
+    나온 값만 담고, 대상 시스템이 기록한 값으로 채우지 않는다 (ADR-004). uid 는 AD 에서 독립적으로
+    읽는 경로가 생기기 전까지 None 이다.
     """
     try:
         evaluate = _EVALUATORS[operation]
@@ -82,6 +86,9 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
             f"operation 은 {sorted(_EVALUATORS)} 중 하나여야 한다: {operation!r}") from None
     if operation == "CREATE" and start_state is not None:
         raise ValueError(f"start_state 는 회수 trial 에만 있다. CREATE 에 넘어왔다: {start_state!r}")
+
+    target = {"username": username,
+              "expected": {"home_suffix": f"/{username}", "uid": None, **(expected or {})}}
 
     environment_record = _judge_environment(environment)
 
@@ -106,10 +113,10 @@ def run_trial(conn, *, trial_id, method, server_group, operation, horizon_sec,
                 if value is not None:
                     declared_value = value
                     t_declared = clock()
-                    at_declaration = evaluate(collect, username=username)
+                    at_declaration = evaluate(collect, target=target)
 
         t_horizon_end = clock()
-        at_horizon = evaluate(collect, username=username)
+        at_horizon = evaluate(collect, target=target)
 
         # 선언이 성립한 상태에서 판정이 PASS 인 첫 확인 지점이다. 두 시각의 최대값이 아니다.
         # 나중의 복구가 앞서 있었던 잘못된 선언을 지우지 않으므로 at_declaration 은 그대로 둔다.
