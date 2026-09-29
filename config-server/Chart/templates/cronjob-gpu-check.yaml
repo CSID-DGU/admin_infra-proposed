@@ -8,8 +8,13 @@ metadata:
 spec:
   # GPU 유실은 발견이 늦어질수록 사용자가 오래 방치되므로 krb5-reconcile(30분)보다 짧게 잡는다.
   schedule: "*/10 * * * *"
+  # 앞 실행이 끝나지 않았으면 새로 만들지 않고, 끝나지 않는 실행은 제한 시간에 끊는다. 둘 다 없으면
+  # 마운트 실패처럼 영영 끝나지 않는 Pod가 주기마다 하나씩 쌓인다(2026-09-29 noprobe에서 7일간 123개).
+  concurrencyPolicy: Forbid
   jobTemplate:
     spec:
+      # 평소 수 초면 끝난다. 주기(10분)의 절반에서 끊어 다음 실행과 겹치지 않게 한다.
+      activeDeadlineSeconds: 300
       template:
         metadata:
           labels:
