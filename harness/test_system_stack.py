@@ -80,3 +80,21 @@ def test_not_exactly_one_row_raises(calls, rows):
     calls["rows"], calls["rc"] = rows, 3
     with pytest.raises(system.SystemCallFailed):
         system.stack_secret("farm1", "ailab-full", "jwt_secret")
+
+
+def test_probe_password_only_on_stdin(calls):
+    system.stack_probe("local", "10.0.0.2", 10022, "exp-fu-m1", password="pw-SECRET")
+    argv, stdin = _last(calls)
+    assert argv == ["--format", "json", "stack", "probe", "--host", "local", "--address", "10.0.0.2",
+                    "--port", "10022", "--user", "exp-fu-m1"]
+    assert json.loads(stdin) == {"password": "pw-SECRET"}
+
+
+def test_mutate_args(calls):
+    system.stack_mutate("local", "ailab-full", "apply", template="deny-ingress-user",
+                        target_user="exp-fu-m1", run="abc123")
+    assert _last(calls)[0] == ["--format", "json", "stack", "mutate", "--host", "local",
+                               "--namespace", "ailab-full", "--action", "apply", "--run", "abc123",
+                               "--template", "deny-ingress-user", "--target-user", "exp-fu-m1"]
+    system.stack_mutate("local", "ailab-full", "clear", run="all")
+    assert _last(calls)[0][-2:] == ["--run", "all"]

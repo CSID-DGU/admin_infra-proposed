@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fault_injector  # noqa: E402
 import inventory  # noqa: E402
 import measure_ports  # noqa: E402
+import real_collector  # noqa: E402
 import stack_lock  # noqa: E402
 import system  # noqa: E402
 import trial_results  # noqa: E402
@@ -100,6 +101,8 @@ def cmd_pair(args, cfg):
     # 사용자 이름이 AD sAMAccountName 20자 제한 안에 들도록 run_id 를 짧게 둔다.
     run_id = secrets.token_hex(3)
     users, files = [], []
+    # 테스트 사용자 비밀번호. run 동안 메모리에만 둔다.
+    passwords = {}
     try:
         with stack_lock.hold(host, ns, owner="measure", run_id=run_id, now=_now_kst().isoformat()):
             _say(f"{args.stack} run={run_id} 잠금을 잡았다")
@@ -113,10 +116,13 @@ def cmd_pair(args, cfg):
             admin_id = measure_ports.create_user(
                 web, username=None, email=f"m{run_id}-admin@example.com",
                 password=secrets.token_urlsafe(24), role="ADMIN")
+            collector = real_collector.RealCollector(host, ns, password_of=passwords.__getitem__,
+                                                     clock=time.monotonic)
             for rep in range(1, args.reps + 1):
                 username = f"{prefix}m{run_id}{rep:02d}"
                 password = secrets.token_urlsafe(24)
                 users.append(username)
+                passwords[username] = password
                 user_id = measure_ports.create_user(
                     web, username=username, email=f"{username}@example.com", password=password, role="USER")
                 base = f"{args.stack}-{run_id}-{rep:02d}"
@@ -125,7 +131,7 @@ def cmd_pair(args, cfg):
                 ports = measure_ports.real_ports(
                     be=be, web_sql=web, user_id=user_id, admin_id=admin_id, prefix=prefix, username=username,
                     expires_at=expires,
-                    sleep=time.sleep, clock=time.monotonic, poll_sec=args.poll)
+                    sleep=time.sleep, clock=time.monotonic, poll_sec=args.poll, collect=collector)
                 submit = ports["create_submit"]
 
                 def create_submit(submit=submit, base=base):

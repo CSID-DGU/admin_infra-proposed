@@ -112,5 +112,28 @@ def stack_http(host, namespace, method, path, *, token, body):
     return _one_row("http", rows, rc)
 
 
+def stack_probe(host, address, port, user, *, password):
+    """host 에서 Pod sshd 로 테스트 사용자 로그인과 고정 검사를 한다. 비밀번호는 표준입력 JSON 으로만 넘긴다.
+    행: rc·probe(connect·error·checks)·stderr."""
+    rows, rc = run("stack", "probe", "--host", host, "--address", address, "--port", str(port),
+                   "--user", user, stdin=json.dumps({"password": password}))
+    return _one_row("probe", rows, rc)
+
+
+def stack_mutate(host, namespace, action, *, template=None, target_user=None, run):
+    """라벨로 묶인 NetworkPolicy 를 적용하거나 지운다. 스택에 쓰는 유일한 경로다. 행: rc·stdout·stderr."""
+    args = ["--host", host, "--namespace", namespace, "--action", action, "--run", run]
+    if template is not None:
+        args += ["--template", template]
+    if target_user is not None:
+        args += ["--target-user", target_user]
+    rows, rc = _run("stack", "mutate", *args)
+    return _one_row("mutate", rows, rc)
+
+
+# stack_mutate 의 인자 run(run id)이 모듈 함수 run 을 가린다.
+_run = run
+
+
 # apply(수렴)는 아직 열지 않는다. 자원을 바꾸는 경로라 안전 승인 인자를 함께 설계해야 하고,
 # 지금 하네스에서 그것을 부르는 곳이 없다. Environment Resetter 를 만들 때 여기에 더한다.
