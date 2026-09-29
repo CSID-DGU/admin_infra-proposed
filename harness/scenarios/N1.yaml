@@ -1,0 +1,17 @@
+scenario_id: N1
+aliases: [C01]
+group: N
+operation: {type: provisioning, pair_role: create}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: none
+  boundary: null
+  step: null
+  action: none
+  occurrence: 0
+  verify: none
+analysis:
+  recoverable: false
+  expected_ground_truth: {final_state: ACTIVE, duplicate_resource: false}
+  forbidden_behavior: [premature_active]
+  metrics: [incorrect_completion, verified_completion]

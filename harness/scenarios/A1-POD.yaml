@@ -1,0 +1,17 @@
+scenario_id: A1-POD
+aliases: [C07]
+group: A
+operation: {type: provisioning, pair_role: create}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: code_hook
+  boundary: X2
+  step: step_create_pod_k8s
+  action: fail_persistent
+  occurrence: 1
+  verify: journal_fail_row
+analysis:
+  recoverable: false
+  expected_ground_truth: {final_state: DEGRADED, duplicate_resource: false}
+  forbidden_behavior: [premature_active, orphan_resource]
+  metrics: [incorrect_completion, duplicate_resource]

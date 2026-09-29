@@ -28,7 +28,7 @@ def conn():
 class Ports:
     """가짜 포트 묶음. 시계는 advance 가 밀어 준다."""
 
-    def __init__(self, *, declare_after=None, rounds=(), step=200.0, checks=5):
+    def __init__(self, *, declare_after=None, rounds=(), step=200.0, checks=len(evaluator.CREATION_CHECKS)):
         self.now = 1000.0
         self.step = step
         self.checks = checks
@@ -58,12 +58,14 @@ class Ports:
             return None
         return "FULFILLED"
 
-    def collect(self, name, username):
+    def collect(self, name, target):
         if self.in_round == 0:
             self.current = self.rounds.pop(0) if self.rounds else evaluator.PASS
             self.eval_times.append(self.now)
         self.in_round = (self.in_round + 1) % self.checks
-        return self.current, {"check": name}
+        # 관계 판정이 회차 결과를 흐리지 않도록 식별자는 늘 서로 맞게 돌려준다.
+        return self.current, {"check": name, "pod_uid": "pod-1", "backend_pod_uid": "pod-1",
+                              "mount_source": "nas:/share" + target["expected"]["home_suffix"]}
 
 
 def _run(conn, ports, **kw):
@@ -384,3 +386,94 @@ def test_pair_without_faults_records_none(conn):
     ports = Ports(declare_after=1)
     created, revoked = _pair(conn, ports, ports, revoke_fault=FakeFault([]))
     assert created["fault"] is None and revoked["fault"] is not None
+
+
+# 기록 스키마 v2 의 보조 칸
+
+HERE = Path(__file__).resolve().parent
+
+
+def test_v2_fields_are_empty_without_their_arguments(conn):
+    result = _run(conn, Ports(declare_after=1))
+    assert result["scenario"] is None
+    assert result["snapshots"] is None
+    assert result["protection"] is None
+    assert result["independent_verdict"]["samples"] == []
+    assert result["evaluator_version"] == evaluator.VERSION
+
+
+def test_scenario_records_only_id_aliases_and_hash(conn):
+    import scenario_spec
+    spec = scenario_spec.load(HERE / "scenarios" / "A3-KRB5.yaml")
+    result = _run(conn, Ports(declare_after=1), scenario=spec, scenario_id="A3-KRB5")
+    assert result["scenario"] == {"id": "A3-KRB5", "aliases": spec.run_view()["aliases"],
+                                  "spec_hash": spec.spec_hash}
+    assert "analysis" not in json.dumps(result)
+
+
+def test_a_scenario_id_that_disagrees_with_the_spec_is_rejected(conn):
+    import scenario_spec
+    spec = scenario_spec.load(HERE / "scenarios" / "A3-KRB5.yaml")
+    with pytest.raises(ValueError, match="scenario_id"):
+        _run(conn, Ports(declare_after=1), scenario=spec, scenario_id="N1")
+
+
+def test_samples_accumulate_only_after_the_declaration(conn):
+    ports = Ports(declare_after=2, step=100.0)
+    result = _run(conn, ports, horizon_sec=500, sample_every=2)
+    samples = result["independent_verdict"]["samples"]
+    # 1100, 1200(선언), 1300, 1400(표본), 1500
+    assert [s["at"] for s in samples] == [1400.0]
+    assert all(s["at"] > result["timestamps"]["declared"] for s in samples)
+    assert samples[0]["verdict"]["verdict"] == evaluator.PASS
+
+
+def test_no_samples_without_a_declaration(conn):
+    result = _run(conn, Ports(declare_after=None, step=100.0), sample_every=1)
+    assert result["independent_verdict"]["samples"] == []
+
+
+def test_snapshot_is_taken_before_open_and_after_close(conn):
+    seen = []
+
+    def snapshot():
+        row = _row(conn, "trial-0001") if seen else None
+        seen.append(row)
+        return {"pods": [len(seen)]}
+
+    result = _run(conn, Ports(declare_after=1), snapshot=snapshot)
+    assert seen[0] is None                  # open_trial 전이라 manifest 행이 없다
+    assert seen[1]["ended_at"]              # close_trial 뒤다
+    assert result["snapshots"] == {"before": {"pods": [1]}, "after": {"pods": [2]}}
+
+
+def test_a_failing_snapshot_is_written_into_its_field_and_the_trial_finishes(conn):
+    def snapshot():
+        raise ConnectionError("kube api down")
+
+    ports = Ports(declare_after=1)
+    result = _run(conn, ports, snapshot=snapshot)
+    err = {"error": "ConnectionError", "message": "kube api down"}
+    assert result["snapshots"] == {"before": err, "after": err}
+    assert ports.saved == [result]
+    assert result["independent_verdict"]["at_horizon"] is not None
+
+
+def test_protection_is_judged_before_and_after(conn):
+    bystander = {"username": "exp-bystander", "expected": {"home_suffix": "/exp-bystander"}}
+    result = _run(conn, Ports(declare_after=1), bystanders=[bystander])
+    for when in ("before", "after"):
+        assert result["protection"][when]["protection_verdict"] == evaluator.PASS
+        assert "exp-bystander" in result["protection"][when]["bystanders"]
+
+
+def test_a_failing_protection_is_written_into_its_field_and_the_trial_finishes(conn, monkeypatch):
+    def broken(collect, *, bystanders):
+        raise RuntimeError("bystander lookup failed")
+
+    monkeypatch.setattr(evaluator, "evaluate_protection", broken)
+    ports = Ports(declare_after=1)
+    result = _run(conn, ports, bystanders=[{"username": "b"}])
+    err = {"error": "RuntimeError", "message": "bystander lookup failed"}
+    assert result["protection"] == {"before": err, "after": err}
+    assert ports.saved == [result]

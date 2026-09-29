@@ -40,13 +40,29 @@ def _revoke(e, rid, pod_name):
     assert e2e.result(e, "revoke", rid)["phase"] == "SUCCESS", e2e.rows(e, rid)
 
 
-def test_normal_creation_is_pass(env):
-    """정상 fixture: 생성을 끝낸 자원을 읽으면 다섯 검사가 전부 PASS 다."""
+def _target():
+    return {"username": USER, "expected": {"home_suffix": f"/{USER}", "uid": None}}
+
+
+def _results(out):
+    return {name: d["result"] for name, d in out["domains"].items()}
+
+
+def test_normal_creation_is_pass_except_gpu(env):
+    """정상 fixture: 생성을 끝낸 자원을 읽으면 GPU 를 뺀 검사와 필수 관계가 전부 PASS 다.
+
+    v2 에서 기대가 바뀌었다. 가상 계층에는 GPU 실체가 없어서 compute_gpu 가 UNKNOWN 이고, PASS
+    를 지어내지 않으므로 판정 전체도 UNKNOWN 이다 (virtual_probe 첫머리 주석).
+    """
     e = env
     _provision(e, "901")
-    out = evaluator.evaluate_creation(virtual_collector(e), username=USER)
-    assert out["verdict"] == evaluator.PASS, out
-    assert set(out["checks"].values()) == {evaluator.PASS}
+    out = evaluator.evaluate_creation(virtual_collector(e), target=_target())
+    assert out["verdict"] == evaluator.UNKNOWN, out
+    results = _results(out)
+    assert results.pop("compute_gpu") == evaluator.UNKNOWN
+    assert set(results.values()) == {evaluator.PASS}, out
+    for name in evaluator.REQUIRED_RELATIONS:
+        assert out["relations"][name]["result"] == evaluator.PASS, out
 
 
 def test_revoked_reclamation_is_pass(env):
@@ -54,9 +70,9 @@ def test_revoked_reclamation_is_pass(env):
     e = env
     pod_name = _provision(e, "902")
     _revoke(e, "902", pod_name)
-    out = evaluator.evaluate_reclamation(virtual_collector(e), username=USER)
+    out = evaluator.evaluate_reclamation(virtual_collector(e), target=_target())
     assert out["verdict"] == evaluator.PASS, out
-    assert set(out["checks"].values()) == {evaluator.PASS}
+    assert set(_results(out).values()) == {evaluator.PASS}
 
 
 def test_mismatch_between_declaration_and_access_is_fail(env):
@@ -65,10 +81,10 @@ def test_mismatch_between_declaration_and_access_is_fail(env):
     pod_name = _provision(e, "904")
     del e.v1.pods[pod_name]
 
-    out = evaluator.evaluate_creation(virtual_collector(e), username=USER)
+    out = evaluator.evaluate_creation(virtual_collector(e), target=_target())
     assert out["verdict"] == evaluator.FAIL, out
-    assert out["checks"]["container_identity"] == evaluator.FAIL
-    assert out["checks"]["storage_access"] == evaluator.FAIL
+    assert out["domains"]["compute_uid"]["result"] == evaluator.FAIL
+    assert out["domains"]["compute_nfs"]["result"] == evaluator.FAIL
     # 같은 시점에 대상 시스템은 여전히 성공을 선언하고 있다. 두 값이 어긋난 것이 이 실험의 대상이다.
     assert e2e.result(e, "provision", "904")["phase"] == "SUCCESS"
 
@@ -77,11 +93,13 @@ def test_collector_failure_is_unknown_not_fail(env):
     """평가자 고장: 자원이 정상인데도 못 물어봤으면 없는 위반을 만들지 않고 UNKNOWN 이다."""
     e = env
     _provision(e, "905")
-    assert evaluator.evaluate_creation(virtual_collector(e), username=USER)["verdict"] == evaluator.PASS
+    before = evaluator.evaluate_creation(virtual_collector(e), target=_target())
+    assert evaluator.FAIL not in _results(before).values()
 
     e.v1 = _Unreachable()
-    out = evaluator.evaluate_creation(virtual_collector(e), username=USER)
+    out = evaluator.evaluate_creation(virtual_collector(e), target=_target())
     assert out["verdict"] == evaluator.UNKNOWN, out
-    assert out["checks"]["container_identity"] == evaluator.UNKNOWN
-    assert out["evidence"]["container_identity"]["collector_error"] == "TimeoutError"
-    assert evaluator.FAIL not in out["checks"].values()
+    assert out["domains"]["compute_uid"]["result"] == evaluator.UNKNOWN
+    assert out["domains"]["compute_uid"]["evidence"]["collector_error"] == "TimeoutError"
+    assert evaluator.FAIL not in _results(out).values()
+

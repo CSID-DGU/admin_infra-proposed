@@ -1,0 +1,17 @@
+scenario_id: N2
+aliases: [C02]
+group: N
+operation: {type: reclamation, pair_role: revoke}
+applies_to: [baseline, noprobe, full]
+injection:
+  kind: none
+  boundary: null
+  step: null
+  action: none
+  occurrence: 0
+  verify: none
+analysis:
+  recoverable: false
+  expected_ground_truth: {final_state: REVOKED, residual_access: false}
+  forbidden_behavior: [premature_revoked]
+  metrics: [incorrect_completion, residual_access]
