@@ -1,4 +1,4 @@
-"""장애 주입 훅(C06, C08, C12)을 가상 계층에서 실제 단계 함수와 재시도 엔진으로 돌려 본다.
+"""장애 주입 훅(X4 response_loss=C06, X6 sigkill_before_journal=C08, X2 fail_persistent=C12)을 가상 계층에서 실제 단계 함수와 재시도 엔진으로 돌려 본다.
 장전 표는 가상 E2E 의 sqlite 에 함께 세우고, fault_injection 이 그 연결을 쓰게 한다."""
 import pytest
 
@@ -43,6 +43,7 @@ def faults(env, lease_env, monkeypatch):
     e = env
     e.db.execute(fault_arming_ddl())
     e.arming_connects = 0
+    monkeypatch.setattr(fault_injection, "_seen", {})
 
     def connect(**kw):
         e.arming_connects += 1
@@ -56,14 +57,19 @@ def faults(env, lease_env, monkeypatch):
     return e
 
 
+# 옛 시나리오 ID -> (boundary, action)
+POINTS = {"C06": ("X4", "response_loss"), "C08": ("X6", "sigkill_before_journal"), "C12": ("X2", "fail_persistent")}
+
+
 def arm(e, username, step, scenario):
-    e.db.execute("INSERT INTO fault_arming (username, step_name, scenario) VALUES (?,?,?)",
-                 (username, step, scenario))
+    e.db.execute("INSERT INTO fault_arming (username, boundary, step_name, action) VALUES (?,?,?,?)",
+                 (username, POINTS[scenario][0], step, POINTS[scenario][1]))
     e.db.commit()
 
 
 def fired_at(e, scenario):
-    return e.db.execute("SELECT fired_at FROM fault_arming WHERE scenario=?", (scenario,)).fetchone()[0]
+    return e.db.execute("SELECT fired_at FROM fault_arming WHERE boundary=? AND action=?",
+                        POINTS[scenario]).fetchone()[0]
 
 
 def provision(e, rid, username):
@@ -158,4 +164,4 @@ def test_c12_keeps_principal_after_pod_and_account_are_gone(faults):
     assert res["phase"] == "FAIL", rows(e, "1012")
     detail = e.db.execute("SELECT error_detail FROM operation_log WHERE request_id='1012'"
                           " AND action='REVOKE' AND phase='FAIL'").fetchone()[0]
-    assert "RETRIES_EXHAUSTED" in detail and "fault C12" in detail
+    assert "RETRIES_EXHAUSTED" in detail and "fault X2 fail_persistent" in detail

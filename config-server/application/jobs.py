@@ -217,13 +217,13 @@ def _execute_step(step, ctx, kind, request_id, username):
                 _main.app.logger.warning(f"[JOB] {name} 사전 정리 실패 — 단계는 계속", exc_info=True)
         token, step_token = current_attempt.set(attempt), current_step.set(name)
         try:
-            if (c12 := fault_injection.armed(username, name, "C12")) is not None:  # C12: 효과 없이 계속 실패
-                if c12["fired_at"] is None:
-                    fault_injection.mark_fired(c12["id"])
-                raise RuntimeError("fault C12")
+            if (x2 := fault_injection.armed(username, name, "X2", "fail_persistent")) is not None:  # 효과 없이 계속 실패
+                if x2["fired_at"] is None:
+                    fault_injection.mark_fired(x2["id"])
+                raise RuntimeError("fault X2 fail_persistent")
             step(ctx)
-            if (c06 := fault_injection.armed(username, name, "C06")) and fault_injection.mark_fired(c06["id"]):
-                raise RuntimeError("fault C06") from ReadTimeout("fault C06")  # C06: 효과는 적용, 응답만 유실
+            if (x4 := fault_injection.armed(username, name, "X4", "response_loss")) and fault_injection.mark_fired(x4["id"]):
+                raise RuntimeError("fault X4 response_loss") from ReadTimeout("fault X4 response_loss")  # 효과는 적용, 응답만 유실
             return
         except LeaseLost:
             raise  # 단계 안의 체크포인트가 소유권을 잃었다 — 재시도하지 않고 새 소유자에게 넘긴다

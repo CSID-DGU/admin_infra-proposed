@@ -11,14 +11,15 @@ fault 칸은 장애를 걸었다는 사실이지 접근 가능성의 판정이 �
 sqlite 흉내를 똑같이 받는다.
 """
 
-# 시나리오 -> (그 장애를 거는 trial 의 operation, config-server application/jobs.py 의 단계 함수 이름)
+# 시나리오 -> (그 장애를 거는 trial 의 operation, config-server application/jobs.py 의 단계 함수 이름,
+#             장전 표의 boundary, action)
 SCENARIOS = {
-    "C06": ("CREATE", "step_create_krb5_principal"),
-    "C08": ("CREATE", "step_create_krb5_principal"),
-    "C12": ("REVOKE", "step_remove_krb5"),
+    "C06": ("CREATE", "step_create_krb5_principal", "X4", "response_loss"),
+    "C08": ("CREATE", "step_create_krb5_principal", "X6", "sigkill_before_journal"),
+    "C12": ("REVOKE", "step_remove_krb5", "X2", "fail_persistent"),
 }
 
-_WHERE = " WHERE username = %s AND step_name = %s AND scenario = %s"
+_WHERE = " WHERE username = %s AND step_name = %s AND boundary = %s AND action = %s"
 
 
 class Fault:
@@ -28,17 +29,17 @@ class Fault:
         self.conn = conn
         self.scenario = scenario
         self.username = username
-        self.operation, self.step_name = SCENARIOS[scenario]
+        self.operation, self.step_name, self.boundary, self.action = SCENARIOS[scenario]
 
     def _execute(self, sql, fetch=False):
         with self.conn.cursor() as cur:
-            cur.execute(sql, (self.username, self.step_name, self.scenario))
+            cur.execute(sql, (self.username, self.step_name, self.boundary, self.action))
             row = cur.fetchone() if fetch else None
         self.conn.commit()
         return row
 
     def arm(self):
-        self._execute("INSERT INTO fault_arming (username, step_name, scenario) VALUES (%s, %s, %s)")
+        self._execute("INSERT INTO fault_arming (username, step_name, boundary, action) VALUES (%s, %s, %s, %s)")
 
     def report(self):
         """장전 행을 읽어 {"scenario", "step_name", "armed_at", "fired_at"} 로 돌려주고 행을 지운다.

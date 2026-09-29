@@ -22,12 +22,12 @@ def _fault(db, scenario="C12"):
 
 
 def _rows(db):
-    return db.execute("SELECT username, step_name, scenario, fired_at FROM fault_arming").fetchall()
+    return db.execute("SELECT username, step_name, boundary, action, fired_at FROM fault_arming").fetchall()
 
 
 def test_arm_inserts_the_scenario_row(db):
     _fault(db).arm()
-    assert _rows(db) == [("exp-fu-m1", "step_remove_krb5", "C12", None)]
+    assert _rows(db) == [("exp-fu-m1", "step_remove_krb5", "X2", "fail_persistent", None)]
 
 
 def test_report_without_firing_reads_none_and_deletes_the_row(db):
@@ -61,7 +61,7 @@ def test_other_users_rows_are_left_alone(db):
     f = _fault(db)
     f.arm()
     f.report()
-    assert _rows(db) == [("exp-fu-m2", "step_remove_krb5", "C12", None)]
+    assert _rows(db) == [("exp-fu-m2", "step_remove_krb5", "X2", "fail_persistent", None)]
 
 
 def test_an_unknown_scenario_is_rejected(db):
