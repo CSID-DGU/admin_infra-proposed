@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fault_injector  # noqa: E402
 import inventory  # noqa: E402
 import measure_ports  # noqa: E402
+import real_collector  # noqa: E402
+import resetter  # noqa: E402
 import stack_lock  # noqa: E402
 import system  # noqa: E402
 import trial_results  # noqa: E402
@@ -94,12 +96,32 @@ def revisions(host, stack):
     return found
 
 
+def _start_bystander(args, ports, name):
+    """방관자 신청을 보내고 FULFILLED 까지 기다린다. (신청 번호 또는 None, FULFILLED 여부)."""
+    try:
+        request_id = ports["create_submit"]()
+    except measure_ports.MeasureStepFailed as e:
+        _say(f"bystander={name} 신청이 거절됐다. 방관자 없이 진행한다: {e}")
+        return None, False
+    started = time.monotonic()
+    while time.monotonic() - started < args.horizon:
+        time.sleep(args.poll)
+        if ports["create_declaration"]():
+            _say(f"bystander={name} request={request_id} FULFILLED")
+            return request_id, True
+    _say(f"bystander={name} request={request_id} 가 {args.horizon}초 안에 FULFILLED 가 되지 않았다."
+         " 방관자 없이 진행한다")
+    return request_id, False
+
+
 def cmd_pair(args, cfg):
     out = _out_dir(args.out, args.stack)
     host, ns, prefix = cfg["KUBE_HOST"], _namespace(args.stack), STACKS[args.stack]
     # 사용자 이름이 AD sAMAccountName 20자 제한 안에 들도록 run_id 를 짧게 둔다.
     run_id = secrets.token_hex(3)
     users, files = [], []
+    # 테스트 사용자 비밀번호. run 동안 메모리에만 둔다.
+    passwords = {}
     try:
         with stack_lock.hold(host, ns, owner="measure", run_id=run_id, now=_now_kst().isoformat()):
             _say(f"{args.stack} run={run_id} 잠금을 잡았다")
@@ -113,54 +135,81 @@ def cmd_pair(args, cfg):
             admin_id = measure_ports.create_user(
                 web, username=None, email=f"m{run_id}-admin@example.com",
                 password=secrets.token_urlsafe(24), role="ADMIN")
-            for rep in range(1, args.reps + 1):
-                username = f"{prefix}m{run_id}{rep:02d}"
-                password = secrets.token_urlsafe(24)
-                users.append(username)
-                user_id = measure_ports.create_user(
-                    web, username=username, email=f"{username}@example.com", password=password, role="USER")
-                base = f"{args.stack}-{run_id}-{rep:02d}"
-                _say(base, f"user={username} 를 만들었다")
-                expires = (_now_kst() + dt.timedelta(days=EXPIRES_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
-                ports = measure_ports.real_ports(
-                    be=be, web_sql=web, user_id=user_id, admin_id=admin_id, prefix=prefix, username=username,
-                    expires_at=expires,
-                    sleep=time.sleep, clock=time.monotonic, poll_sec=args.poll)
-                submit = ports["create_submit"]
+            collector = real_collector.RealCollector(host, ns, password_of=passwords.__getitem__,
+                                                     clock=time.monotonic)
+            expires = (_now_kst() + dt.timedelta(days=EXPIRES_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+            # 방관자는 run 에 한 명이다. trial 마다 새로 만들면 전후 비교가 되지 않는다.
+            bystander = f"{prefix}m{run_id}b"
+            passwords[bystander] = secrets.token_urlsafe(24)
+            users.append(bystander)
+            bystander_id = measure_ports.create_user(
+                web, username=bystander, email=f"{bystander}@example.com", password=passwords[bystander],
+                role="USER")
+            bystander_ports = measure_ports.real_ports(
+                be=be, web_sql=web, user_id=bystander_id, admin_id=admin_id, prefix=prefix,
+                username=bystander, expires_at=expires, sleep=time.sleep, clock=time.monotonic,
+                poll_sec=args.poll)
+            bystander_request, fulfilled = _start_bystander(args, bystander_ports, bystander)
+            bystanders = ([{"username": bystander, "expected": {"home_suffix": f"/{bystander}", "uid": None}}]
+                          if fulfilled else None)
+            try:
+                for rep in range(1, args.reps + 1):
+                    username = f"{prefix}m{run_id}{rep:02d}"
+                    password = secrets.token_urlsafe(24)
+                    users.append(username)
+                    passwords[username] = password
+                    user_id = measure_ports.create_user(
+                        web, username=username, email=f"{username}@example.com", password=password, role="USER")
+                    base = f"{args.stack}-{run_id}-{rep:02d}"
+                    _say(base, f"user={username} 를 만들었다")
+                    ports = measure_ports.real_ports(
+                        be=be, web_sql=web, user_id=user_id, admin_id=admin_id, prefix=prefix, username=username,
+                        expires_at=expires,
+                        sleep=time.sleep, clock=time.monotonic, poll_sec=args.poll, collect=collector)
+                    # 방관자 자원은 run 내내 있어야 하므로 잔재가 아니다.
+                    ports["environment"] = resetter.environment_for(host, ns, prefix, username=username,
+                                                                    also_exclude=(bystander,))
+                    submit = ports["create_submit"]
 
-                def create_submit(submit=submit, base=base):
-                    request_id = submit()
-                    _say(f"{base}-c", f"request={request_id} 신청과 승인을 보냈다")
-                    return request_id
+                    def create_submit(submit=submit, base=base):
+                        request_id = submit()
+                        _say(f"{base}-c", f"request={request_id} 신청과 승인을 보냈다")
+                        return request_id
 
-                ports["create_submit"] = create_submit
-                save = functools.partial(trial_results.save, out, secrets=[password, jwt["value"]])
+                    ports["create_submit"] = create_submit
+                    save = functools.partial(trial_results.save, out,
+                                             secrets=[password, passwords[bystander], jwt["value"]])
 
-                def save_and_say(record, save=save):
-                    files.append(save(record))
-                    _say(record["trial_id"], f"request={record['request_id']}",
-                         f"declaration={record['system_declaration']['value']}",
-                         f"verdict={record['independent_verdict']['at_horizon']['verdict']}")
+                    def save_and_say(record, save=save):
+                        files.append(save(record))
+                        _say(record["trial_id"], f"request={record['request_id']}",
+                             f"declaration={record['system_declaration']['value']}",
+                             f"verdict={record['independent_verdict']['at_horizon']['verdict']}")
 
-                faults = {}
-                if args.scenario:
-                    # 장애는 시나리오의 operation 에 맞는 trial 에만 건다. 짝의 다른 trial 은 장애 없이 돈다.
-                    kind = "create" if fault_injector.SCENARIOS[args.scenario][0] == "CREATE" else "revoke"
-                    faults = {f"{kind}_scenario_id": args.scenario,
-                              f"{kind}_fault": fault_injector.Fault(journal, scenario=args.scenario,
-                                                                     username=username)}
+                    faults = {}
+                    if args.scenario:
+                        # 장애는 시나리오의 operation 에 맞는 trial 에만 건다. 짝의 다른 trial 은 장애 없이 돈다.
+                        kind = "create" if fault_injector.SCENARIOS[args.scenario][0] == "CREATE" else "revoke"
+                        faults = {f"{kind}_scenario_id": args.scenario,
+                                  f"{kind}_fault": fault_injector.Fault(journal, scenario=args.scenario,
+                                                                         username=username)}
 
-                trial_runner.run_pair(
-                    journal, create_trial_id=f"{base}-c", revoke_trial_id=f"{base}-r",
-                    method=args.stack, server_group=SERVER_GROUP, horizon_sec=args.horizon,
-                    repetition=rep, revisions=revs, username=username, save=save_and_say,
-                    **faults, **ports)
-                # 기록은 이미 저장했다. 여기서는 남은 것을 보여 주기만 한다.
-                inv = inventory.collect_inventory(host, ns, prefix)
-                left = inv["by_user"].get(username, {})
-                _say(base, f"user={username} 짝 실행 뒤 남은 자원:",
-                     json.dumps(left, ensure_ascii=False) if left else "없음",
-                     f"조회 실패={sorted(inv['errors'])}" if inv["errors"] else "")
+                    trial_runner.run_pair(
+                        journal, create_trial_id=f"{base}-c", revoke_trial_id=f"{base}-r",
+                        method=args.stack, server_group=SERVER_GROUP, horizon_sec=args.horizon,
+                        repetition=rep, revisions=revs, username=username, save=save_and_say,
+                        snapshot=lambda: inventory.collect_inventory(host, ns, prefix), bystanders=bystanders,
+                        **faults, **ports)
+                    # 기록은 이미 저장했다. 여기서는 남은 것을 보여 주기만 한다.
+                    inv = inventory.collect_inventory(host, ns, prefix)
+                    left = inv["by_user"].get(username, {})
+                    _say(base, f"user={username} 짝 실행 뒤 남은 자원:",
+                         json.dumps(left, ensure_ascii=False) if left else "없음",
+                         f"조회 실패={sorted(inv['errors'])}" if inv["errors"] else "")
+            finally:
+                if bystander_request is not None:
+                    bystander_ports["revoke_submit"](bystander_request)
+                    _say(f"bystander={bystander} request={bystander_request} 회수를 보냈다")
     except stack_lock.LockError as e:
         print(f"잠금 문제로 멈췄다: {e}", file=sys.stderr)
         print(f"남은 잠금이면: python3 harness/measure.py release --stack {args.stack} --force", file=sys.stderr)

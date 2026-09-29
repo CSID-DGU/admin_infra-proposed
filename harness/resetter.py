@@ -13,13 +13,17 @@ CLEAN, DIRTY, UNKNOWN = "CLEAN", "DIRTY", "UNKNOWN"
 UNCHECKED = ("ledger", "nas_home", "ad", "farm_keytab", "shared_group")
 
 
-def environment_for(host, namespace, prefix, *, username):
-    """trial_runner 의 environment 포트. 부를 때마다 목록을 새로 모아 (verdict, evidence) 를 돌려준다."""
+def environment_for(host, namespace, prefix, *, username, also_exclude=()):
+    """trial_runner 의 environment 포트. 부를 때마다 목록을 새로 모아 (verdict, evidence) 를 돌려준다.
+
+    also_exclude 는 잔재로 세지 않을 다른 사용자다. run 내내 살아 있는 방관자가 여기에 들어간다.
+    """
+    own = {username, *also_exclude}
 
     def environment():
         inv = inventory.collect_inventory(host, namespace, prefix)
         residue = [{"user": user, "kind": kind, "name": name}
-                   for user, kinds in sorted(inv["by_user"].items()) if user != username
+                   for user, kinds in sorted(inv["by_user"].items()) if user not in own
                    for kind, names in sorted(kinds.items()) for name in names]
         evidence = {"username": username, "residue": residue, "e2e_users": inv["e2e_users"],
                     "errors": inv["errors"], "unchecked": list(UNCHECKED)}

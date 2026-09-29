@@ -213,7 +213,7 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
              create_scenario_id=None, revoke_scenario_id=None,
              create_fault=None, revoke_fault=None,
              create_submit, create_declaration, revoke_submit, revoke_declaration,
-             advance, collect, clock, environment, save):
+             advance, collect, clock, environment, save, snapshot=None, bystanders=None):
     """생성 trial 에 이어서 같은 신청으로 회수 trial 을 돌리고 (생성 기록, 회수 기록) 을 돌려준다.
 
     근거는 docs/domains/experiment-records.md 의 "회수 trial 은 생성 trial 에 바로 이어 붙입니다 (R2)".
@@ -229,7 +229,7 @@ def run_pair(conn, *, create_trial_id, revoke_trial_id, method, server_group,
     common = dict(method=method, server_group=server_group, horizon_sec=horizon_sec,
                   repetition=repetition, revisions=revisions, username=username,
                   advance=advance, collect=collect, clock=clock, save=save,
-                  environment=environment)
+                  environment=environment, snapshot=snapshot, bystanders=bystanders)
 
     created = run_trial(conn, trial_id=create_trial_id, operation="CREATE",
                         scenario_id=create_scenario_id, fault=create_fault, submit=create_submit,

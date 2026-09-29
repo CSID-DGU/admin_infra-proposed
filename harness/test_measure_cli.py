@@ -20,6 +20,7 @@ class FakeCluster(FakeStack):
         self.lock = None
         self.kube_calls = []
         self.log_lines = ""
+        self.pods = ""
 
     def sql(self, host, namespace, database, statement):
         if statement.startswith("SELECT u.ubuntu_username"):
@@ -49,6 +50,8 @@ class FakeCluster(FakeStack):
             items = [{"metadata": {"name": n}, "spec": {"template": {"spec": {"containers": [{"image": f"{n}:1"}]}}}}
                      for n in args[2:5]]
             return {**ok, "stdout": json.dumps({"items": items})}
+        if args[:2] == ["get", "pods"]:
+            return {**ok, "stdout": self.pods}
         if args[0] == "logs":
             return {**ok, "stdout": self.log_lines}
         return ok
@@ -158,3 +161,72 @@ def test_release_other_run_refused(cluster):
     assert measure.main(["release", "--stack", "full", "--force"]) == 0
     assert cluster.lock is None
 
+
+
+BYSTANDER = "exp-fu-mabcb"
+
+
+def _records(tmp_path):
+    return [json.loads(f.read_text()) for f in sorted((tmp_path / "out").glob("*.json"))]
+
+
+def test_bystander_created_and_revoked_once_and_in_every_trial(cluster, tmp_path):
+    assert _pair(tmp_path, "--reps", "2") == 0
+    inserts = [s for _, s in cluster.statements if s.startswith("INSERT INTO users") and BYSTANDER in s]
+    assert len(inserts) == 1
+    calls = [(m, p) for m, p, _, _ in cluster.http]
+    # 방관자 1 + trial 사용자 2. 방관자 신청이 맨 앞, 방관자 회수가 맨 뒤다.
+    assert calls.count(("POST", "/api/requests")) == 3 and calls[0] == ("POST", "/api/requests")
+    deletes = [c for c in calls if c[0] == "DELETE"]
+    assert len(deletes) == 3 and calls[-1] == deletes[-1]
+    records = _records(tmp_path)
+    assert len(records) == 4
+    for r in records:
+        assert list(r["protection"]["before"]["bystanders"]) == [BYSTANDER]
+        assert list(r["protection"]["after"]["bystanders"]) == [BYSTANDER]
+        assert set(r["snapshots"]) == {"before", "after"}
+
+
+def test_bystander_not_fulfilled_runs_without_protection(cluster, tmp_path, monkeypatch, capsys):
+    real_sql = cluster.sql
+    held = [True]
+
+    def sql(host, namespace, database, statement):
+        if statement.startswith("INSERT INTO users") and "exp-fu-mabc01" in statement:
+            held[0] = False
+        if held[0] and statement.startswith("SELECT status FROM requests"):
+            return cluster._rows(["status"], [["PENDING"]])
+        return real_sql(host, namespace, database, statement)
+
+    monkeypatch.setattr(system, "stack_sql", sql)
+    assert _pair(tmp_path) == 0
+    records = _records(tmp_path)
+    assert len(records) == 2 and all(r["protection"] is None for r in records)
+    assert "FULFILLED 가 되지 않았다" in capsys.readouterr().out
+    # 신청은 나갔으므로 회수도 보낸다.
+    assert sum(1 for m, *_ in cluster.http if m == "DELETE") == 2
+
+
+def test_bystander_password_never_printed_or_saved(cluster, tmp_path, monkeypatch, capsys):
+    issued = []
+
+    def token(n):
+        issued.append(f"Pw-distinct-{len(issued):02d}-0123456789")
+        return issued[-1]
+
+    monkeypatch.setattr(measure.secrets, "token_urlsafe", token)
+    assert _pair(tmp_path) == 0
+    captured = capsys.readouterr()
+    texts = [captured.out, captured.err] + [f.read_text() for f in (tmp_path / "out").glob("*.json")]
+    assert len(issued) == 3  # 관리자, 방관자, trial 사용자
+    for pw in issued:
+        assert all(pw not in t for t in texts)
+
+
+def test_bystander_resources_are_not_residue(cluster, tmp_path):
+    cluster.pods = f"ailab-{BYSTANDER}-1234abcd {BYSTANDER}\n"
+    assert _pair(tmp_path) == 0
+    for r in _records(tmp_path):
+        assert r["environment"]["evidence"]["residue"] == []
+        assert r["environment"]["verdict"] != "DIRTY"
+        assert BYSTANDER in r["snapshots"]["before"]["by_user"]
