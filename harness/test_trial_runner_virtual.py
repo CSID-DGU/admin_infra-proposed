@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluator  # noqa: E402
 import fault_injector  # noqa: E402
+import scenario_spec  # noqa: E402
 import test_trial  # noqa: E402
 import trial  # noqa: E402
 import trial_results  # noqa: E402
@@ -29,6 +30,7 @@ from virtual_probe import virtual_collector  # noqa: E402
 
 e2e = sys.modules["cs_e2e"]
 
+HERE = Path(__file__).resolve().parent
 HORIZON_SEC = 600.0
 STEP_SEC = 200.0  # 한 걸음이 미는 초. 관측 구간이 세 걸음 만에 끝난다.
 
@@ -101,13 +103,13 @@ def _revoke_ports(e, request_id, pod_name):
                               "pod_name": pod_name, "delete_account": True})
 
 
-def _run(conn, ports, *, trial_id, operation, save=None, fault=None):
+def _run(conn, ports, *, trial_id, operation, save=None, injector=None, method="full"):
     return trial_runner.run_trial(
-        conn, trial_id=trial_id, method="full", server_group="A", operation=operation,
+        conn, trial_id=trial_id, method=method, server_group="A", operation=operation,
         horizon_sec=HORIZON_SEC, repetition=1, revisions={"config-server": "virtual"},
         username=USER, submit=ports.submit, advance=ports.advance,
         declaration=ports.declaration, collect=ports.collect, clock=ports.clock,
-        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}), fault=fault)
+        save=save or ports.save, environment=lambda: (trial_runner.CLEAN, {}), injector=injector)
 
 
 # 흐름 시험은 가상 GPU 가 쓸 수 있다고 정한 세계(VirtualPorts 의 gpu_usable=True)에서 돈다.
@@ -228,31 +230,93 @@ def armed(conn, env, monkeypatch):
     from adapters import fault_injection
     from test_fault_injection import Sql as ArmingSql  # 훅이 쓰는 rowcount 와 close 까지 흉내 낸다
     monkeypatch.setattr(fault_injection, "get_log_db_connection", lambda **kw: ArmingSql(env.db))
+    monkeypatch.setattr(fault_injection, "_seen", {})  # 발동 횟수는 행 id 로 세므로 시험마다 비운다
     monkeypatch.setenv("FAULT_INJECTION", "1")
     return conn
 
 
-def test_c06_creation_trial_records_the_fired_fault(armed, env, monkeypatch):
-    """C06: 효과는 적용되고 응답만 사라져도 관찰기가 확인해서 선언은 SUCCESS 이고, 발동 시각이 기록에 남는다."""
-    main = sys.modules["main"]
+def _injector(conn, scenario_id):
+    view = scenario_spec.load(HERE / "scenarios" / f"{scenario_id}.yaml").run_view()
+    return fault_injector.from_spec(view, username=USER, journal=conn)
 
+
+METHODS = ("baseline", "noprobe", "full")
+
+
+def _method(env, monkeypatch, method):
+    """대상 시스템을 그 비교군으로 돌린다. full 은 가상 계층의 접근 시험 대역까지 건다."""
+    if method == "full":
+        getattr(e2e.full, "__wrapped__", e2e.full)(env, monkeypatch)
+    else:
+        monkeypatch.setattr(sys.modules["main"], "VERIFY_MODE", method)
+
+
+def _keytab_secret_too(env, monkeypatch):
+    """principal 생성 대역이 keytab Secret 도 남겨야 관찰기가 효과를 확인할 수 있다."""
     def create(name, uid, gid):
-        # principal 생성 대역이 keytab Secret 도 남겨야 관찰기가 효과를 확인할 수 있다.
         env.calls.append(("krb5_principal", (name,)))
         env.v1.secrets[f"krb5-keytab-{name}"] = {"data": {}, "owners": []}
-    monkeypatch.setattr(main, "_create_krb5_principal_and_secret", create)
+    monkeypatch.setattr(sys.modules["main"], "_create_krb5_principal_and_secret", create)
 
-    fault = fault_injector.Fault(armed, scenario="C06", username=USER)
-    out = _run(armed, _create_ports(env, "820"), trial_id="trial-c06", operation="CREATE", fault=fault)
 
-    assert out["fault"]["scenario"] == "C06"
-    assert out["fault"]["fired_at"] is not None
-    assert out["system_declaration"]["value"] == "SUCCESS"
+@pytest.mark.parametrize("method", METHODS)
+def test_a3_injection_is_verified_in_every_method(armed, env, monkeypatch, method):
+    """A3-KRB5(C06): 효과가 적용된 뒤 응답을 잃었다는 사실은 비교군의 반응과 무관하게 성립한다."""
+    _method(env, monkeypatch, method)
+    _keytab_secret_too(env, monkeypatch)
+
+    out = _run(armed, _create_ports(env, "820"), trial_id=f"trial-a3-{method}", operation="CREATE",
+               injector=_injector(armed, "A3-KRB5"), method=method)
+
+    assert out["injection"]["boundary"] == "X4" and out["injection"]["fired_at"] is not None
+    assert out["injection"]["verified"] is True, out["injection"]
+    assert out["injection"]["invalid_reason"] is None
     assert env.db.execute("SELECT COUNT(*) FROM fault_arming").fetchone()[0] == 0
 
 
-def test_c12_pair_records_the_fault_on_the_revoke_trial(armed, env):
-    """C12: 짝 실행에서 장애는 회수 trial 에만 걸리고, 회수 기록에 발동 시각이 남는다."""
+class Killed(BaseException):
+    """os._exit 대역. except Exception 에 잡히지 않아야 실제 kill 처럼 제어기를 빠져나간다."""
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_b4_injection_is_verified_in_every_method(armed, env, lease, monkeypatch, method):
+    """B4-KRB5(C08): 저널에 기록하기 전에 끊었다는 사실은 재시작 뒤에 이어 하는지와 무관하게 성립한다."""
+    main = sys.modules["main"]
+    from adapters import fault_injection, operation_log
+    from test_fault_hooks import _NullConn
+    _method(env, monkeypatch, method)
+    # X6 훅은 실제 log_operation 안에 있다. 그것을 먼저 부른 뒤 가상 계층의 기록기로 행을 남긴다.
+    fake = main.log_operation
+    monkeypatch.setattr(operation_log, "get_log_db_connection", lambda **kw: _NullConn())
+    monkeypatch.setattr(main, "log_operation", lambda **kw: (operation_log.log_operation(**kw), fake(**kw))[1])
+
+    def kill():
+        raise Killed()
+    monkeypatch.setattr(fault_injection, "kill_process", kill)
+
+    ports = _create_ports(env, "822")
+    step = ports.advance
+
+    def advance():
+        # 제어기가 죽으면 그 걸음을 끝내고, 죽은 제어기의 lease 를 만료시켜 다음 걸음이 재시작이 되게 한다.
+        try:
+            step()
+        except Killed:
+            for row in lease.values():
+                row.update(owner="dead-controller", alive=False)
+            ports.now += STEP_SEC
+    ports.advance = advance
+
+    out = _run(armed, ports, trial_id=f"trial-b4-{method}", operation="CREATE",
+               injector=_injector(armed, "B4-KRB5"), method=method)
+
+    assert out["injection"]["boundary"] == "X6" and out["injection"]["fired_at"] is not None
+    assert out["injection"]["verified"] is True, out["injection"]
+    assert out["injection"]["invalid_reason"] is None
+
+
+def test_c3_pair_records_the_injection_on_the_revoke_trial(armed, env):
+    """C3-KRB5(C12): 짝 실행에서 장애는 회수 trial 에만 걸리고, 회수 기록에 확인된 주입이 남는다."""
     create = _create_ports(env, "821")
     revoke = None
 
@@ -265,15 +329,16 @@ def test_c12_pair_records_the_fault_on_the_revoke_trial(armed, env):
         armed, create_trial_id="trial-c12-c", revoke_trial_id="trial-c12-r", method="full",
         server_group="A", horizon_sec=HORIZON_SEC, repetition=1,
         revisions={"config-server": "virtual"}, username=USER,
-        revoke_scenario_id="C12",
-        revoke_fault=fault_injector.Fault(armed, scenario="C12", username=USER),
+        revoke_scenario_id="C3-KRB5",
+        revoke_injector=_injector(armed, "C3-KRB5"),
         create_submit=create.submit, create_declaration=create.declaration,
         revoke_submit=revoke_submit, revoke_declaration=lambda: revoke.declaration(),
         advance=create.advance, collect=create.collect, clock=create.clock,
         environment=lambda: (trial_runner.CLEAN, {}), save=create.save)
 
-    assert created["fault"] is None
+    assert created["injection"] is None
     assert created["system_declaration"]["value"] == "SUCCESS"
-    assert revoked["scenario_id"] == "C12"
-    assert revoked["fault"]["fired_at"] is not None
+    assert revoked["scenario_id"] == "C3-KRB5"
+    assert revoked["injection"]["fired_at"] is not None
+    assert revoked["injection"]["verified"] is True, revoked["injection"]
     assert env.db.execute("SELECT COUNT(*) FROM fault_arming").fetchone()[0] == 0

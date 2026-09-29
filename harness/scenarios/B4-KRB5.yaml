@@ -9,7 +9,7 @@ injection:
   step: step_create_krb5_principal
   action: sigkill_before_journal
   occurrence: 1
-  verify: journal_restart_row
+  verify: fired_before_success
 analysis:
   recoverable: true
   expected_ground_truth: {final_state: ACTIVE, duplicate_resource: false}

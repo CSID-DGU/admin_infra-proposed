@@ -9,7 +9,7 @@ injection:
   step: step_create_services
   action: endpoint_block
   occurrence: 1
-  verify: networkpolicy_applied
+  verify: policy_present
 analysis:
   recoverable: false
   expected_ground_truth: {final_state: DEGRADED}

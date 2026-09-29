@@ -323,8 +323,8 @@ def test_an_unpaired_revoke_trial_keeps_start_state_none(conn):
     assert result["start_state"] is None
 
 
-class FakeFault:
-    """장전 포트 흉내. 호출 순서를 trial 모듈 호출과 함께 한 목록에 적는다."""
+class FakeInjector:
+    """주입 포트 흉내. 호출 순서를 trial 모듈 호출과 함께 한 목록에 적는다."""
 
     def __init__(self, log):
         self.log = log
@@ -332,9 +332,12 @@ class FakeFault:
     def arm(self):
         self.log.append("arm")
 
+    def poll(self):
+        self.log.append("poll")
+
     def report(self):
         self.log.append("report")
-        return {"scenario": "C06", "step_name": "s", "armed_at": "t0", "fired_at": "t1"}
+        return {"kind": "code_hook", "armed_at": "t0", "fired_at": "t1", "verified": True}
 
     def disarm(self):
         self.log.append("disarm")
@@ -348,20 +351,21 @@ def _logged(monkeypatch, log, ports):
     ports.submit = lambda: (log.append("submit"), submit())[1]
 
 
-def test_fault_is_armed_before_submit_and_reported_after_close(conn, monkeypatch):
+def test_injector_is_armed_before_submit_polled_per_advance_and_reported_after_close(conn, monkeypatch):
     log = []
     ports = Ports(declare_after=1)
     _logged(monkeypatch, log, ports)
-    result = _run(conn, ports, fault=FakeFault(log))
-    assert log == ["arm", "submit", "bind_request", "close_trial", "report", "disarm"]
-    assert result["fault"]["fired_at"] == "t1"
+    result = _run(conn, ports, injector=FakeInjector(log))
+    assert log == ["arm", "submit", "bind_request", "poll", "poll", "poll", "close_trial", "report", "disarm"]
+    assert result["injection"]["fired_at"] == "t1"
+    assert "fault" not in result
 
 
-def test_without_a_fault_the_record_has_none(conn):
-    assert _run(conn, Ports(declare_after=1))["fault"] is None
+def test_without_an_injector_the_record_has_none(conn):
+    assert _run(conn, Ports(declare_after=1))["injection"] is None
 
 
-def test_fault_is_disarmed_when_submit_raises(conn):
+def test_injector_is_disarmed_when_submit_raises(conn):
     log = []
     ports = Ports(declare_after=1)
 
@@ -369,23 +373,23 @@ def test_fault_is_disarmed_when_submit_raises(conn):
         raise RuntimeError("be down")
     ports.submit = submit
     with pytest.raises(RuntimeError, match="be down"):
-        _run(conn, ports, fault=FakeFault(log))
+        _run(conn, ports, injector=FakeInjector(log))
     assert log == ["arm", "disarm"]
 
 
-def test_pair_passes_each_fault_only_to_its_trial(conn):
+def test_pair_passes_each_injector_only_to_its_trial(conn):
     create_log, revoke_log = [], []
     ports = Ports(declare_after=1)
-    created, revoked = _pair(conn, ports, ports, create_fault=FakeFault(create_log),
-                             revoke_fault=FakeFault(revoke_log))
-    assert create_log == revoke_log == ["arm", "report", "disarm"]
-    assert created["fault"] is not None and revoked["fault"] is not None
+    created, revoked = _pair(conn, ports, ports, create_injector=FakeInjector(create_log),
+                             revoke_injector=FakeInjector(revoke_log))
+    assert create_log == revoke_log == ["arm", "poll", "poll", "poll", "report", "disarm"]
+    assert created["injection"] is not None and revoked["injection"] is not None
 
 
-def test_pair_without_faults_records_none(conn):
+def test_pair_without_a_create_injector_records_none(conn):
     ports = Ports(declare_after=1)
-    created, revoked = _pair(conn, ports, ports, revoke_fault=FakeFault([]))
-    assert created["fault"] is None and revoked["fault"] is not None
+    created, revoked = _pair(conn, ports, ports, revoke_injector=FakeInjector([]))
+    assert created["injection"] is None and revoked["injection"] is not None
 
 
 # 기록 스키마 v2 의 보조 칸

@@ -9,7 +9,7 @@ injection:
   step: step_create_pod_k8s
   action: fail_persistent
   occurrence: 1
-  verify: journal_fail_row
+  verify: fired_before_success
 analysis:
   recoverable: false
   expected_ground_truth: {final_state: DEGRADED, duplicate_resource: false}
