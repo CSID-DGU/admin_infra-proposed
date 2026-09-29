@@ -16,7 +16,9 @@ svc_delete 가 나오기 때문에, 호출 이름이 있다는 사실만으로 �
 
 GPU 는 가상 계층에 실체가 없다. Pod 의 has-gpu 라벨은 대상 시스템이 붙인 주장이지 컨테이너
 안에서 GPU 가 보인다는 측정이 아니므로, compute_gpu 는 PASS 를 지어내지 않고 UNKNOWN 이다.
-그래서 가상 계층의 생성 판정은 다른 검사가 전부 PASS 여도 UNKNOWN 에 머문다.
+그래서 가상 계층의 생성 판정은 다른 검사가 전부 PASS 여도 UNKNOWN 에 머문다. 흐름을 끝까지
+시험하려면 시험이 gpu_usable 로 가상 GPU 의 상태를 명시한다. 수집기가 지어내는 것이 아니라
+시험이 세계를 그렇게 정의하는 것이고, 그 사실이 증거 칸에 남는다.
 
 마운트 출처는 Pod 가 /home 에 건 hostPath 에 사용자 이름을 이어 붙여 만든다. 사용자 공유
 전체를 /home 에 거는 구조라서, 홈 디렉터리의 실제 출처는 그 아래 사용자 이름 경로다.
@@ -67,8 +69,11 @@ def _one_pod(e, username):
     return PASS, pods[0], {"pods": names, "pod_uid": pods[0].metadata.uid}
 
 
-def virtual_collector(e):
-    """가상 계층 상태 e 를 읽는 collect(check, target) 를 돌려준다."""
+def virtual_collector(e, *, gpu_usable=None):
+    """가상 계층 상태 e 를 읽는 collect(check, target) 를 돌려준다.
+
+    gpu_usable 은 시험이 정하는 가상 GPU 의 상태다. None 이면 GPU 가 없는 세계라 UNKNOWN 이다.
+    """
 
     def home_kept(username):
         created = _last(e, "create_home", lambda a: a[0] == username)
@@ -112,7 +117,9 @@ def virtual_collector(e):
             return result, {**detail, "runtime_uid": uid}
         if check == "compute_gpu":
             _, _, detail = _one_pod(e, username)
-            return UNKNOWN, {**detail, "reason": "가상 계층에는 GPU 실체가 없다"}
+            if gpu_usable is None:
+                return UNKNOWN, {**detail, "reason": "가상 계층에는 GPU 실체가 없다"}
+            return _verdict(gpu_usable), {**detail, "source": "시험이 정한 가상 GPU 상태"}
         if check == "compute_nfs":
             result, pod, detail = _one_pod(e, username)
             if pod is None:

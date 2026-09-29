@@ -80,15 +80,25 @@ def test_run_view_has_no_analysis():
 
 
 def _analysis_reads(path):
-    """analysis_view 를 가리키는 속성 접근과 "analysis" 상수 첨자를 찾는다."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    """analysis_view 를 가리키는 이름·속성과, 문서 문자열이 아닌 곳의 "analysis" 상수를 찾는다.
+
+    첨자뿐 아니라 .get("analysis") 나 변수에 담은 키처럼 어떤 모양으로 읽어도 문자열 상수는
+    남으므로, 상수 자체를 막는다.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  and n.body and isinstance(n.body[0], ast.Expr)
+                  and isinstance(n.body[0].value, ast.Constant)}
     hits = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == "analysis_view":
             hits.append(f"{path.name}:{node.lineno} .analysis_view")
-        elif (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
-              and node.slice.value == "analysis"):
-            hits.append(f"{path.name}:{node.lineno} [\"analysis\"]")
+        elif isinstance(node, ast.Name) and node.id == "analysis_view":
+            hits.append(f"{path.name}:{node.lineno} analysis_view")
+        elif (isinstance(node, ast.Constant) and node.value == "analysis"
+              and id(node) not in docstrings):
+            hits.append(f"{path.name}:{node.lineno} \"analysis\"")
     return hits
 
 
@@ -101,8 +111,9 @@ def test_run_modules_do_not_read_analysis():
 
 def test_analysis_reads_detector_catches_both_forms(tmp_path):
     probe = tmp_path / "probe.py"
-    probe.write_text('x = spec["analysis"]\ny = s.analysis_view()\n', encoding="utf-8")
-    assert len(_analysis_reads(probe)) == 2
+    probe.write_text('x = spec["analysis"]\ny = s.analysis_view()\nz = spec.get("analysis")\n'
+                     'k = "analysis"\n', encoding="utf-8")
+    assert len(_analysis_reads(probe)) == 4
 
 
 def test_duplicate_id_in_two_files_raises(tmp_path):
