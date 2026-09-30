@@ -106,7 +106,9 @@ class BeApi:
             return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
         now = int(time.time())
         head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-        claims = b64(json.dumps({"sub": str(user_id), "iat": now, "exp": now + 300}).encode())
+        # admin_be는 종류가 access인 토큰만 API 호출에 받는다(be#621). 없으면 모든 호출이 401이다.
+        claims = b64(json.dumps({"sub": str(user_id), "iat": now, "exp": now + 300,
+                                 "token_type": "access"}).encode())
         sig = b64(hmac.new(self._key, f"{head}.{claims}".encode(), hashlib.sha256).digest())
         return f"{head}.{claims}.{sig}"
 

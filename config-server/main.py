@@ -61,6 +61,8 @@ from utils import (
     sync_running_pod_password,
     update_account_secrets,
     select_best_node_from_prometheus,
+    list_node_gpus,
+    normalize_gpu_model,
     resolve_k8s_node_name,
     resolve_farm_home_mount_root,
     load_user_image,
