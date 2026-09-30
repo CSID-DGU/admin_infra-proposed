@@ -5,8 +5,8 @@ import crypt
 import main
 from test_e2e_virtual import env, full, tick, result, rows, PW  # noqa: F401  (env·full은 pytest fixture)
 
-NODES = [{"node_name": "farm2", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"},
-         {"node_name": "farm7", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"}]
+NODES = [{"node_name": "farm2", "num_gpu": 1, "gpu_models": ["RTX A5000"], "cpu_limit": "4", "memory_limit": "16Gi"},
+         {"node_name": "farm7", "num_gpu": 1, "gpu_models": ["RTX A5000"], "cpu_limit": "4", "memory_limit": "16Gi"}]
 
 
 def _provisioned(e, monkeypatch, rid="1000", user="exp-np-mig"):

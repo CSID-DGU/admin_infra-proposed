@@ -194,6 +194,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "load_k8s", lambda: None)
     monkeypatch.setattr(main.client, "CoreV1Api", lambda: e.v1)
     monkeypatch.setattr(main, "select_best_node_from_prometheus", lambda nodes, url, t: nodes[0])
+    monkeypatch.setattr(main, "list_node_gpus", lambda node, url, t: [
+        (f"GPU-{node}-0", "NVIDIA RTX A5000"), (f"GPU-{node}-1", "NVIDIA GeForce RTX 3090")])
     monkeypatch.setattr(main, "resolve_k8s_node_name", lambda n: n)
     monkeypatch.setattr(main, "resolve_farm_home_mount_root", lambda n: "/home/share/user")
     monkeypatch.setattr(main, "load_user_image", lambda u, img: img)
@@ -214,7 +216,7 @@ def env(monkeypatch, tmp_path):
         if e.was:
             return e.was(url)
         return Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW, "gpu_nodes": [
-            {"node_name": "farm2", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"}]})
+            {"node_name": "farm2", "num_gpu": 1, "gpu_models": ["RTX A5000"], "cpu_limit": "4", "memory_limit": "16Gi"}]})
     e.was_headers = []
     monkeypatch.setattr(main.requests, "get", was)
     e.Resp = Resp
@@ -702,7 +704,7 @@ def test_pod_env_carries_supplementary_groups_under_the_name_the_image_reads(env
         main.write_group_lines(main.read_group_lines() + ["teamx:x:53000:"])
     e.was = lambda url: e.Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW,
                                      "groups": [{"gid": 53000}],
-                                     "gpu_nodes": [{"node_name": "farm2", "num_gpu": 1,
+                                     "gpu_nodes": [{"node_name": "farm2", "num_gpu": 1, "gpu_models": ["RTX A5000"],
                                                     "cpu_limit": "4", "memory_limit": "16Gi"}]})
     e.api.post("/operations/provision", json={"request_id": "150", "username": "exp-np-e2e",
                                               "account": {"passwd_base64": PW}})
@@ -1046,3 +1048,55 @@ def test_home_created_by_earlier_attempt_is_still_cleaned_up(env, monkeypatch):
     res = _provision(e, "1101", "exp-np-partial")
     assert res["phase"] == "FAIL", rows(e, "1101")
     assert "exp-np-partial" not in e.homes                             # 이 작업이 만든 빈 홈은 남지 않는다
+
+
+def _provision_with_gpu_nodes(e, rid, gpu_nodes):
+    e.was = lambda url: e.Resp(200, {"image": "dguailab/decs:1", "passwd_base64": PW, "gpu_nodes": gpu_nodes})
+    e.api.post("/operations/provision", json={"request_id": rid, "username": f"exp-np-gpu{rid}",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+    return result(e, "provision", rid)
+
+
+def _pod_env(e):
+    body = e.v1.pods[next(iter(e.v1.pods))].body
+    return {v["name"]: v.get("value") for v in body["spec"]["containers"][0]["env"]}
+
+
+def test_pod_sees_only_gpus_of_the_requested_model(env):
+    """노드에 A5000과 3090이 섞여 있어도 A5000을 신청하면 A5000만 보인다. GPU를 독점 요청하지는 않는다."""
+    e = env
+    res = _provision_with_gpu_nodes(e, "160", [
+        {"node_name": "farm2", "num_gpu": 1, "gpu_models": ["RTX A5000"], "cpu_limit": "4", "memory_limit": "16Gi"}])
+    assert res["phase"] == "SUCCESS"
+
+    assert _pod_env(e)["NVIDIA_VISIBLE_DEVICES"] == "GPU-farm2-0"
+    body = e.v1.pods[next(iter(e.v1.pods))].body
+    assert "nvidia.com/gpu" not in body["spec"]["containers"][0]["resources"]["limits"]
+
+
+def test_pod_without_gpu_gets_no_gpu_device(env):
+    e = env
+    res = _provision_with_gpu_nodes(e, "161", [
+        {"node_name": "farm2", "num_gpu": 0, "gpu_models": [], "cpu_limit": "4", "memory_limit": "16Gi"}])
+    assert res["phase"] == "SUCCESS"
+
+    assert _pod_env(e)["NVIDIA_VISIBLE_DEVICES"] == "void"
+
+
+def test_requested_model_missing_on_node_fails_and_releases_nodeports(env):
+    """신청한 종류가 노드에 없을 때 이미지 기본값(all)으로 넘어가면 다른 종류 GPU가 보인다. Pod를 만들지 않는다."""
+    e = env
+    res = _provision_with_gpu_nodes(e, "162", [
+        {"node_name": "farm2", "num_gpu": 1, "gpu_models": ["RTX A6000"], "cpu_limit": "4", "memory_limit": "16Gi"}])
+    assert res["phase"] == "FAIL"
+    assert not e.v1.pods
+    assert any(c[0] == "release" for c in e.calls)
+
+
+def test_missing_gpu_models_fails_instead_of_exposing_all_gpus(env):
+    e = env
+    res = _provision_with_gpu_nodes(e, "163", [
+        {"node_name": "farm2", "num_gpu": 1, "cpu_limit": "4", "memory_limit": "16Gi"}])
+    assert res["phase"] == "FAIL"
+    assert not e.v1.pods

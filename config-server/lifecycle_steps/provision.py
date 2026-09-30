@@ -938,6 +938,28 @@ POD_CREATE_STEPS = [
     step_create_services,
 ]
 
+def _resolve_visible_gpus(target_node: str, num_gpu: int, gpu_models: List[str]) -> str:
+    """컨테이너에 보일 GPU를 NVIDIA_VISIBLE_DEVICES 값으로 돌려준다. 신청한 종류의 GPU는 그 노드에 있는 것을
+    모두 넣고, 다른 종류는 넣지 않는다. GPU를 독점 할당하지 않으므로(nvidia.com/gpu 요청 없음) 같은 GPU를
+    여러 컨테이너가 함께 쓴다. GPU가 없으면 "void"로 런타임이 GPU를 아예 붙이지 않게 한다.
+    신청 종류를 모르거나 노드에서 찾지 못하면 Pod를 만들지 않는다 — 이미지 기본값(all)으로 넘어가면
+    다른 종류 GPU까지 보이기 때문이다."""
+    if num_gpu <= 0:
+        return "void"
+    wanted = {_main.normalize_gpu_model(m) for m in gpu_models if m}
+    if not wanted:
+        raise ValueError(f"gpu_models missing for node {target_node!r} — 신청한 GPU 종류를 받지 못했습니다")
+    inventory = _main.list_node_gpus(
+        target_node, _main.app.config["PROM_URL"], _main.app.config["HTTP_TIMEOUT_SEC"])
+    uuids = [gpu_uuid for gpu_uuid, model in inventory if _main.normalize_gpu_model(model) in wanted]
+    if not uuids:
+        found = sorted({model for _, model in inventory}) or ["none"]
+        raise ValueError(
+            f"no GPU of {sorted(gpu_models)} on node {target_node!r}; found: {', '.join(found)}")
+    _main.app.logger.info(f"[POD SPEC] visible GPUs node={target_node} models={gpu_models} count={len(uuids)}")
+    return ",".join(uuids)
+
+
 def build_pod_spec(
     username: str,
     user_info: dict,
@@ -1041,6 +1063,7 @@ def build_pod_spec(
         cpu_limit = _main.app.config["DEFAULT_CPU_LIMIT"]
         memory_limit = _main.app.config["DEFAULT_MEM_LIMIT"]
         num_gpu = 0
+        gpu_models = []
     
         tn_key = target_node.lower()
         for node in gpu_nodes:
@@ -1048,13 +1071,16 @@ def build_pod_spec(
                 cpu_limit = node.get("cpu_limit", cpu_limit)
                 memory_limit = node.get("memory_limit", memory_limit)
                 num_gpu = node.get("num_gpu", 0)
+                gpu_models = node.get("gpu_models") or []
                 break
     
         _main.app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
+        visible_gpus = _resolve_visible_gpus(target_node, num_gpu, gpu_models)
 
-        # GPU 디바이스는 개별 hostPath로 수동 마운트하지 않는다. 이미지에 baked-in된
-        # NVIDIA_VISIBLE_DEVICES=all과 노드의 기본 컨테이너 런타임(nvidia-container-runtime)이
-        # 컨테이너 생성 시점마다 현재 호스트 디바이스 상태를 다시 조회해서 알아서 주입해준다.
+        # GPU 디바이스는 개별 hostPath로 수동 마운트하지 않는다. 노드의 기본 컨테이너 런타임
+        # (nvidia-container-runtime)이 컨테이너 생성 시점마다 NVIDIA_VISIBLE_DEVICES에 적힌 GPU만
+        # 현재 호스트 디바이스 상태를 다시 조회해서 주입해준다. 이미지에는 이 값이 all로 들어 있어
+        # Pod env로 신청한 종류의 GPU UUID를 덮어쓴다(_resolve_visible_gpus).
         # 예전에는 /dev/nvidia{i}를 수동으로 bind mount했는데, 이 마운트는 마운트 시점의
         # inode에 고정되기 때문에 이후 호스트에서 드라이버 리로드 등으로 디바이스 파일이
         # 재생성되면 이미 떠 있던 컨테이너의 GPU 접근이 복구 불가능하게 끊기는 문제가 있었다
@@ -1166,6 +1192,7 @@ def build_pod_spec(
                                                     {"name": "UID", "value": str(uid)},
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "SHELL", "value": "/bin/bash"},
+                                                    {"name": "NVIDIA_VISIBLE_DEVICES", "value": visible_gpus},
                                                     # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
                                                     # `echo "$USER_ID:$USER_PW_HASH" | chpasswd -e`로 로그인 비밀번호를 설정한다.
                                                     # 평문은 받지 않는다 — admin_be가 신청 때 해시만 남긴다.

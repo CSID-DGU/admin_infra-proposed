@@ -1281,6 +1281,37 @@ def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
         return float("inf")
 
 
+# 같은 GPU라도 DB에 적힌 이름("RTX 3090")과 드라이버가 알려 주는 이름("NVIDIA GeForce RTX 3090")은
+# 제조사·제품군 표기만 다르다. 이 낱말을 빼고 남은 낱말 순서가 같으면 같은 종류로 본다.
+# "RTX 3090"과 "RTX 3090 Ti"처럼 낱말이 하나라도 다르면 다른 종류다.
+_GPU_MODEL_NOISE_TOKENS = frozenset({"NVIDIA", "GEFORCE", "GENERATION"})
+
+
+def normalize_gpu_model(name: str) -> tuple:
+    tokens = re.split(r"[^0-9A-Z]+", (name or "").upper())
+    return tuple(t for t in tokens if t and t not in _GPU_MODEL_NOISE_TOKENS)
+
+
+def list_node_gpus(node: str, prom_url: str, timeout: float) -> List[tuple]:
+    """노드에 꽂힌 GPU를 (UUID, 모델명) 목록으로 돌려준다. 노드마다 떠 있는 DCGM exporter 지표를 읽는다.
+    조회가 실패하면 예외를 그대로 올린다 — 빈 목록으로 삼키면 호출 쪽이 GPU가 없는 것과 구분하지 못한다."""
+    import requests
+
+    response = requests.get(
+        f"{prom_url}/api/v1/query",
+        params={"query": f'DCGM_FI_DEV_GPU_UTIL{{Hostname="{node}"}}'},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    by_uuid = {}
+    for series in response.json()["data"]["result"]:
+        labels = series.get("metric") or {}
+        gpu_uuid = labels.get("UUID")
+        if gpu_uuid:
+            by_uuid[gpu_uuid] = (int(labels.get("gpu") or 0), labels.get("modelName") or "")
+    return [(gpu_uuid, model) for gpu_uuid, (_, model) in sorted(by_uuid.items(), key=lambda kv: kv[1][0])]
+
+
 def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeout: float):
     """Select the best node from a list based on Prometheus metrics
 
