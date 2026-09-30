@@ -16,6 +16,9 @@ from .catalog import is_fault_case
 from .ports import safe
 from .resetter import admin_email, run_prefix
 
+# admin_be는 사용 목적을 50자 이상 받는다(be#633).
+PURPOSE_FILLER = "자동 점검용 시험 신청입니다. 컨테이너 생성과 회수 흐름이 정상인지 확인합니다."
+
 _CRYPT_HASH = re.compile(r"^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
 
 
@@ -142,7 +145,7 @@ class Context:
         user = self.users[arg["user"]]
         expires = (dt.datetime.now() + dt.timedelta(days=arg.get("days", 3))).strftime("%Y-%m-%dT%H:%M:%S")
         body = {"resourceGroupId": self.run.resource_group, "imageId": self.run.image,
-                "usagePurpose": f"e2e {self.case}", "formAnswers": {}, "expiresAt": expires}
+                "usagePurpose": f"e2e {self.case} {PURPOSE_FILLER}", "formAnswers": {}, "expiresAt": expires}
         payload = self._call("POST", "/api/requests", as_user=user["id"], body=body)
         self.requests[arg["as"]] = int(payload["data"]["requestId"])
         self.memo[f"{arg['as']}.owner"] = user["id"]

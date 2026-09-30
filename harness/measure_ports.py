@@ -18,6 +18,9 @@ import resetter
 import system
 from sha512_crypt import sha512_crypt
 
+# admin_be는 사용 목적을 50자 이상 받는다(be#633).
+MEASURE_PURPOSE = "measure 자동 측정용 시험 신청입니다. 컨테이너 생성과 회수에 걸리는 시간을 잽니다."
+
 TOKEN_TTL_SEC = 300
 _ALLOWED = (str, int, float, type(None))
 
@@ -163,7 +166,7 @@ def real_ports(*, be, web_sql, user_id, admin_id, prefix, username, expires_at, 
 
     def create_submit():
         body = _ok(*be.call("POST", "/api/requests", as_user=user_id, body={
-            "resourceGroupId": resource_group, "imageId": image, "usagePurpose": "measure",
+            "resourceGroupId": resource_group, "imageId": image, "usagePurpose": MEASURE_PURPOSE,
             "formAnswers": {}, "expiresAt": expires_at}))
         request_id = str(int(body["data"]["requestId"]))
         _ok(*be.call("POST", f"/api/admin/requests/{request_id}/approval", as_user=admin_id, body={
