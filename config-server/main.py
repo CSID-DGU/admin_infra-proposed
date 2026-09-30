@@ -125,9 +125,13 @@ ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "")
 
 
 # 내부 API 토큰. config-server에는 사용자 인증이 없으므로 admin_be만 부르도록 공유 토큰을 요구한다.
-# 비어 있으면 검사하지 않는다(로컬 개발·테스트). 상태 확인과 진행 상황 조회(화면이 nginx를 거쳐 GET으로 부름),
-# API 문서만 토큰 없이 연다.
+# 상태 확인과 진행 상황 조회(화면이 nginx를 거쳐 GET으로 부름), API 문서만 토큰 없이 연다.
+# 토큰이 비어 있으면 나머지 요청을 모두 거절한다. Secret이 빠진 채 배포되면 계정·Pod API가 통째로
+# 열리던 것을 막기 위해서다. 로컬 개발에서만 CONFIG_API_AUTH_DISABLED=true로 검사를 끈다.
 API_TOKEN = os.getenv("CONFIG_API_TOKEN", "")
+API_AUTH_DISABLED = os.getenv("CONFIG_API_AUTH_DISABLED", "").lower() == "true"
+if not API_TOKEN and not API_AUTH_DISABLED:
+    app.logger.error("[AUTH] CONFIG_API_TOKEN이 비어 있어 공개 경로 외 요청을 모두 거절합니다")
 _TOKEN_FREE_GET = re.compile(r"^/(health|requests/[^/]+/status|apispec_1\.json|apidocs/.*|flasgger_static/.*)$")
 
 
@@ -138,10 +142,13 @@ def admin_be_headers():
 
 @app.before_request
 def _require_api_token():
-    if not API_TOKEN:
+    if API_AUTH_DISABLED:
         return None
     if request.method == "GET" and _TOKEN_FREE_GET.match(request.path):
         return None
+    if not API_TOKEN:
+        app.logger.error(f"[AUTH] 내부 API 토큰 미설정으로 거절: {request.method} {request.path}")
+        return jsonify(infra_error("AUTHENTICATE", "API_TOKEN_NOT_CONFIGURED", "서버에 내부 API 토큰이 설정되지 않았습니다")), 503
     # 헤더 값과 토큰을 바이트로 맞춰 비교한다. 문자열끼리 비교하면 헤더에 비ASCII 문자가 섞였을 때
     # 예외가 나서 401 대신 500이 나갔다 — 바깥에서 쉽게 유발할 수 있는 경로다.
     sent = request.headers.get("X-Internal-Token", "").encode("utf-8", "surrogateescape")
