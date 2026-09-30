@@ -12,6 +12,7 @@ import base64
 import crypt
 import re
 import functools
+import unicodedata
 from typing import List, Optional
 
 from flask import jsonify, request
@@ -68,7 +69,7 @@ class ProvisionAccount(RequestBody):
                                        examples=["$6$saltsalt$" + "a" * 86])
     passwd_base64: Optional[str] = Field(default=None, description="UTF-8 평문 비밀번호를 base64로 인코딩한 값(구 방식)",
                                          examples=["cHc="])
-    gecos: str = ""
+    gecos: str = Field(default="", max_length=256, description="사람 이름. 원장 칸 구분자(:)·제어 문자·줄바꿈 불가")
     primary_group_name: Optional[str] = Field(default=None, description="생략하면 username")
     supplementary_groups: List[SupplementaryGroup] = []
     expected_uid: Optional[int] = Field(
@@ -81,6 +82,14 @@ class ProvisionAccount(RequestBody):
     def _sha512_crypt(cls, value):
         if value is not None and not SHA512_CRYPT_RE.match(value):
             raise ValueError("passwd_hash는 SHA-512 crypt 해시($6$...)여야 합니다")
+        return value
+
+    @field_validator("gecos")
+    @classmethod
+    def _ledger_safe_gecos(cls, value):
+        # 이 값은 passwd 원장의 한 칸이 된다. 구분자나 줄바꿈이 섞이면 호출자가 원장에 임의의 줄을 끼워 넣는다.
+        if ":" in value or any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value):
+            raise ValueError("gecos에는 콜론(:)·제어 문자·줄바꿈을 쓸 수 없습니다")
         return value
 
     @field_validator("passwd_base64")

@@ -940,8 +940,26 @@ def parse_passwd_line(line: str) -> Optional[dict]:
     return d
 
 
+# 원장 파일을 한 줄씩 읽을 때(str.splitlines) 줄을 끊는 문자 전부. \n 만 막으면   같은 문자로도
+# 줄이 갈라져, 칸 값 하나로 다른 계정 줄을 끼워 넣을 수 있다.
+_LEDGER_LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85  ")
+
+
+def _ledger_field(value, field: str) -> str:
+    """원장 한 칸에 들어갈 값. 칸 구분자(:)나 줄바꿈이 섞이면 줄 모양이 깨지므로 쓰기 전에 거절한다."""
+    text = "" if value is None else str(value)
+    if ":" in text or any(ch in _LEDGER_LINE_BREAKS for ch in text):
+        raise ValueError(f"ledger field {field!r} contains ':' or a line break: {text!r}")
+    return text
+
+
 def format_passwd_entry(d: dict) -> str:
-    return f"{d['name']}:{d.get('passwd','x')}:{int(d['uid'])}:{int(d['gid'])}:{d.get('gecos','')}:{d.get('home','')}:{d.get('shell','')}"
+    name = _ledger_field(d["name"], "name")
+    passwd = _ledger_field(d.get("passwd", "x"), "passwd")
+    gecos = _ledger_field(d.get("gecos", ""), "gecos")
+    home = _ledger_field(d.get("home", ""), "home")
+    shell = _ledger_field(d.get("shell", ""), "shell")
+    return f"{name}:{passwd}:{int(d['uid'])}:{int(d['gid'])}:{gecos}:{home}:{shell}"
 
 
 def parse_group_line(line: str) -> Optional[dict]:
@@ -955,8 +973,8 @@ def parse_group_line(line: str) -> Optional[dict]:
 
 
 def format_group_entry(d: dict) -> str:
-    members = ",".join(d.get("members", []))
-    return f"{d['name']}:{d.get('passwd','x')}:{int(d['gid'])}:{members}"
+    members = ",".join(_ledger_field(m, "members") for m in d.get("members", []))
+    return f"{_ledger_field(d['name'], 'name')}:{_ledger_field(d.get('passwd', 'x'), 'passwd')}:{int(d['gid'])}:{members}"
 
 # ---- /etc/shadow parsing ----
 _shadow_line_re = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<lastchg>\d*):(?P<min>\d*):(?P<max>\d*):(?P<warn>\d*):(?P<inactive>\d*):(?P<expire>\d*):(?P<flag>[^\n:]*)$")
@@ -995,9 +1013,12 @@ def parse_shadow_line(line: str) -> Optional[dict]:
 def format_shadow_entry(d: dict) -> str:
     # Fill defaults similar to Debian/Ubuntu: min=0, max=99999, warn=7
     return (
-        f"{d['name']}:{d['passwd']}:{d.get('lastchg', 0)}:"
-        f"{d.get('min', 0)}:{d.get('max', 99999)}:{d.get('warn', 7)}:"
-        f"{d.get('inactive', '')}:{d.get('expire', '')}:{d.get('flag', '')}"
+        f"{_ledger_field(d['name'], 'name')}:{_ledger_field(d['passwd'], 'passwd')}:"
+        f"{_ledger_field(d.get('lastchg', 0), 'lastchg')}:"
+        f"{_ledger_field(d.get('min', 0), 'min')}:{_ledger_field(d.get('max', 99999), 'max')}:"
+        f"{_ledger_field(d.get('warn', 7), 'warn')}:"
+        f"{_ledger_field(d.get('inactive', ''), 'inactive')}:{_ledger_field(d.get('expire', ''), 'expire')}:"
+        f"{_ledger_field(d.get('flag', ''), 'flag')}"
     )
 
 
