@@ -9,6 +9,12 @@ import main  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def api_auth_off(monkeypatch):
+    """토큰 검사는 test_api_token에서 따로 본다. 나머지 시험은 라우트 동작만 보므로 로컬 개발처럼 검사를 끈다."""
+    monkeypatch.setattr(main, "API_AUTH_DISABLED", True)
+
+
+@pytest.fixture(autouse=True)
 def local_ledger_lock(monkeypatch):
     """원장 잠금은 운영에서 MySQL 이름 잠금이다. 시험에는 DB가 없으므로 프로세스 안 잠금으로 돌린다."""
     monkeypatch.setenv("LEDGER_LOCK_BACKEND", "local")

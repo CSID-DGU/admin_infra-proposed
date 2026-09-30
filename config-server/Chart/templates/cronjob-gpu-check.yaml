@@ -38,7 +38,6 @@ spec:
                     secretKeyRef:
                       name: "{{ .Values.apiToken.secretName }}"
                       key: token
-                      optional: true
                 - name: INFRA_SLACK_WEBHOOK_URL
                   valueFrom:
                     secretKeyRef:

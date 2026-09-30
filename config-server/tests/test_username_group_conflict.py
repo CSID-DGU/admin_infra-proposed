@@ -64,6 +64,7 @@ def test_reserved_names_lists_image_groups_seed_users_and_ops_accounts(api):
 
 
 def test_reserved_names_requires_api_token(api, monkeypatch):
+    monkeypatch.setattr(main, "API_AUTH_DISABLED", False)
     monkeypatch.setattr(main, "API_TOKEN", "secret")
     assert api.get("/reserved-names").status_code == 401
     assert api.get("/reserved-names", headers={"X-Internal-Token": "secret"}).status_code == 200

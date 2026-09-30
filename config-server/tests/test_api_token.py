@@ -6,6 +6,7 @@ import main
 
 @pytest.fixture
 def client(monkeypatch):
+    monkeypatch.setattr(main, "API_AUTH_DISABLED", False)
     monkeypatch.setattr(main, "API_TOKEN", "s3cret")
     return main.app.test_client()
 
@@ -34,8 +35,19 @@ def test_status_route_is_open_only_for_get(client):
     assert client.post("/requests/1/status").status_code == 401
 
 
-def test_token_check_is_off_when_not_configured(monkeypatch):
+def test_missing_token_config_rejects_instead_of_opening(monkeypatch):
+    monkeypatch.setattr(main, "API_AUTH_DISABLED", False)
     monkeypatch.setattr(main, "API_TOKEN", "")
+    c = main.app.test_client()
+    r = c.post("/operations/provision", json={}, headers={"X-Internal-Token": ""})
+    assert r.status_code == 503 and r.get_json()["error"] == "API_TOKEN_NOT_CONFIGURED"
+    assert c.delete("/pods/ailab-u-1").status_code == 503
+    assert c.get("/health").status_code == 200   # 공개 경로는 그대로 연다
+
+
+def test_explicit_opt_out_disables_check(monkeypatch):
+    monkeypatch.setattr(main, "API_AUTH_DISABLED", True)
+    monkeypatch.setattr(main, "API_TOKEN", "s3cret")
     assert main.app.test_client().post("/operations/provision", json={}).status_code == 400
 
 
