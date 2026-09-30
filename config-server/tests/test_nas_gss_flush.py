@@ -348,3 +348,51 @@ def test_release_only_deletes_when_token_matches(monkeypatch):
 
     lock_mod.release_flush_lock("someone-elses-token")
     assert lock_mod._LOCK_KEY not in store
+
+
+# ---------- NAS 그룹 조회 명령 ----------
+
+@pytest.fixture
+def nas_shell(tmp_path, monkeypatch):
+    """nas_shared_gids_for_users 가 만든 스크립트를 로컬 bash 로 돌린다. id 는 가짜로 바꿔
+    'FARM\\alice' 만 그룹을 돌려준다. 반환: 인젝션이 실행됐으면 생기는 표시 파일 경로"""
+    import contextlib
+    import subprocess
+    import utils
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "id").write_text('#!/bin/sh\n[ "$2" = "FARM\\\\alice" ] && echo "513 70001 90000" && exit 0\nexit 1\n')
+    (bindir / "id").chmod(0o755)
+    marker = tmp_path / "pwned"
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "MARK": str(marker)}
+
+    def capture(_ssh, script):
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout
+
+    monkeypatch.setattr(utils, "_nas_ssh_client", lambda: contextlib.nullcontext())
+    monkeypatch.setattr(utils, "_ssh_capture", capture)
+    return marker
+
+
+def test_nas_group_query_parses_known_users_and_drops_unknown(nas_shell):
+    from utils import nas_shared_gids_for_users
+    assert nas_shared_gids_for_users({"alice", "bob"}, 70000, 79999) == {"alice": {70001}}
+
+
+@pytest.mark.parametrize("evil", ['x"$(touch $MARK)"', "x$(touch $MARK)", "x`touch $MARK`", "x;touch $MARK", "a\nb"])
+def test_nas_group_query_never_runs_names_as_shell(nas_shell, evil):
+    from utils import nas_shared_gids_for_users
+    assert nas_shared_gids_for_users({"alice", evil}, 70000, 79999) == {"alice": {70001}}
+    assert not nas_shell.exists()
+
+
+def test_nas_group_query_quotes_names_even_if_rule_is_bypassed(nas_shell, monkeypatch):
+    """이름 규칙 검사가 빠져도 인용만으로 명령이 실행되지 않는다."""
+    import re
+    import utils
+    from utils import nas_shared_gids_for_users
+    monkeypatch.setattr(utils, "_VALID_USERNAME_RE", re.compile(r".+"))
+    nas_shared_gids_for_users({'x"$(touch $MARK)"', "x`touch $MARK`"}, 70000, 79999)
+    assert not nas_shell.exists()
