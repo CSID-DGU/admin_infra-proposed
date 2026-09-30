@@ -13,10 +13,10 @@ import crypt
 import re
 import functools
 import unicodedata
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from flask import jsonify, request
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from error import infra_error
 
@@ -47,6 +47,17 @@ def is_valid_unix_name(value: str) -> bool:
     return bool(_VALID_UNIX_NAME_RE.match(value))
 
 
+def _unix_name(value: str) -> str:
+    if not _VALID_UNIX_NAME_RE.match(value):
+        raise ValueError("이름은 [a-z_]로 시작하는 32자 이하의 소문자·숫자·_·- 여야 합니다")
+    return value
+
+
+# 사용자·그룹 이름. 원장(passwd·group) 칸, 셸 명령, AD sAMAccountName 에 그대로 들어가므로
+# 본문으로 받는 이름은 모두 이 타입으로 받는다(경로로 받는 이름은 is_valid_unix_name).
+UnixName = Annotated[str, AfterValidator(_unix_name)]
+
+
 def _optional_text(value):
     return None if value is None or value == "" else str(value)
 
@@ -58,7 +69,7 @@ def _pod_name(value):
 
 
 class SupplementaryGroup(RequestBody):
-    name: str = Field(min_length=1, examples=["ASCP"])
+    name: UnixName = Field(examples=["ascp"])
     gid: int = Field(examples=[20004])
 
 
@@ -70,7 +81,7 @@ class ProvisionAccount(RequestBody):
     passwd_base64: Optional[str] = Field(default=None, description="UTF-8 평문 비밀번호를 base64로 인코딩한 값(구 방식)",
                                          examples=["cHc="])
     gecos: str = Field(default="", max_length=256, description="사람 이름. 원장 칸 구분자(:)·제어 문자·줄바꿈 불가")
-    primary_group_name: Optional[str] = Field(default=None, description="생략하면 username")
+    primary_group_name: Optional[UnixName] = Field(default=None, description="생략하면 username")
     supplementary_groups: List[SupplementaryGroup] = []
     expected_uid: Optional[int] = Field(
         default=None, ge=1,
@@ -118,7 +129,7 @@ class ProvisionAccount(RequestBody):
 
 class ProvisionRequest(RequestBody):
     request_id: str = Field(description="admin_be 신청 번호(양의 정수)", examples=["4821"])
-    username: str = Field(min_length=1, examples=["exp-np-001"])
+    username: UnixName = Field(examples=["exp-np-001"])
     account: Optional[ProvisionAccount] = None
     supplementary_groups: List[SupplementaryGroup] = Field(
         default_factory=list,
@@ -134,7 +145,7 @@ class ProvisionRequest(RequestBody):
 class RevokeRequest(RequestBody):
     request_id: str = Field(description="admin_be 신청 번호(양의 정수)", examples=["4821"])
     pod_name: Optional[str] = Field(default=None, examples=["ailab-exp-np-001-7f3a9c21"])
-    username: Optional[str] = Field(default=None, description="pod_name이 없을 때 필요")
+    username: Optional[UnixName] = Field(default=None, description="pod_name이 없을 때 필요")
     node_name: Optional[str] = Field(default=None, description="keytab을 지울 노드. 없으면 지운 Pod의 노드")
     delete_account: bool = False
 
@@ -179,7 +190,7 @@ class MigrateRequest(RequestBody):
     request_id: str = Field(description="admin_be 신청 번호(양의 정수)", examples=["4821"])
     pod_name: Optional[str] = Field(default=None, description="옮길 Pod. 없으면 사용자의 실행 중인 Pod",
                                     examples=["ailab-exp-np-001-7f3a9c21"])
-    username: str = Field(min_length=1, examples=["exp-np-001"])
+    username: UnixName = Field(examples=["exp-np-001"])
     nodes: List[str] = Field(min_length=1, description="후보 노드 목록(현재 노드 포함)", examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
     force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
@@ -201,18 +212,11 @@ class MigrateRequest(RequestBody):
 
 
 class AddGroupRequest(RequestBody):
-    name: str = Field(min_length=1, examples=["developers"])
-
-    @field_validator("name")
-    @classmethod
-    def _name(cls, value):
-        # 이 이름은 AD DC 로 가는 SSH 명령 문자열에 그대로 들어가고 sAMAccountName 이 된다.
-        # 원격 스크립트도 같은 규칙으로 막지만, 보내는 쪽에서 먼저 거른다(#146).
-        if not _VALID_UNIX_NAME_RE.match(value):
-            raise ValueError("그룹 이름은 [a-z_]로 시작하는 32자 이하의 소문자·숫자·_·- 여야 합니다")
-        return value
+    # 이 이름은 AD DC 로 가는 SSH 명령 문자열에 그대로 들어가고 sAMAccountName 이 된다.
+    # 원격 스크립트도 같은 규칙으로 막지만, 보내는 쪽에서 먼저 거른다(#146).
+    name: UnixName = Field(examples=["developers"])
     gid: Optional[int] = Field(default=None, description="생략하면 그룹 파일 기준으로 자동 할당")
-    members: List[str] = []
+    members: List[UnixName] = []
 
     @field_validator("gid", mode="before")
     @classmethod
@@ -225,7 +229,7 @@ class AddGroupRequest(RequestBody):
 
 
 class AddUserGroupsRequest(RequestBody):
-    groups: List[str] = Field(min_length=1, examples=[["developers"]])
+    groups: List[UnixName] = Field(min_length=1, examples=[["developers"]])
 
 
 class ChangePasswordRequest(RequestBody):

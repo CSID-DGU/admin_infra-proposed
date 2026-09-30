@@ -96,6 +96,39 @@ def test_revoke_needs_pod_or_account_target():
         rm.RevokeRequest(request_id="5", delete_account=True)   # 누구를 회수할지 없음
 
 
+# 사용자·그룹 이름은 원장 칸·셸 명령·AD 이름에 그대로 들어가므로 본문 어디서 받든 같은 규칙으로 거른다.
+_BAD_NAMES = ("Bob", "1abc", "a b", "a;id", "a:b", "a\nb", "../x", "$(id)", "a" * 33, "")
+
+
+@pytest.mark.parametrize("bad", _BAD_NAMES)
+@pytest.mark.parametrize("build", [
+    lambda n: rm.ProvisionRequest(request_id="1", username=n),
+    lambda n: rm.ProvisionRequest(request_id="1", username="u", supplementary_groups=[{"name": n, "gid": 1}]),
+    lambda n: rm.ProvisionAccount(passwd_base64="cHc=", primary_group_name=n),
+    lambda n: rm.ProvisionAccount(passwd_base64="cHc=", supplementary_groups=[{"name": n, "gid": 1}]),
+    lambda n: rm.RevokeRequest(request_id="1", username=n or "x y", delete_account=True),
+    lambda n: rm.MigrateRequest(request_id="1", username=n, nodes=["farm1"]),
+    lambda n: rm.AddGroupRequest(name=n),
+    lambda n: rm.AddGroupRequest(name="g", members=[n]),
+    lambda n: rm.AddUserGroupsRequest(groups=[n]),
+], ids=["provision.username", "provision.groups", "account.primary_group", "account.groups",
+        "revoke.username", "migrate.username", "group.name", "group.members", "user_groups.groups"])
+def test_every_body_name_field_rejects_non_unix_names(build, bad):
+    with pytest.raises(ValidationError):
+        build(bad)
+
+
+@pytest.mark.parametrize("good", ("u", "_svc", "exp-np-001", "a_b-9", "a" * 32))
+def test_unix_names_are_accepted(good):
+    assert rm.ProvisionRequest(request_id="1", username=good).username == good
+    assert rm.AddUserGroupsRequest(groups=[good]).groups == [good]
+
+
+def test_bad_name_in_body_is_400_before_route(client):
+    body = _invalid(client.post("/operations/provision", json={"request_id": "1", "username": "a;reboot"}))
+    assert "username" in [e["field"] for e in body["errors"]]
+
+
 def test_group_gid_rules():
     assert rm.AddGroupRequest(name="g", gid="12").gid == 12
     assert rm.AddGroupRequest(name="g", gid="").gid is None
