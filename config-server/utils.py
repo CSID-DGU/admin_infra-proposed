@@ -1228,15 +1228,18 @@ def nas_shared_gids_for_users(usernames, gid_min: int, gid_max) -> dict:
     #153). 그래서 "NAS 가 아직 모르는가"를 판정할 수 있는 곳도 NAS 뿐이다.
 
     이름이 AD 에 없으면(레거시 계정 등) `id` 가 실패한다. 그런 사용자는 결과에서 빠지므로
-    호출자가 "모름"과 "그룹 없음"을 구분할 수 있다."""
-    if not usernames:
+    호출자가 "모름"과 "그룹 없음"을 구분할 수 있다. 유닉스 이름 규칙에 맞지 않는 이름도
+    NAS 에 묻지 않고 같은 식으로 뺀다."""
+    names = sorted(u for u in usernames if _VALID_USERNAME_RE.match(u))
+    if not names:
         return {}
     out = {}
     with _nas_ssh_client() as ssh:
         # 한 세션 안에서 한 번에 묻는다. 사용자 수만큼 SSH 를 새로 열면 재조정 한 번이 분 단위가 된다.
+        # 이름은 NAS 셸로 가는 문자열이라 두 자리 모두 인용한다(큰따옴표 안에 그대로 넣으면 $(...)가 실행된다).
         script = "\n".join(
-            'echo "%s|$(id -G %s 2>/dev/null)"' % (u, shlex.quote("FARM\\" + u))
-            for u in sorted(usernames)
+            'printf "%%s|%%s\\n" %s "$(id -G %s 2>/dev/null)"' % (shlex.quote(u), shlex.quote("FARM\\" + u))
+            for u in names
         )
         _, text = _ssh_capture(ssh, script)
     for line in text.splitlines():
