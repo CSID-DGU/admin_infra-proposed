@@ -233,7 +233,7 @@ class _FakeV1:
 
 @pytest.fixture
 def revoke_env(probe_env, monkeypatch):
-    state = {"v1": _FakeV1(), "db_rows": 0}
+    state = {"v1": _FakeV1(), "db_rows": 0, "reassigned": []}
     ctx = main.app.app_context(); ctx.push()
     monkeypatch.setitem(main.app.config, "NAMESPACE", "test-ns")
 
@@ -242,7 +242,7 @@ def revoke_env(probe_env, monkeypatch):
         def __exit__(self, *a): pass
         def execute(self, sql, params=()): pass
         def fetchone(self): return (state["db_rows"],)
-        def fetchall(self): return []
+        def fetchall(self): return [(p,) for p in state["reassigned"]]
 
     class Conn:
         def cursor(self): return Cur()
@@ -282,6 +282,26 @@ def test_revoked_fails_when_port_still_open(revoke_env):
     with pytest.raises(StepFailed):
         verify.step_verify_revoked(dict(RCTX))
     assert '"open_ports": [32001]' in revoke_env["logs"][-1]["error_detail"]
+
+
+def test_revoked_ignores_port_reassigned_to_another_pod(revoke_env):
+    """반납한 포트를 다른 Pod가 곧바로 배정받아 열어 둔 것은 회수 실패가 아니다."""
+    revoke_env["reassigned"] = [32001]
+    revoke_env["tcp"][("10.0.0.8", 22)] = (True, "")
+    revoke_env["tcp"][("10.0.0.8", 32001)] = (True, "SSH-2.0")
+    verify.step_verify_revoked(dict(RCTX))
+    assert revoke_env["logs"][-1]["phase"] == Phase.SUCCESS
+    assert '"reassigned_ports": [32001]' in revoke_env["logs"][-1]["error_detail"]
+
+
+def test_revoked_still_checks_ports_not_reassigned(revoke_env):
+    revoke_env["reassigned"] = [32001]
+    revoke_env["tcp"][("10.0.0.8", 22)] = (True, "")
+    revoke_env["tcp"][("10.0.0.8", 32001)] = (True, "SSH-2.0")
+    revoke_env["tcp"][("10.0.0.8", 32002)] = (True, "")
+    with pytest.raises(StepFailed):
+        verify.step_verify_revoked({**RCTX, "verify_ports": [32001, 32002]})
+    assert '"open_ports": [32002]' in revoke_env["logs"][-1]["error_detail"]
 
 
 def test_revoked_fails_when_pod_still_exists(revoke_env):
