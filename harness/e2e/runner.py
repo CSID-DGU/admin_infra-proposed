@@ -390,6 +390,8 @@ class Context:
     def do_remove_group(self, arg):
         """관리자가 사용자를 E2E 공용 그룹에서 뺀다. 빼기도 작업으로 등록만 된다."""
         group = observe.group_row(self.run.cluster, self.run.group_name)
+        if not group:
+            raise StepFailed(f"그룹 {self.run.group_name}이 admin_be에 없음")
         payload = self._call("DELETE", f"/api/admin/users/{self.users[arg['user']]['id']}/groups/{group['id']}",
                              as_user=self.run.admin_id)
         self.memo[f"{arg['as']}.operation"] = int(payload["data"]["operationId"])
