@@ -65,6 +65,12 @@ class Run:
             "print(json.dumps([n['name'] for n in json.loads(os.environ.get('FARM_NODES_JSON', '[]'))]))")
         return json.loads(out.strip().splitlines()[-1])
 
+    def group_nodes(self):
+        """신청에 쓰는 리소스 그룹에 속한 farm 노드. 다른 그룹 노드에는 신청한 GPU가 없어 옮길 수 없다."""
+        rows = self.cluster.sql(f"SELECT node_id FROM nodes WHERE rsgroup_id={int(self.resource_group)};")
+        in_group = {r[0].lower() for r in rows}
+        return [n for n in self.farm_nodes() if n.lower() in in_group]
+
     def run_case(self, case, *, allow_faults):
         if is_fault_case(case) and not allow_faults:
             return {"id": case["id"], "result": "SKIP", "reason": "장애 사례 (--allow-faults 없음)"}
@@ -189,9 +195,9 @@ class Context:
         alias, expect = self._target(arg, "req")
         row = observe.request_row(self.run.cluster, self._req(alias))
         self.memo[f"{alias}.node_before"] = row["node"]
-        others = [n for n in self.run.farm_nodes() if n != row["node"]]
+        others = [n for n in self.run.group_nodes() if n != row["node"]]
         if not others:
-            raise StepFailed("옮겨 갈 다른 farm 노드가 없음")
+            raise StepFailed("같은 리소스 그룹에 옮겨 갈 다른 farm 노드가 없음")
         self._call("POST", f"/api/admin/requests/{self._req(alias)}/migrations", as_user=self.run.admin_id,
                    body={"nodes": [row["node"], others[0]], "force": True}, expect=expect)
 
