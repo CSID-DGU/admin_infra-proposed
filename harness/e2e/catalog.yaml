@@ -5,7 +5,7 @@
 #   3) junit·pytest로 가리킨 시험이 실제로 있다.
 #
 # 사례 형식:
-#   id / title / covers: ["FROM>TO", ...] / codes: [기대 오류 코드]
+#   id / title / covers: ["FROM>TO", ...] / codes: [기대 오류 코드] (신청 전이가 없는 사례는 covers를 뺀다)
 #   steps: 실제 스택에서 실행할 단계(runner.py의 do_<단계>) — 또는 —
 #   junit: "<클래스>#<메서드>" (admin_be 단위 시험) / pytest: "<파일>::<시험>" (config-server 가상 시험)
 # fault 단계가 있는 사례는 --allow-faults 없이는 건너뛴다.
@@ -126,6 +126,35 @@ cases:
       - wait: {r1: FULFILLED}
       - expect_node_changed: r1
       - expect_pod: {r1: present}
+
+  - id: C09
+    title: 비밀번호 초기화 — 떠 있는 컨테이너의 로그인 비밀번호가 바뀐 뒤에야 적용되고, 둘은 같은 값이다
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - reset_password: a
+      - wait_password: {a: APPLIED}
+      - expect_password: {r1: changed}
+
+  - id: C10
+    title: 리눅스 계정이 없는 사용자의 비밀번호 초기화 — 반영할 컨테이너가 없어 작업 없이 바로 적용된다
+    steps:
+      - user: a
+      - reset_password: a
+      - wait_password: {a: APPLIED}
+      - expect_user: {a: {account: NONE, uid: none}}
+
+  - id: C11
+    title: 컨테이너를 만드는 중의 비밀번호 초기화 — 거절되고, 만들어진 컨테이너는 원래 비밀번호 그대로다
+    steps:
+      - user: a
+      - apply: {user: a, as: r1}
+      - approve: r1
+      - reset_password: {user: a, expect: error}
+      - wait: {r1: FULFILLED}
+      - expect_password: {r1: unchanged}
 
   - id: F01
     title: 생성 중 제어기 Pod 사망 — 다른(새) 제어기가 이어받아 끝낸다

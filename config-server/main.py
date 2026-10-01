@@ -24,7 +24,7 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from request_models import (is_valid_unix_name, validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest,
-                            ChangePasswordRequest, SHA512_CRYPT_RE)
+                            PasswordChangeRequest, SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -167,7 +167,8 @@ def _enforce_account_prefix():
         names.append(request.view_args["username"])
     body = request.get_json(silent=True)
     if isinstance(body, dict):
-        if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke"):
+        if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke",
+                            "/operations/password"):
             names.append(body.get("username"))
         if request.path == "/operations/revoke" and str(body.get("pod_name") or "").startswith("ailab-"):
             names.append(_pod_username(body["pod_name"]))
@@ -1290,69 +1291,9 @@ def remove_user_group(username: str, groupname: str):
     pods = remove_running_pod_groups(username, [groupname])
     return jsonify({"status": "removed", "user": username, "group": groupname, "pods": pods})
 
-# ----------- Change a user's login password -----------
-@accounts_bp.route("/users/<username>/password", methods=["PUT"])
-@validate_body(ChangePasswordRequest)
-def change_user_password(username: str, body: ChangePasswordRequest):
-    """
-    사용자 로그인 비밀번호 교체 API
-
-    계정 원장(shadow), 사용자의 모든 계정 Secret, 떠 있는 모든 Pod 의 /etc/shadow 를 새 해시로 바꾼다.
-    멱등이라 일부가 실패하면 같은 요청을 다시 보내면 된다. Pod 가 하나도 없어도 성공이다.
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 로그인 비밀번호 교체
-
-    parameters:
-
-      - in: path
-        name: username
-        required: true
-        type: string
-        example: user2100
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/ChangePasswordRequest'
-
-    responses:
-
-      200:
-        description: 원장·Secret·떠 있는 Pod 모두 반영
-      400:
-        description: 이름 또는 해시 형식 오류
-      404:
-        description: 계정 없음
-      500:
-        description: 일부 반영 실패(같은 요청으로 재시도)
-    """
-    if not is_valid_unix_name(username):
-        return jsonify(infra_error("CHANGE_PASSWORD", "INVALID_NAME", f"invalid name: {username}")), 400
-
-    # 원장을 먼저 바꾼다. 계정이 없으면 여기서 끝나 Secret·Pod 를 건드리지 않는다.
-    old_hash = set_ledger_password(username, body.passwd_hash)
-    if old_hash is None:
-        return jsonify(infra_error("CHANGE_PASSWORD", "USER_NOT_FOUND", f"user not found: {username}")), 404
-
-    try:
-        secrets = update_account_secrets(username, body.passwd_hash)
-    except Exception:
-        app.logger.exception("[ACCOUNTS] 계정 Secret 비밀번호 교체 실패: %s", username)
-        return jsonify(infra_error("CHANGE_PASSWORD", "SECRET_UPDATE_FAILED",
-                                   f"failed to update account secrets: {username}",
-                                   rolled_back=_restore_password(username, old_hash))), 500
-
-    pods = sync_running_pod_password(username, body.passwd_hash)
-    if pods["failed"] or pods.get("error"):
-        return jsonify(infra_error("CHANGE_PASSWORD", "POD_PASSWORD_SYNC_FAILED",
-                                   f"failed to apply password to running pods: {username}",
-                                   pods=pods, rolled_back=_restore_password(username, old_hash))), 500
-    return jsonify({"status": "updated", "user": username, "secrets": secrets, "pods": pods})
-
+# ----------- 로그인 비밀번호 -----------
+# 교체는 작업으로만 한다(POST /operations/password, lifecycle_steps/password.py). 아래는 그 단계와
+# 원장에 남은 계정을 이어받는 생성 경로가 함께 쓰는 원장·되돌리기 함수다.
 
 def set_ledger_password(username: str, passwd_hash: str):
     """계정 원장(shadow)의 해시와 변경일을 바꾼다. 반환: 바꾸기 전 해시, 계정이 없으면 None."""
@@ -1487,13 +1428,14 @@ from lifecycle_steps.revoke import (  # noqa: E402
 from lifecycle_steps.migrate import (  # noqa: E402
     step_migrate_select_target, step_migrate_inherit_password, step_migrate_cleanup_old, MIGRATE_STEPS,
 )
+from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
 
 # 작업 실행 엔진은 application/jobs.py로 이동했다(얇은 이동). 아래 재수출은 기존 소비자
 # (라우트·제어기·테스트의 main.* 참조)를 무수정으로 유지한다.
 from application.jobs import (  # noqa: E402
     STEP_MAX_ATTEMPTS, RETRY_DELAY_SEC, STEP_OBSERVERS, RERUN_SAFE, PRE_STEP,
     ALWAYS_RERUN, DEFER_DONE, SAVED_CTX_KEYS, _saved_ctx, _StepDegraded, _execute_step,
-    JOB_ACTIONS, _JOB_KIND, _job_steps, _job_ctx, find_unfinished_jobs, job_end_exists, _finish_job,
+    JOB_ACTIONS, _JOB_KIND, job_key, _job_steps, _job_ctx, find_unfinished_jobs, job_end_exists, _finish_job,
     _record_job_result, _compensate_provision, run_job, _release_lease, _run_job,
     _observe_account_created, _observe_krb5_principal, _observe_pod_created,
     RESUME_JUDGES, _judge_interrupted_account, _account_missing_parts,
@@ -1502,8 +1444,9 @@ from application.jobs import (  # noqa: E402
 
 def _register_job(kind, request_id, username, job):
     action = JOB_ACTIONS[kind]
+    key = job_key(kind, request_id)
     try:
-        if not save_job_input(action.value, request_id, job):
+        if not save_job_input(action.value, key, job):
             return jsonify(infra_error(
                 "REGISTER_JOB", "JOB_ALREADY_REGISTERED",
                 f"{kind} job for request {request_id} is already registered and not finished",
@@ -1514,15 +1457,15 @@ def _register_job(kind, request_id, username, job):
 
     # 이 START 행이 제어기가 작업을 찾는 근거이자 작업 번호(행 id)라, 기록이 실패하면 등록도 실패로 돌린다.
     # 목표 상태는 이 행에 남긴다(비밀번호 해시 제외).
-    target = {k: v for k, v in job.items() if k != "account"}
+    target = {k: v for k, v in job.items() if k not in ("account", "passwd_hash")}
     if job.get("account"):
         target["account"] = {k: v for k, v in job["account"].items() if k != "passwd_hash"}
     try:
-        job_id = log_operation(request_id=request_id, username=username, action=action,
+        job_id = log_operation(request_id=key, username=username, action=action,
                                phase=Phase.START, target_state=json.dumps(target, ensure_ascii=False),
                                start_job=True, raise_errors=True)
     except Exception as e:
-        delete_job_input(action.value, request_id)
+        delete_job_input(action.value, key)
         return jsonify(infra_error("REGISTER_JOB", "JOB_LOG_UNAVAILABLE", str(e))), 503
 
     if kind in ("provision", "migrate"):
@@ -1678,6 +1621,34 @@ def register_migrate(body: MigrateRequest):
     return _register_job("migrate", body.request_id, body.username, job)
 
 
+@app.route("/operations/password", methods=["POST"])
+@validate_body(PasswordChangeRequest)
+def register_password_change(body: PasswordChangeRequest):
+    """
+    로그인 비밀번호 교체 작업 등록
+
+    계정 원장(shadow), 사용자의 모든 계정 Secret, 떠 있는 모든 Pod 의 /etc/shadow 를 새 해시로 바꾸는 작업을
+    등록하고 바로 202를 돌려준다. 중간에 실패하면 옛 해시로 되돌리고 작업을 실패로 끝낸다 — 실패의
+    error_detail 에 되돌렸는지(rolled_back)가 남는다. Pod 가 하나도 없어도 성공이다.
+    결과는 GET /operations/password/<request_id>로 조회한다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/PasswordChangeRequest'
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 신청의 비밀번호 교체 작업이 아직 끝나지 않음}
+    """
+    job = {"username": body.username, "passwd_hash": body.passwd_hash}
+    return _register_job("password", body.request_id, body.username, job)
+
+
 @app.route("/operations/nas-gss-flush", methods=["POST"])
 def trigger_nas_gss_flush():
     """
@@ -1713,7 +1684,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}
@@ -1722,13 +1693,14 @@ def get_job_result(kind, request_id):
     action = JOB_ACTIONS.get(kind)
     if action is None:
         return jsonify(infra_error("GET_JOB", "UNKNOWN_JOB_KIND", f"unknown job kind {kind!r}")), 404
+    key = job_key(kind, request_id)
     conn = get_log_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT phase, error_code, created_at, job_id FROM operation_log "
                 "WHERE request_id=%s AND action=%s ORDER BY id DESC LIMIT 1",
-                (str(request_id), action.value),
+                (str(key), action.value),
             )
             row = cur.fetchone()
     finally:
@@ -1738,7 +1710,7 @@ def get_job_result(kind, request_id):
     phase, error_code, created_at, job_id = row
     return jsonify({"request_id": request_id, "kind": kind, "job_id": job_id, "phase": phase,
                     "error_code": error_code, "updated_at": str(created_at),
-                    "result": load_job_result(action.value, request_id)}), 200
+                    "result": load_job_result(action.value, key)}), 200
 
 
 # 한 신청에서 돌려줄 최근 작업 수. 재승인·재회수가 반복돼도 응답이 커지지 않게 한다.
@@ -1792,7 +1764,7 @@ def get_job_steps(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공 — 작업이 없으면 jobs가 빈 목록}
@@ -1808,7 +1780,7 @@ def get_job_steps(kind, request_id):
             cur.execute(
                 "SELECT id FROM operation_log WHERE request_id=%s AND action=%s AND phase=%s AND job_id=id "
                 "ORDER BY id DESC LIMIT %s",
-                (str(request_id), action.value, Phase.START.value, JOB_STEPS_MAX_JOBS),
+                (str(job_key(kind, request_id)), action.value, Phase.START.value, JOB_STEPS_MAX_JOBS),
             )
             job_ids = [r[0] for r in cur.fetchall()]
             rows = []

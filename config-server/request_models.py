@@ -232,9 +232,16 @@ class AddUserGroupsRequest(RequestBody):
     groups: List[UnixName] = Field(min_length=1, examples=[["developers"]])
 
 
-class ChangePasswordRequest(RequestBody):
-    """계정 로그인 비밀번호 교체. admin_be가 해시한 값만 받는다(평문은 받지 않는다)."""
+class PasswordChangeRequest(RequestBody):
+    """로그인 비밀번호 교체 작업 등록. admin_be가 해시한 값만 받는다(평문은 받지 않는다)."""
+    request_id: str = Field(description="admin_be 비밀번호 재설정 신청 번호(양의 정수)", examples=["12"])
+    username: UnixName = Field(examples=["exp-np-001"])
     passwd_hash: str = Field(description="SHA-512 crypt 해시($6$...)", examples=["$6$saltsalt$" + "a" * 86])
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
 
     @field_validator("passwd_hash")
     @classmethod
@@ -245,7 +252,7 @@ class ChangePasswordRequest(RequestBody):
 
 
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  AddGroupRequest, AddUserGroupsRequest, ChangePasswordRequest)
+                  AddGroupRequest, AddUserGroupsRequest, PasswordChangeRequest)
 
 
 def _errors(exc: ValidationError):

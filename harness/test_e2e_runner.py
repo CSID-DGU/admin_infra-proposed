@@ -137,6 +137,77 @@ def test_uid_must_stay_with_the_person():
     assert result["result"] == "FAIL" and "55003" in result["error"]
 
 
+def _fulfilled_cluster():
+    """컨테이너가 떠 있는 사용자 하나."""
+    cluster = FakeCluster()
+    cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])
+    cluster.on(r"SELECT status, IFNULL\(node_name", [("FULFILLED", "farm1", "ailab-exp-fu-e2eabc12c09a-1")])
+    return cluster
+
+
+PASSWORD_STEPS = [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}, {"reset_password": "a"},
+                  {"wait_password": {"a": "APPLIED"}}]
+
+
+def test_password_reset_passes_when_pod_and_record_agree_on_a_new_hash():
+    cluster, api = _fulfilled_cluster(), FakeApi()
+    recorded = iter(["OLD", "NEW"])
+    cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", lambda _: [(next(recorded),)])
+    cluster.on(r"FROM password_reset_requests", [("APPLIED",)])
+    cluster.on(r"getent shadow", "NEW\n")
+    run = make_run(cluster, api)
+
+    result = run.run_case({"id": "C09", "steps": PASSWORD_STEPS + [{"expect_password": {"r1": "changed"}}]},
+                          allow_faults=False)
+
+    assert result["result"] == "PASS"
+    assert ("PUT", "/api/admin/users/7/password", 1) in api.calls
+    assert any("getent shadow exp-fu-e2eabc12c09a" in c for c in cluster.calls)
+    # 해시는 관측 기록에 남기지 않는다(공개 저장소의 실행 결과에 실린다).
+    assert "NEW" not in str(result["observed"]) and "OLD" not in str(result["observed"])
+
+
+def test_password_reset_fails_when_the_pod_kept_the_old_hash():
+    """웹 계정 기록만 바뀌고 컨테이너가 옛 비밀번호로 남는 것이 이 사례가 잡으려는 결함이다."""
+    cluster = _fulfilled_cluster()
+    recorded = iter(["OLD", "NEW"])
+    cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", lambda _: [(next(recorded),)])
+    cluster.on(r"FROM password_reset_requests", [("APPLIED",)])
+    cluster.on(r"getent shadow", "OLD\n")
+
+    result = make_run(cluster, FakeApi()).run_case(
+        {"id": "C09", "steps": PASSWORD_STEPS + [{"expect_password": {"r1": "changed"}}]}, allow_faults=False)
+
+    assert result["result"] == "FAIL" and "기록과 다름" in result["error"]
+    assert "OLD" not in result["error"] and "NEW" not in result["error"]
+
+
+def test_password_reset_that_never_applies_is_a_failure():
+    cluster = _fulfilled_cluster()
+    cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", [("OLD",)])
+    cluster.on(r"FROM password_reset_requests", [("PENDING",)])
+
+    result = make_run(cluster, FakeApi()).run_case({"id": "C09", "steps": PASSWORD_STEPS}, allow_faults=False)
+
+    assert result["result"] == "FAIL" and result["step"] == 4
+    assert "APPLIED" in result["error"] and "PENDING" in result["error"]
+
+
+def test_rejected_password_reset_must_leave_the_password_alone():
+    cluster = _fulfilled_cluster()
+    cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", [("OLD",)])
+    cluster.on(r"getent shadow", "OLD\n")
+    api = FakeApi({("PUT", "/api/admin/users/7/password"): (409, {"message": "컨테이너를 만드는 중"})})
+    steps = [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}, {"reset_password": {"user": "a", "expect": "error"}}]
+
+    kept = make_run(cluster, api).run_case(
+        {"id": "C11", "steps": steps + [{"expect_password": {"r1": "unchanged"}}]}, allow_faults=False)
+    assert kept["result"] == "PASS"
+    wrong = make_run(cluster, api).run_case(
+        {"id": "C11", "steps": steps + [{"expect_password": {"r1": "changed"}}]}, allow_faults=False)
+    assert wrong["result"] == "FAIL" and "그대로" in wrong["error"]
+
+
 def test_resetter_refuses_operation_stack():
     with pytest.raises(ValueError):
         Resetter(FakeCluster(stack="operation"), FakeApi(), "", "abc12")
@@ -179,3 +250,17 @@ def test_resetter_revokes_directly_when_job_finished_but_request_stuck_in_proces
     Resetter(cluster, api, "exp-fu-", "abc12", wait_timeout=0, interval=0).reset(admin_id=1)
     revoke = next(c for c in cluster.calls if "operations/revoke" in c)
     assert "'exp-fu-e2eabc12c04a'" in revoke and "'farm8'" in revoke and "'delete_account': True" in revoke
+
+
+def test_resetter_deletes_password_reset_rows_before_users_only_where_the_table_exists():
+    """재설정 신청은 users를 가리켜, 먼저 지우지 않으면 사용자 행이 지워지지 않는다. 표가 없는 옛 스택에서는 건드리지 않는다."""
+    for table_exists in (True, False):
+        cluster = FakeCluster()
+        cluster.on(r"information_schema\.tables", [("1",)] if table_exists else [])
+        Resetter(cluster, FakeApi(), "exp-fu-", "abc12", wait_timeout=0, interval=0).reset(admin_id=1)
+        deletes = next(c for c in cluster.calls if "START TRANSACTION" in c)
+        if table_exists:
+            assert deletes.index("DELETE FROM password_reset_requests") < deletes.index("DELETE FROM users")
+            assert "reviewed_by IN" in deletes
+        else:
+            assert "password_reset_requests" not in deletes

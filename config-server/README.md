@@ -38,7 +38,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `delete_pvc` | route `DELETE /pvc` | PVC와 연결 NFS 디렉토리를 삭제한다. | JSON `{"pvcs":[{"name","type","pvc_name?"}]}` 또는 legacy username/type | JSON `{results:[...]}` |
 | `add_group` | route `PUT /accounts/groups` | 새 Linux group row를 추가한다. `gid` 생략 시 group 파일 기준으로 자동 할당한다. | JSON `name`, optional `gid`, optional `members` | 201 JSON `{group:{name,gid}}` |
 | `add_user_groups` | route `PUT /accounts/users/<username>/groups` | 사용자를 보조 그룹에 추가한다. | path username, JSON `groups` | JSON `{status,user,groups}` |
-| `change_user_password` | route `PUT /users/<username>/password` | 계정 원장(shadow)·모든 계정 Secret·떠 있는 Pod의 로그인 비밀번호 해시를 바꾼다. 해시는 Pod에 표준입력으로 넘긴다. 중간에 실패하면 옛 해시로 되돌리고(`rolled_back`) 500으로 답한다. | path username, JSON `passwd_hash`(SHA-512 crypt) | JSON `{status,user,secrets,pods}` |
+| `register_password_change` | route `POST /operations/password` | 로그인 비밀번호 교체 작업을 등록하고 바로 202를 돌려준다. 제어기가 계정 원장(shadow)·모든 계정 Secret·떠 있는 Pod의 해시를 바꾸고(`lifecycle_steps/password.py`), 중간에 실패하면 옛 해시로 되돌린 뒤 작업을 실패로 끝낸다(`rolled_back`). 해시는 Pod에 표준입력으로 넘긴다. 결과는 `GET /operations/password/<request_id>`. | JSON `request_id`(비밀번호 재설정 신청 번호), `username`, `passwd_hash`(SHA-512 crypt) | 202 JSON `{request_id,job_id,status}` |
 
 ## `utils.py` 클래스와 함수
 

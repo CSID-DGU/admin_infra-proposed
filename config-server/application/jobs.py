@@ -78,6 +78,7 @@ RERUN_SAFE = {
     "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
+    "step_change_login_password",
 }
 
 PRE_STEP = {
@@ -267,11 +268,24 @@ def _execute_step(step, ctx, kind, request_id, username):
         if _main.RETRY_DELAY_SEC:
             time.sleep(_main.RETRY_DELAY_SEC)
 
-JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE}
+JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE,
+               "password": Action.CHANGE_PASSWORD}
+
+# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호)로 등록하는 작업은
+# 접두어를 붙여, 같은 숫자의 컨테이너 신청 기록과 섞이지 않게 한다 — 신청 번호만으로 기록을 읽는 조회가 있다.
+JOB_KEY_PREFIX = {"password": "password-reset-"}
+
+
+def job_key(kind, request_id):
+    """작업 기록·작업 입력에 쓰는 키. 컨테이너 신청 작업은 신청 번호 그대로다."""
+    prefix = JOB_KEY_PREFIX.get(kind)
+    return f"{prefix}{request_id}" if prefix else request_id
 
 _JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
 
 def _job_steps(kind, job):
+    if kind == "password":
+        return list(_main.PASSWORD_CHANGE_STEPS)
     if kind == "migrate":
         steps = list(_main.MIGRATE_STEPS)
         if _main.VERIFY_MODE == "full":
@@ -304,6 +318,8 @@ def _job_steps(kind, job):
 
 def _job_ctx(kind, request_id, job):
     ctx = {"request_id": request_id, "username": job["username"]}
+    if kind == "password":
+        ctx["passwd_hash"] = job["passwd_hash"]
     if kind == "provision":
         ctx["config_by_request"] = True
         if job.get("account"):
@@ -322,16 +338,18 @@ def _job_ctx(kind, request_id, job):
 
 def find_unfinished_jobs(limit=100):
     """operation_log에서 작업 START만 있고 끝이 없는 작업을 오래된 순으로. (kind, request_id, username, job_id)"""
+    actions = [action.value for action in JOB_ACTIONS.values()]
+    marks = ", ".join(["%s"] * len(actions))
     conn = _main.get_log_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT s.action, s.request_id, s.username, s.id FROM operation_log s "
-                "WHERE s.action IN (%s, %s, %s) AND s.phase = %s AND NOT EXISTS ("
+                f"WHERE s.action IN ({marks}) AND s.phase = %s AND NOT EXISTS ("
                 " SELECT 1 FROM operation_log e WHERE e.request_id = s.request_id"
                 " AND e.action = s.action AND e.id > s.id AND e.phase IN (%s, %s, %s)) "
                 "ORDER BY s.id LIMIT %s",
-                (Action.PROVISION.value, Action.REVOKE.value, Action.MIGRATE.value, Phase.START.value,
+                (*actions, Phase.START.value,
                  Phase.SUCCESS.value, Phase.FAIL.value, Phase.UNKNOWN.value, limit),
             )
             return [(_JOB_KIND[a], r, u, j) for a, r, u, j in cur.fetchall()]
@@ -392,6 +410,8 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             "pod_name": ctx.get("pod_name"), "node": ctx.get("node"),
             "ports": ctx.get("allocated_ports") or [],
         }
+        if kind == "password":
+            result = {"secrets": ctx.get("password_secrets") or [], "pods": ctx.get("password_pods") or {}}
         if kind == "migrate":
             skipped = bool(ctx.get("skipped"))
             result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),

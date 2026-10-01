@@ -273,6 +273,46 @@ class Context:
             if row["account"] != wanted:
                 raise StepFailed(f"{alias}: 계정 상태 {wanted}를 기다렸지만 {row['account']}")
 
+    def do_reset_password(self, arg):
+        """관리자가 사용자의 비밀번호를 새로 정한다. 버리는 무작위 값이라 어디에도 남기지 않는다.
+        바뀌었는지 나중에 견줄 수 있게, 초기화 전에 기록돼 있던 해시를 기억해 둔다."""
+        alias, expect = self._target(arg, "user")
+        user = self.users[alias]
+        self.memo[f"{alias}.password_before"] = observe.recorded_password_hash(self.run.cluster, user["id"])
+        self._call("PUT", f"/api/admin/users/{user['id']}/password", as_user=self.run.admin_id,
+                   body={"newPassword": secrets.token_urlsafe(24)}, expect=expect)
+
+    def do_wait_password(self, arg):
+        """가장 최근 비밀번호 재설정 신청이 원하는 상태(PENDING·PROCESSING·APPLIED·DENIED)가 될 때까지 기다린다.
+        초기화는 컨테이너에 반영하는 작업만 등록하고 돌아오므로, 적용은 그 작업이 끝난 뒤다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, wanted in arg.items():
+            if alias == "timeout":
+                continue
+            user_id = self.users[alias]["id"]
+            observe.wait_until(lambda: observe.password_reset_status(self.run.cluster, user_id) == wanted,
+                               timeout, self.run.interval)
+            status = observe.password_reset_status(self.run.cluster, user_id)
+            self.observed.append({"step": self.step_no, "user": alias, "password_reset": status})
+            if status != wanted:
+                raise StepFailed(f"{alias}: 비밀번호 재설정 상태 {wanted}를 기다렸지만 {status}")
+
+    def do_expect_password(self, arg):
+        """{신청: changed|unchanged}. 그 신청의 컨테이너에 들어 있는 로그인 비밀번호가 admin_be 기록과 같아야 한다
+        — 어긋나면 웹과 SSH 비밀번호가 달라진 것이다. 마지막 초기화 전과 견주어 바뀌었는지도 함께 본다."""
+        for alias, want in arg.items():
+            owner_alias, owner = next((a, u) for a, u in self.users.items() if u["id"] == self._owner(alias))
+            row = observe.request_row(self.run.cluster, self._req(alias))
+            recorded = observe.recorded_password_hash(self.run.cluster, owner["id"])
+            in_pod = observe.pod_password_hash(self.run.cluster, row["pod"], owner["name"])
+            changed = recorded != self.memo[f"{owner_alias}.password_before"]
+            self.observed.append({"step": self.step_no, "request": alias, "password_in_sync": in_pod == recorded,
+                                  "password_changed": changed})
+            if in_pod != recorded:
+                raise StepFailed(f"{alias}: 컨테이너의 로그인 비밀번호가 admin_be 기록과 다름")
+            if changed != (want == "changed"):
+                raise StepFailed(f"{alias}: 비밀번호가 {want}이어야 하는데 {'바뀜' if changed else '그대로'}")
+
     def do_remember_uid(self, arg):
         row = observe.user_row(self.run.cluster, self.users[arg["user"]]["id"])
         self.memo[arg["as"]] = row["uid"]
