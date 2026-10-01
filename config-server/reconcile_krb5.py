@@ -20,12 +20,20 @@ def reconcile_krb5_cleanup_pending() -> None:
     지우면 이미 살아난 keytab을 뒤늦게 지워버리게 된다. 그래서 각 행마다 먼저 그 행을
     원자적으로 DELETE(선점)해보고, 실제로 지워진 경우(=아직 아무도 안 지운 예약)에만
     실제 정리를 실행한다. 이미 지워져 있었다면(배포 성공으로 먼저 취소됨) 조용히
-    건너뛴다."""
+    건너뛴다.
+
+    선점만으로는 막지 못하는 경우가 있다. 정리가 시간 초과로 실패하면 예약을 다시 적는데, 그 사이
+    같은 노드에 배포가 성공해 있으면 살아 있는 keytab에 삭제 예약이 걸려 다음 주기에 지워진다(갱신
+    타이머까지 사라져 티켓 만료 뒤 홈 접근이 끊긴다). 그래서 지우기 전에 그 노드에 이 사용자의 포트
+    할당이 있는지 본다 — 할당은 keytab 배포보다 먼저 생기고 회수 때는 keytab 정리보다 먼저 지워진다.
+    있으면 지우지 않고 예약도 버린다. 확인 자체가 실패하면 지우지 않고 예약을 되돌려 다음 주기에 맡긴다."""
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT username, node_name FROM krb5_cleanup_pending")
-        rows = cur.fetchall()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username, node_name FROM krb5_cleanup_pending")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
     for username, node_name in rows:
         conn = get_db_connection()
@@ -42,6 +50,16 @@ def reconcile_krb5_cleanup_pending() -> None:
 
         if not claimed:
             app.logger.info(f"[KRB5 RECONCILE] 예약이 이미 취소됨(그 사이 배포 성공): {username} ← {node_name}")
+            continue
+
+        try:
+            in_use = username in _get_expected_krb5_usernames_for_node(node_name)
+        except Exception as e:
+            app.logger.warning(f"[KRB5 RECONCILE] 사용 여부 확인 실패(다음 주기에 재시도): {username} ← {node_name} — {e}")
+            _record_krb5_cleanup_pending(username, node_name)
+            continue
+        if in_use:
+            app.logger.info(f"[KRB5 RECONCILE] 그 노드에서 다시 쓰이는 중이라 정리 예약을 버림: {username} ← {node_name}")
             continue
 
         try:
