@@ -1,5 +1,7 @@
+import itertools
 import pathlib
 import sys
+import types
 
 import pytest
 
@@ -107,3 +109,46 @@ def lease_env(monkeypatch):
     monkeypatch.setattr(job_control, "release", lambda job_id, owner=None: rows.pop(job_id, None))
     monkeypatch.setattr(job_control, "renew", lambda ids, owner=None, ttl_sec=None: len(ids))
     return rows
+
+
+@pytest.fixture
+def group_job(monkeypatch, api):
+    """그룹 작업을 등록하고 제어기가 하듯 끝까지 실행한다. 반환: run(op, mode="baseline", **본문 필드).
+
+    결과의 status 는 등록 응답 코드다. 등록이 거절되면(202 아님) error 는 응답의 error 이고 작업은 돌지 않는다.
+    등록되면 phase·error 는 작업 끝 행, gid·pods 는 작업 결과다. mode 는 실행 방식(baseline 은 재시도 없음)."""
+    store, rows, results, numbers = {}, [], {}, itertools.count(1)
+
+    def save(action, key, job):
+        if (action, key) in store:
+            return False
+        store[(action, key)] = {"state": "queued", "job": job}
+        return True
+
+    def log(**row):
+        rows.append(row)
+        return len(rows)
+
+    monkeypatch.setattr(main, "save_job_input", save)
+    monkeypatch.setattr(main, "load_job_input", lambda a, k: store.get((a, k)))
+    monkeypatch.setattr(main, "mark_job_running", lambda a, k: store[(a, k)].update(state="running"))
+    monkeypatch.setattr(main, "delete_job_input", lambda a, k: store.pop((a, k), None))
+    monkeypatch.setattr(main, "save_job_result", lambda a, k, result: results.update({k: result}))
+    monkeypatch.setattr(main, "log_operation", log)
+
+    def run(op, mode="baseline", **fields):
+        monkeypatch.setattr(main, "VERIFY_MODE", mode)
+        number = next(numbers)
+        response = api.post("/operations/group", json={"request_id": number, "op": op, **fields})
+        if response.status_code != 202:
+            return types.SimpleNamespace(status=response.status_code, phase=None,
+                                         error=response.get_json().get("error"), gid=None, pods=None)
+        key = f"group-op-{number}"
+        with main.app.app_context():
+            main.run_job("group", key, fields.get("username") or fields["name"])
+        end = [r for r in rows if r["request_id"] == key and r["action"] == main.Action.CHANGE_GROUP][-1]
+        result = results.get(key) or {}
+        return types.SimpleNamespace(status=202, phase=end["phase"].value, error=end.get("error_code"),
+                                     gid=result.get("gid"), pods=result.get("pods"))
+    run.rows = rows
+    return run

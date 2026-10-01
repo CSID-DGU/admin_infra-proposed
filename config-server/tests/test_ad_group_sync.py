@@ -41,39 +41,102 @@ def _group_names():
     return {r["name"] for l in main.read_group_lines() if (r := main.parse_group_line(l))}
 
 
-# ---------- POST /groups ----------
+# ---------- 그룹 생성 ----------
 
-def test_new_group_goes_to_ad(etc, api):
+def test_new_group_goes_to_ad(etc, group_job):
     seed, sent = etc
-    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
-    assert r.status_code == 201
+    r = group_job("create", **{"name": "teamx", "gid": 70000})
+    assert r.phase == "SUCCESS"
     assert sent == ["group-create teamx 70000"]
 
 
-def test_ad_failure_rolls_back_the_group_file(etc, api, monkeypatch):
+def test_ad_failure_fails_the_job_and_the_same_request_finishes_it(etc, group_job, monkeypatch):
+    """실패해도 원장의 줄을 되돌리지 않는다. 되돌리면 다시 만들 때 gid 가 새로 배정돼, AD 에 먼저 남은
+    그룹의 gid 와 어긋난다. 같은 요청을 다시 보내면 그 줄의 gid 로 이어서 끝낸다."""
     seed, sent = etc
 
     def boom(cmd, stdin_data=""):
         raise RuntimeError("AD DC 접속 실패")
     monkeypatch.setattr(main, "_farm_ad_ssh", boom)
-    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
-    assert r.status_code == 500
-    assert r.get_json()["error"] == "AD_GROUP_CREATE_FAILED"
-    # 파일에만 있고 AD 에는 없는 "있는데 안 먹는" 그룹이 남으면 안 된다
+    r = group_job("create", name="teamx")
+    assert r.phase == "FAIL"
+    assert r.error == "AD_GROUP_CREATE_FAILED"
+
+    monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": sent.append(cmd) or "")
+    again = group_job("create", name="teamx")
+    assert again.phase == "SUCCESS" and again.gid == 70000
+    assert sent == ["group-create teamx 70000"]
+
+
+def test_ad_failure_is_retried_until_it_recovers(etc, group_job, monkeypatch):
+    """재시도하는 방식에서는 잠깐 막힌 AD 를 작업이 스스로 넘긴다."""
+    seed, sent = etc
+    calls = []
+
+    def flaky(cmd, stdin_data=""):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise RuntimeError("AD DC 접속 실패")
+        return ""
+    monkeypatch.setattr(main, "_farm_ad_ssh", flaky)
+    r = group_job("create", mode="full", name="teamx")
+    assert r.phase == "SUCCESS" and r.gid == 70000
+    assert calls == ["group-create teamx 70000"] * 2
     with main.app.app_context():
-        assert "teamx" not in _group_names()
+        assert [l for l in main.read_group_lines() if l.startswith("teamx:")] == ["teamx:x:70000:"]
 
 
-def test_group_name_must_not_collide_with_a_user(etc, api):
+def test_group_line_used_by_others_is_not_taken_over(etc, group_job):
+    """같은 이름의 줄에 요청에 없는 멤버가 있으면 남이 쓰는 그룹이다 — 이어 쓰지 않는다."""
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"], group=["teamx:x:70000:bob"])
+    r = group_job("create", name="teamx", members=["alice"])
+    assert r.phase == "FAIL" and r.error == "GROUP_NAME_EXISTS"
+    assert sent == []
+    assert _members("teamx") == ["bob"]
+
+
+def test_registration_stores_the_job_and_same_number_is_409(etc, api, logs, monkeypatch):
+    stored = {}
+    monkeypatch.setattr(main, "save_job_input",
+                        lambda a, k, job: (a, k) not in stored and not stored.update({(a, k): job}))
+    body = {"request_id": 7, "op": "create", "name": "teamx"}
+    r = api.post("/operations/group", json=body)
+    assert r.status_code == 202 and r.get_json()["request_id"] == "7"
+    # 컨테이너 신청 번호와 섞이지 않게 작업 기록의 키에는 접두어가 붙는다.
+    assert stored[("CHANGE_GROUP", "group-op-7")]["op"] == "create"
+    assert logs[0]["request_id"] == "group-op-7" and logs[0]["action"] == main.Action.CHANGE_GROUP
+    assert api.post("/operations/group", json=body).status_code == 409
+
+
+def test_prefix_guard_covers_group_jobs(etc, api, monkeypatch):
+    seed, sent = etc
+    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"], group=["teamx:x:70000:"])
+    monkeypatch.setattr(main, "ACCOUNT_PREFIX", "exp-np-")
+    for body in [{"op": "add", "username": "alice", "groups": ["teamx"]},
+                 {"op": "remove", "username": "alice", "name": "teamx"},
+                 {"op": "create", "name": "teamy", "members": ["alice"]}]:
+        assert api.post("/operations/group", json={"request_id": 1, **body}).status_code == 403
+
+
+@pytest.mark.parametrize("method,path", [
+    ("post", "/groups"), ("post", "/users/alice/groups"), ("delete", "/users/alice/groups/teamx"),
+    ("post", "/operations/nas-gss-flush"),
+])
+def test_sync_routes_are_gone(api, method, path):
+    assert getattr(api, method)(path, json={}).status_code in (404, 405)
+
+
+def test_group_name_must_not_collide_with_a_user(etc, group_job):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"])
-    r = api.post("/groups", json={"name": "alice", "gid": 70000})
-    assert r.status_code == 400
-    assert r.get_json()["error"] == "GROUP_NAME_CONFLICTS_USER"
+    r = group_job("create", **{"name": "alice", "gid": 70000})
+    assert r.status == 400
+    assert r.error == "GROUP_NAME_CONFLICTS_USER"
     assert sent == []          # AD 로 나가기 전에 막혀야 한다
 
 
-def test_group_name_reserved_by_the_image_is_rejected(etc, api):
+def test_group_name_reserved_by_the_image_is_rejected(etc, group_job):
     """이미지가 이미 가진 이름이면 Pod 가 기동하지 못한다 — 만들기 전에 막는다(#152).
     group 파일 중복 검사로는 못 잡는다. 시드에 없는 이름이라 409 에 걸리지 않기 때문이다."""
     seed, sent = etc
@@ -81,61 +144,61 @@ def test_group_name_reserved_by_the_image_is_rejected(etc, api):
         seeded = _group_names()
     for bad in ["render", "docker", "_ssh", "nova", "svmanager"]:
         assert bad not in seeded, f"{bad} 가 시드에 있으면 이 시험이 의미 없다"
-        r = api.post("/groups", json={"name": bad, "gid": 70000})
-        assert r.status_code == 409, bad
-        assert r.get_json()["error"] == "GROUP_NAME_RESERVED", bad
+        r = group_job("create", **{"name": bad, "gid": 70000})
+        assert r.status == 409, bad
+        assert r.error == "GROUP_NAME_RESERVED", bad
     assert sent == []          # AD 로 나가기 전에 막혀야 한다
     with main.app.app_context():
         assert _group_names() == seeded
 
 
-def test_group_name_charset_is_validated(etc, api):
+def test_group_name_charset_is_validated(etc, group_job):
     seed, sent = etc
     for bad in ["Team X", "team;rm -rf /", "TEAM", "1team"]:
-        r = api.post("/groups", json={"name": bad, "gid": 70000})
-        assert r.status_code == 400, bad
+        r = group_job("create", **{"name": bad, "gid": 70000})
+        assert r.status == 400, bad
     assert sent == []
 
 
 # ---------- 팀 공유 디렉터리 (#154) ----------
 
-def test_new_group_gets_a_team_directory(etc, api, team_dirs):
+def test_new_group_gets_a_team_directory(etc, group_job, team_dirs):
     seed, sent = etc
-    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
-    assert r.status_code == 201
+    r = group_job("create", **{"name": "teamx", "gid": 70000})
+    assert r.phase == "SUCCESS"
     assert team_dirs == [("teamx", 70000)]
 
 
-def test_team_directory_is_made_after_the_ad_group(etc, api, monkeypatch):
+def test_team_directory_is_made_after_the_ad_group(etc, group_job, monkeypatch):
     """NAS 는 AD 그룹을 보고 판정한다. AD 에 없으면 chown 할 gid 도 NAS 가 모른다."""
     seed, sent = etc
     order = []
     monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": order.append("ad") or "")
     monkeypatch.setattr(main, "create_team_directory", lambda name, gid: order.append("dir"))
-    api.post("/groups", json={"name": "teamx", "gid": 70000})
+    group_job("create", **{"name": "teamx", "gid": 70000})
     assert order == ["ad", "dir"]
 
 
-def test_team_directory_failure_rolls_back_the_group_file(etc, api, monkeypatch):
+def test_team_directory_failure_is_finished_by_the_same_request(etc, group_job, monkeypatch):
     seed, sent = etc
 
     def boom(name, gid):
         raise RuntimeError("NAS SSH 실패")
     monkeypatch.setattr(main, "create_team_directory", boom)
-    r = api.post("/groups", json={"name": "teamx", "gid": 70000})
-    assert r.status_code == 500
-    assert r.get_json()["error"] == "TEAM_DIR_CREATE_FAILED"
-    with main.app.app_context():
-        assert "teamx" not in _group_names()
-    # 같은 요청을 다시 보내면 끝까지 간다 — AD 그룹 생성은 멱등이다
+    r = group_job("create", name="teamx")
+    assert r.phase == "FAIL"
+    assert r.error == "TEAM_DIR_CREATE_FAILED"
+    # 같은 요청을 다시 보내면 같은 gid 로 끝까지 간다 — AD 에는 이미 그 gid 로 그룹이 있다
     monkeypatch.setattr(main, "create_team_directory", lambda name, gid: None)
-    assert api.post("/groups", json={"name": "teamx", "gid": 70000}).status_code == 201
+    again = group_job("create", name="teamx")
+    assert again.phase == "SUCCESS" and again.gid == 70000
+    assert sent == ["group-create teamx 70000"] * 2
 
 
-def test_no_team_directory_when_ad_is_disabled(etc, api, monkeypatch, team_dirs):
+def test_no_team_directory_when_ad_is_disabled(etc, group_job, monkeypatch, team_dirs):
     seed, sent = etc
     monkeypatch.setitem(main.app.config, "KRB5_REALM", "")
-    assert api.post("/groups", json={"name": "teamx", "gid": 70000}).status_code == 201
+    assert group_job("create", **{"name": "teamx", "gid": 70000}).phase == "SUCCESS"
     assert team_dirs == []
 
 
@@ -178,27 +241,27 @@ def test_step_retries_plain_nas_failure(etc, monkeypatch):
     assert err.value.body["error"] == "AD_GROUP_SYNC_FAILED"
 
 
-# ---------- POST /users/<username>/groups ----------
+# ---------- 그룹 추가 ----------
 
-def test_adding_user_to_group_goes_to_ad(etc, api):
+def test_adding_user_to_group_goes_to_ad(etc, group_job):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 200
+    r = group_job("add", username="alice", groups=["teamx"])
+    assert r.phase == "SUCCESS"
     assert sent == ["group-addmember teamx alice"]
 
 
-def test_adding_user_to_older_group_fills_in_its_team_directory(etc, api, team_dirs):
+def test_adding_user_to_older_group_fills_in_its_team_directory(etc, group_job, team_dirs):
     """승인은 신규·재사용 계정 모두 이 경로를 탄다 — 디렉터리가 없던 옛 그룹도 여기서 채운다."""
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
-    assert api.post("/users/alice/groups", json={"groups": ["teamx"]}).status_code == 200
+    assert group_job("add", username="alice", groups=["teamx"]).phase == "SUCCESS"
     assert team_dirs == [("teamx", 70000)]
 
 
-def test_team_dir_failure_on_member_add_leaves_the_group_file_untouched(etc, api, monkeypatch):
+def test_team_dir_failure_on_member_add_leaves_the_group_file_untouched(etc, group_job, monkeypatch):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
@@ -206,15 +269,15 @@ def test_team_dir_failure_on_member_add_leaves_the_group_file_untouched(etc, api
     def boom(name, gid):
         raise RuntimeError("NAS SSH 실패")
     monkeypatch.setattr(main, "create_team_directory", boom)
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 500
-    assert r.get_json()["error"] == "TEAM_DIR_CREATE_FAILED"
+    r = group_job("add", username="alice", groups=["teamx"])
+    assert r.phase == "FAIL"
+    assert r.error == "TEAM_DIR_CREATE_FAILED"
     with main.app.app_context():
         line = [l for l in main.read_group_lines() if l.startswith("teamx:")][0]
         assert main.parse_group_line(line)["members"] == []
 
 
-def test_team_dir_mismatch_on_member_add_is_a_conflict(etc, api, monkeypatch):
+def test_team_dir_mismatch_on_member_add_is_a_conflict(etc, group_job, monkeypatch):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
@@ -222,12 +285,13 @@ def test_team_dir_mismatch_on_member_add_is_a_conflict(etc, api, monkeypatch):
     def mismatch(name, gid):
         raise main.TeamDirGroupMismatch("이미 gid 70001 소유")
     monkeypatch.setattr(main, "create_team_directory", mismatch)
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 409
-    assert r.get_json()["error"] == "TEAM_DIR_GROUP_MISMATCH"
+    r = group_job("add", mode="full", username="alice", groups=["teamx"])
+    # 사람이 NAS 를 확인해야 풀리는 실패라 재시도 없이 바로 끝난다.
+    assert r.phase == "FAIL"
+    assert r.error == "TEAM_DIR_GROUP_MISMATCH"
 
 
-def test_ad_failure_leaves_the_group_file_untouched(etc, api, monkeypatch):
+def test_ad_failure_leaves_the_group_file_untouched(etc, group_job, monkeypatch):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
@@ -235,85 +299,85 @@ def test_ad_failure_leaves_the_group_file_untouched(etc, api, monkeypatch):
     def boom(cmd, stdin_data=""):
         raise RuntimeError("AD DC 접속 실패")
     monkeypatch.setattr(main, "_farm_ad_ssh", boom)
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 500
+    r = group_job("add", username="alice", groups=["teamx"])
+    assert r.phase == "FAIL"
     with main.app.app_context():
         line = [l for l in main.read_group_lines() if l.startswith("teamx:")][0]
         assert main.parse_group_line(line)["members"] == []
 
 
-# ---------- DELETE /users/<username>/groups/<groupname> ----------
+# ---------- 그룹 제거 ----------
 
 def _members(name):
     line = [l for l in main.read_group_lines() if l.startswith(f"{name}:")][0]
     return main.parse_group_line(line)["members"]
 
 
-def test_removing_user_from_group_goes_to_ad_then_file_then_pods(etc, api, pod_group_remove):
+def test_removing_user_from_group_goes_to_ad_then_file_then_pods(etc, group_job, pod_group_remove):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:alice,bob"])
-    r = api.delete("/users/alice/groups/teamx")
-    assert r.status_code == 200
+    r = group_job("remove", username="alice", name="teamx")
+    assert r.phase == "SUCCESS"
     assert sent == ["group-removemember teamx alice"]
     assert _members("teamx") == ["bob"]
     assert pod_group_remove == [("alice", ["teamx"])]
 
 
-def test_removing_a_non_member_still_clears_ad(etc, api):
+def test_removing_a_non_member_still_clears_ad(etc, group_job):
     """파일과 AD 가 어긋나 있을 수 있다 — 파일에 없어도 AD 쪽은 확실히 비운다."""
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:bob"])
-    assert api.delete("/users/alice/groups/teamx").status_code == 200
+    assert group_job("remove", username="alice", name="teamx").phase == "SUCCESS"
     assert sent == ["group-removemember teamx alice"]
     assert _members("teamx") == ["bob"]
 
 
-def test_revoked_account_membership_can_still_be_removed(etc, api):
+def test_revoked_account_membership_can_still_be_removed(etc, group_job):
     seed, sent = etc
     seed(group=["teamx:x:70000:alice"])
-    assert api.delete("/users/alice/groups/teamx").status_code == 200
+    assert group_job("remove", username="alice", name="teamx").phase == "SUCCESS"
     assert _members("teamx") == []
 
 
-def test_primary_group_is_refused(etc, api):
+def test_primary_group_is_refused(etc, group_job):
     seed, sent = etc
     seed(passwd=["alice:x:21000:70000::/home/alice:/bin/bash"], group=["teamx:x:70000:"])
-    r = api.delete("/users/alice/groups/teamx")
-    assert r.status_code == 409
-    assert r.get_json()["error"] == "PRIMARY_GROUP"
+    r = group_job("remove", username="alice", name="teamx")
+    assert r.status == 409
+    assert r.error == "PRIMARY_GROUP"
     assert sent == []
 
 
-def test_unknown_group_is_not_found(etc, api):
+def test_unknown_group_is_not_found(etc, group_job):
     seed, sent = etc
-    r = api.delete("/users/alice/groups/nope")
-    assert r.status_code == 404
-    assert r.get_json()["error"] == "GROUP_NOT_FOUND"
+    r = group_job("remove", username="alice", name="nope")
+    assert r.status == 404
+    assert r.error == "GROUP_NOT_FOUND"
     assert sent == []
 
 
-@pytest.mark.parametrize("path", ["/users/Alice/groups/teamx", "/users/alice/groups/team%20x"])
-def test_names_outside_unix_rules_never_reach_ad(etc, api, path):
+@pytest.mark.parametrize("names", [{"username": "Alice", "name": "teamx"}, {"username": "alice", "name": "team x"}])
+def test_names_outside_unix_rules_never_reach_ad(etc, group_job, names):
     seed, sent = etc
     seed(group=["teamx:x:70000:alice"])
-    r = api.delete(path)
-    assert r.status_code == 400
-    assert r.get_json()["error"] == "INVALID_NAME"
+    r = group_job("remove", **names)
+    assert r.status == 400
+    assert r.error == "INVALID_REQUEST"
     assert sent == []
 
 
-def test_ad_failure_on_remove_leaves_the_group_file_untouched(etc, api, monkeypatch, pod_group_remove):
+def test_ad_failure_on_remove_leaves_the_group_file_untouched(etc, group_job, monkeypatch, pod_group_remove):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"], group=["teamx:x:70000:alice"])
 
     def boom(cmd, stdin_data=""):
         raise RuntimeError("AD DC 접속 실패")
     monkeypatch.setattr(main, "_farm_ad_ssh", boom)
-    r = api.delete("/users/alice/groups/teamx")
-    assert r.status_code == 500
-    assert r.get_json()["error"] == "AD_GROUP_MEMBER_FAILED"
+    r = group_job("remove", username="alice", name="teamx")
+    assert r.phase == "FAIL"
+    assert r.error == "AD_GROUP_MEMBER_FAILED"
     assert _members("teamx") == ["alice"]
     assert pod_group_remove == []
 
@@ -386,11 +450,11 @@ def test_nas_flush_trigger_failure_does_not_fail_the_job(etc, monkeypatch):
         provision.step_trigger_nas_gss_flush(ctx)
 
 
-def test_new_group_with_members_adds_them_in_ad(etc, api):
+def test_new_group_with_members_adds_them_in_ad(etc, group_job):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"])
-    r = api.post("/groups", json={"name": "teamx", "gid": 70000, "members": ["alice"]})
-    assert r.status_code == 201
+    r = group_job("create", **{"name": "teamx", "gid": 70000, "members": ["alice"]})
+    assert r.phase == "SUCCESS"
     assert sent == ["group-create teamx 70000", "group-addmember teamx alice"]
 
 
@@ -439,29 +503,29 @@ def test_remote_rejection_stops_immediately_and_keeps_the_real_reason(monkeypatc
 
 # ---------- 떠 있는 Pod 의 /etc/group (admin_infra_server#25) ----------
 
-def test_adding_user_to_group_syncs_running_pods(etc, api, pod_group_sync):
+def test_adding_user_to_group_syncs_running_pods(etc, group_job, pod_group_sync):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:", "teamy:x:70001:"])
-    r = api.post("/users/alice/groups", json={"groups": ["teamx", "teamy"]})
-    assert r.status_code == 200
+    r = group_job("add", username="alice", groups=["teamx", "teamy"])
+    assert r.phase == "SUCCESS"
     assert pod_group_sync == [("alice", {"teamx": 70000, "teamy": 70001})]
-    assert r.get_json()["pods"] == {"synced": [], "failed": []}
+    assert r.pods == {"synced": [], "failed": []}
 
 
-def test_pod_sync_failure_does_not_fail_the_request(etc, api, monkeypatch):
+def test_pod_sync_failure_does_not_fail_the_request(etc, group_job, monkeypatch):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
     monkeypatch.setattr(main, "sync_running_pod_groups",
                         lambda u, g: {"synced": [], "failed": ["ailab-alice-1"]})
-    r = api.post("/users/alice/groups", json={"groups": ["teamx"]})
-    assert r.status_code == 200
+    r = group_job("add", username="alice", groups=["teamx"])
+    assert r.phase == "SUCCESS"
     assert "alice" in next(l for l in main.read_group_lines() if l.startswith("teamx:"))
-    assert r.get_json()["pods"]["failed"] == ["ailab-alice-1"]
+    assert r.pods["failed"] == ["ailab-alice-1"]
 
 
-def test_no_pod_sync_when_ad_rejects(etc, api, monkeypatch, pod_group_sync):
+def test_no_pod_sync_when_ad_rejects(etc, group_job, monkeypatch, pod_group_sync):
     seed, sent = etc
     seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
          group=["alice:x:21000:", "teamx:x:70000:"])
@@ -469,5 +533,5 @@ def test_no_pod_sync_when_ad_rejects(etc, api, monkeypatch, pod_group_sync):
     def boom(cmd, stdin_data=""):
         raise RuntimeError("AD DC 접속 실패")
     monkeypatch.setattr(main, "_farm_ad_ssh", boom)
-    assert api.post("/users/alice/groups", json={"groups": ["teamx"]}).status_code == 500
+    assert group_job("add", username="alice", groups=["teamx"]).phase == "FAIL"
     assert pod_group_sync == []

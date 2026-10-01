@@ -18,6 +18,11 @@ def run_prefix(stack_prefix, run_id):
     return f"{stack_prefix}e2e{safe(run_id)}".lower()
 
 
+def e2e_group_name(stack_prefix):
+    """E2E 가 쓰는 공용 그룹 이름. 스택마다 하나이고 실행마다 다시 쓴다(실행 접두어와는 겹치지 않는다)."""
+    return f"{stack_prefix}e2e-team"
+
+
 def admin_email(run_id):
     return f"e2e{safe(run_id)}-admin@example.com".lower()
 
@@ -29,6 +34,7 @@ class Resetter:
             raise ValueError("operation 스택에서는 allow_operation 없이 E2E 정리를 실행하지 않는다")
         self.cluster, self.api = cluster, api
         self.prefix = run_prefix(stack_prefix, run_id)
+        self.group_name = e2e_group_name(stack_prefix)
         self.admin_email = admin_email(run_id)
         self.wait_timeout, self.interval = wait_timeout, interval
 
@@ -152,9 +158,23 @@ class Resetter:
                                       "AND table_name = 'password_reset_requests';")
         resets = (f"DELETE FROM password_reset_requests WHERE user_id IN (SELECT * FROM ({users}) t) "
                   f"OR reviewed_by IN (SELECT * FROM ({users}) t);\n") if has_resets else ""
+        # 그룹 작업은 users·change_request·groups 를 가리킨다. E2E 공용 그룹은 admin_be 기록만 지운다 — 인프라의
+        # 그룹(AD·원장·팀 디렉터리)은 지울 수단이 없어 남기고, 다음 실행의 생성 작업이 그대로 이어받는다.
+        # 다른 실행의 사용자가 아직 속해 있으면 그 실행이 쓰는 중이므로 그룹 행은 두고 간다.
+        has_group_ops = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                                         "AND table_name = 'group_operations';")
+        group_ops = (f"DELETE FROM group_operations WHERE user_id IN (SELECT * FROM ({users}) t) "
+                     f"OR requested_by IN (SELECT * FROM ({users}) t);\n") if has_group_ops else ""
+        e2e_group = f"SELECT group_id FROM `groups` WHERE group_name = '{safe(self.group_name)}'"
+        group = (f"DELETE FROM `groups` WHERE group_name = '{safe(self.group_name)}' "
+                 f"AND NOT EXISTS (SELECT 1 FROM user_groups WHERE group_id IN (SELECT * FROM ({e2e_group}) t)) "
+                 f"AND NOT EXISTS (SELECT 1 FROM request_groups WHERE group_id IN (SELECT * FROM ({e2e_group}) t)) "
+                 f"AND NOT EXISTS (SELECT 1 FROM group_operations WHERE group_id IN (SELECT * FROM ({e2e_group}) t));\n"
+                 ) if has_group_ops else ""
         self.cluster.sql(
             "START TRANSACTION;\n"
             f"{resets}"
+            f"{group_ops}"
             f"DELETE FROM pod_external_ports WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM port_requests WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM change_request WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
@@ -162,6 +182,7 @@ class Resetter:
             f"DELETE FROM requests WHERE user_id IN (SELECT * FROM ({users}) t);\n"
             f"DELETE FROM user_groups WHERE user_id IN (SELECT * FROM ({users}) t);\n"
             f"DELETE FROM users WHERE user_id IN (SELECT * FROM ({users}) t);\n"
+            f"{group}"
             "COMMIT;")
         self.cluster.sql(f"DELETE FROM operation_log WHERE username LIKE '{self.prefix}%';",
                          database="operation_state_db")

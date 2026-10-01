@@ -26,23 +26,27 @@ def etc(tmp_path, monkeypatch):
         yield seed
 
 
+def _drop_group_line(name):
+    main.write_group_lines([l for l in main.read_group_lines() if (main.parse_group_line(l) or {}).get("name") != name])
+
+
 def _gids():
     return {r["name"]: r["gid"] for l in main.read_group_lines() if (r := main.parse_group_line(l))}
 
 
-def test_new_group_gets_first_shared_band_number(etc, api):
+def test_new_group_gets_first_shared_band_number(etc, group_job):
     etc(group=["yoon6yo:x:21000:"])          # uid 대역의 개인 그룹은 후보가 되면 안 된다
-    r = api.post("/groups", json={"name": "teamx"})
-    assert r.status_code == 201 and r.get_json()["group"]["gid"] == 70000
+    r = group_job("create", **{"name": "teamx"})
+    assert r.phase == "SUCCESS" and r.gid == 70000
 
 
-def test_explicit_gid_must_be_inside_shared_band(etc, api):
+def test_explicit_gid_must_be_inside_shared_band(etc, group_job):
     etc()
-    r = api.post("/groups", json={"name": "teamx", "gid": 21003})
-    assert r.status_code == 400 and r.get_json()["error"] == "GID_OUT_OF_RANGE"
+    r = group_job("create", **{"name": "teamx", "gid": 21003})
+    assert r.status == 400 and r.error == "GID_OUT_OF_RANGE"
 
-    r = api.post("/groups", json={"name": "teamx", "gid": 70001})
-    assert r.status_code == 201 and _gids()["teamx"] == 70001
+    r = group_job("create", **{"name": "teamx", "gid": 70001})
+    assert r.phase == "SUCCESS" and _gids()["teamx"] == 70001
 
 
 def test_shared_group_does_not_steal_the_next_uid(etc):
@@ -87,34 +91,34 @@ def test_deleted_top_uid_is_not_reissued(etc, logs):
     assert _uids()["newuser"] == 21002
 
 
-def test_deleted_top_shared_gid_is_not_reissued(etc, api):
+def test_deleted_top_shared_gid_is_not_reissued(etc, group_job):
     etc()
-    assert api.post("/groups", json={"name": "oldteam"}).status_code == 201
+    assert group_job("create", **{"name": "oldteam"}).phase == "SUCCESS"
     assert _gids()["oldteam"] == 70000
 
-    main._remove_group_line("oldteam")
-    r = api.post("/groups", json={"name": "newteam"})
-    assert r.status_code == 201 and r.get_json()["group"]["gid"] == 70001
+    _drop_group_line("oldteam")
+    r = group_job("create", **{"name": "newteam"})
+    assert r.phase == "SUCCESS" and r.gid == 70001
 
 
-def test_explicit_gid_raises_the_issued_floor(etc, api):
+def test_explicit_gid_raises_the_issued_floor(etc, group_job):
     etc()
-    assert api.post("/groups", json={"name": "restored", "gid": 70005}).status_code == 201
-    main._remove_group_line("restored")
-    r = api.post("/groups", json={"name": "teamx"})
-    assert r.get_json()["group"]["gid"] == 70006
+    assert group_job("create", **{"name": "restored", "gid": 70005}).phase == "SUCCESS"
+    _drop_group_line("restored")
+    r = group_job("create", **{"name": "teamx"})
+    assert r.gid == 70006
 
 
-def test_missing_record_falls_back_to_ledger_max(etc, api):
+def test_missing_record_falls_back_to_ledger_max(etc, group_job):
     etc(group=["legacy:x:70003:"])               # 기록 파일이 생기기 전부터 있던 팀
-    r = api.post("/groups", json={"name": "teamx"})
-    assert r.get_json()["group"]["gid"] == 70004
+    r = group_job("create", **{"name": "teamx"})
+    assert r.gid == 70004
 
 
-def test_corrupt_record_stops_allocation(etc, api):
+def test_corrupt_record_stops_allocation(etc, group_job):
     etc()
     with open(main.app.config["ISSUED_ID_MAX_PATH"], "w") as f:
         f.write("{not json")
-    r = api.post("/groups", json={"name": "teamx"})
-    assert r.status_code == 500 and r.get_json()["error"] == "ISSUED_ID_RECORD_FAILED"
+    r = group_job("create", **{"name": "teamx"})
+    assert r.phase == "FAIL" and r.error == "ISSUED_ID_RECORD_FAILED"
     assert "teamx" not in _gids()

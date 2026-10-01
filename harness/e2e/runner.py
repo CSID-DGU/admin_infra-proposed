@@ -14,7 +14,7 @@ import time
 from . import observe
 from .catalog import is_fault_case
 from .ports import safe
-from .resetter import admin_email, run_prefix
+from .resetter import admin_email, e2e_group_name, run_prefix
 
 # admin_be는 사용 목적을 50자 이상 받는다(be#633).
 PURPOSE_FILLER = "자동 점검용 시험 신청입니다. 컨테이너 생성과 회수 흐름이 정상인지 확인합니다."
@@ -45,6 +45,9 @@ class Run:
         # 한 사례가 수 분씩 걸려 끝날 때만 알리면 멈춘 것과 구분이 안 된다. 단계마다 한 줄씩 알린다.
         self.progress = progress
         self.prefix = run_prefix(stack_prefix, run_id)
+        # 공용 그룹은 AD 에서 지울 수단이 없다. 실행마다 새로 만들면 AD 에 계속 쌓이므로 스택마다 하나를 두고
+        # 다시 쓴다 — 정리 때 admin_be 기록만 지우면, 다음 실행의 생성 작업이 남은 그룹을 그대로 이어받는다.
+        self.group_name = e2e_group_name(stack_prefix)
         self.run_id = run_id
         self.wait_timeout, self.interval = wait_timeout, interval
         self.admin_id = None
@@ -74,6 +77,8 @@ class Run:
     def run_case(self, case, *, allow_faults):
         if is_fault_case(case) and not allow_faults:
             return {"id": case["id"], "result": "SKIP", "reason": "장애 사례 (--allow-faults 없음)"}
+        if self.cluster.stack in case.get("not_on", []):
+            return {"id": case["id"], "result": "SKIP", "reason": f"{self.cluster.stack} 스택에서는 돌리지 않는 사례"}
         ctx = Context(self, case["id"])
         started = time.monotonic()
         try:
@@ -318,6 +323,97 @@ class Context:
                 raise StepFailed(f"{alias}: 컨테이너의 로그인 비밀번호가 admin_be 기록과 다름")
             if changed != (want == "changed"):
                 raise StepFailed(f"{alias}: 비밀번호가 {want}이어야 하는데 {'바뀜' if changed else '그대로'}")
+
+    # ---- 공용 그룹 ----
+    def do_create_group(self, arg):
+        """사용자가 E2E 공용 그룹을 만든다. 만들기는 작업으로 등록만 되므로 끝나기는 wait_group 으로 기다린다."""
+        if observe.group_row(self.run.cluster, self.run.group_name):
+            # 같은 실행의 앞선 사례가 이미 만들었다. 그 그룹을 그대로 쓴다.
+            self.observed.append({"step": self.step_no, "group": "already exists"})
+            self.memo[f"{arg['as']}.operation"] = None
+            return
+        payload = self._call("POST", "/api/groups", as_user=self.users[arg["user"]]["id"],
+                             body={"groupName": self.run.group_name})
+        self.memo[f"{arg['as']}.operation"] = int(payload["data"]["operationId"])
+
+    def do_wait_group(self, arg):
+        """그룹 작업(만들기·빼기)이 원하는 상태(APPLIED·FAILED)가 될 때까지 기다린다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, wanted in arg.items():
+            if alias == "timeout":
+                continue
+            operation_id = self.memo[f"{alias}.operation"]
+            if operation_id is None:
+                continue  # 이미 있던 그룹이라 작업이 없다
+            observe.wait_until(
+                lambda: (o := observe.group_operation(self.run.cluster, operation_id)) and o["status"] != "PROCESSING",
+                timeout, self.run.interval)
+            row = observe.group_operation(self.run.cluster, operation_id)
+            self.observed.append({"step": self.step_no, "group_operation": alias, **(row or {})})
+            if not row or row["status"] != wanted:
+                raise StepFailed(f"{alias}: 그룹 작업이 {wanted}로 끝나야 하는데 {row}")
+
+    def do_request_group(self, arg):
+        """신청의 주인이 E2E 공용 그룹 추가를 변경 요청으로 낸다."""
+        alias = arg["req"]
+        group = observe.group_row(self.run.cluster, self.run.group_name)
+        if not group:
+            raise StepFailed(f"그룹 {self.run.group_name}이 admin_be에 없음")
+        self._call("POST", f"/api/requests/{self._req(alias)}/change", as_user=self._owner(alias),
+                   body={"changeType": "GROUP", "newValue": json.dumps([group["gid"]]),
+                         "reason": f"e2e {self.case} 공용 그룹 추가"})
+        rows = self.run.cluster.sql("SELECT MAX(change_request_id) FROM change_request "
+                                    f"WHERE request_id={int(self._req(alias))} AND change_type='GROUP';")
+        self.memo[f"{arg['as']}.change"] = int(rows[0][0])
+
+    def do_approve_change(self, arg):
+        alias, expect = self._target(arg, "change")
+        self._call("POST", f"/api/admin/change-requests/{self.memo[f'{alias}.change']}/approval",
+                   as_user=self.run.admin_id, body={"adminComment": "e2e"}, expect=expect)
+
+    def do_wait_change(self, arg):
+        """변경 요청이 원하는 상태가 될 때까지 기다린다. 그룹 추가는 승인하면 PROCESSING 이 되고, 반영 작업이
+        성공하면 FULFILLED, 실패하면 PENDING 으로 돌아온다."""
+        timeout = arg.get("timeout", self.run.wait_timeout)
+        for alias, wanted in arg.items():
+            if alias == "timeout":
+                continue
+            change_id = self.memo[f"{alias}.change"]
+            observe.wait_until(lambda: observe.change_request_status(self.run.cluster, change_id) == wanted,
+                               timeout, self.run.interval)
+            status = observe.change_request_status(self.run.cluster, change_id)
+            self.observed.append({"step": self.step_no, "change": alias, "status": status})
+            if status != wanted:
+                codes = sorted(observe.change_request_codes(self.run.cluster, change_id))
+                raise StepFailed(f"{alias}: 변경 요청 상태 {wanted}를 기다렸지만 {status} (코드 {codes})")
+
+    def do_remove_group(self, arg):
+        """관리자가 사용자를 E2E 공용 그룹에서 뺀다. 빼기도 작업으로 등록만 된다."""
+        group = observe.group_row(self.run.cluster, self.run.group_name)
+        payload = self._call("DELETE", f"/api/admin/users/{self.users[arg['user']]['id']}/groups/{group['id']}",
+                             as_user=self.run.admin_id)
+        self.memo[f"{arg['as']}.operation"] = int(payload["data"]["operationId"])
+
+    def do_expect_member(self, arg):
+        """{사용자: present|absent}. admin_be 기록·계정 원장·떠 있는 컨테이너가 모두 같은 답이어야 한다."""
+        for alias, want in arg.items():
+            user = self.users[alias]
+            pods = [r[0] for r in self.run.cluster.sql(
+                f"SELECT pod_name FROM requests WHERE user_id={int(user['id'])} AND status='FULFILLED' "
+                "AND pod_name IS NOT NULL;")]
+            seen = observe.group_membership(self.run.cluster, user["id"], user["name"], self.run.group_name, pods)
+            self.observed.append({"step": self.step_no, "user": alias, "membership": seen})
+            answers = [seen["recorded"], seen["ledger"], *seen["pods"]]
+            if any(answer != (want == "present") for answer in answers):
+                raise StepFailed(f"{alias}: 그룹 소속이 {want}이어야 하는데 {seen}")
+
+    def do_expect_change_codes(self, arg):
+        for alias, codes in arg.items():
+            seen = observe.change_request_codes(self.run.cluster, self.memo[f"{alias}.change"])
+            self.observed.append({"step": self.step_no, "change": alias, "codes": sorted(seen)})
+            missing = set(codes) - seen
+            if missing:
+                raise StepFailed(f"{alias}: 오류 코드 {sorted(missing)}가 기록되지 않음 (기록된 코드 {sorted(seen)})")
 
     def do_remember_uid(self, arg):
         row = observe.user_row(self.run.cluster, self.users[arg["user"]]["id"])

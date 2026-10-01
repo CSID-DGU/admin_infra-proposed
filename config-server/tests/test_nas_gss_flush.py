@@ -92,7 +92,7 @@ def test_removal_also_waits_for_nas(ledger, monkeypatch):
     더한 것만 보면 그룹에서 뺀 사용자가 하루 더 접근한다.
 
     그룹 줄은 남고 멤버만 빠지는 것이 실제 회수 모습이다. 그룹 자체를 지우는 API 는
-    없다(POST /groups 와 POST /users/<u>/groups 둘뿐)."""
+    없다(그룹 작업은 생성·멤버 추가·제거 셋뿐)."""
     write_group, flushes = ledger
     write_group("alice:x:21000:", "teamx:x:70000:")   # teamx 는 남고 alice 만 빠졌다
     _nas_says(monkeypatch, {"alice": {70000}})        # NAS 는 아직 멤버로 본다
