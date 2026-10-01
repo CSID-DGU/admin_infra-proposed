@@ -104,3 +104,50 @@ def wait_status(cluster, request_id, wanted, timeout=900, interval=10):
         time.sleep(interval)
         row = request_row(cluster, request_id)
     return row
+
+
+def group_operation(cluster, operation_id):
+    """그룹 작업의 상태(PROCESSING·APPLIED·FAILED)와 오류 코드."""
+    rows = cluster.sql(f"SELECT status, IFNULL(error_code,'') FROM group_operations "
+                       f"WHERE group_operation_id={int(operation_id)};")
+    return {"status": rows[0][0], "error": rows[0][1] or None} if rows else None
+
+
+def group_row(cluster, group_name):
+    rows = cluster.sql(f"SELECT group_id, ubuntu_gid FROM `groups` WHERE group_name='{safe(group_name)}';")
+    return {"id": int(rows[0][0]), "gid": int(rows[0][1])} if rows else None
+
+
+def change_request_status(cluster, change_request_id):
+    rows = cluster.sql(f"SELECT status FROM change_request WHERE change_request_id={int(change_request_id)};")
+    return rows[0][0] if rows else None
+
+
+def change_request_codes(cluster, change_request_id):
+    """이 변경 요청을 반영하려던 그룹 작업들이 남긴 오류 코드 집합."""
+    ops = cluster.sql(f"SELECT group_operation_id FROM group_operations "
+                      f"WHERE change_request_id={int(change_request_id)};")
+    keys = ", ".join(f"'group-op-{int(op[0])}'" for op in ops)
+    if not keys:
+        return set()
+    rows = cluster.sql(f"SELECT DISTINCT error_code FROM operation_log WHERE request_id IN ({keys}) "
+                       "AND error_code IS NOT NULL;", database="operation_state_db")
+    return {r[0] for r in rows}
+
+
+def group_membership(cluster, user_id, username, group_name, pods):
+    """한 사용자가 그룹에 들어 있는지를 세 곳에서 본다: admin_be 기록, 계정 원장, 떠 있는 컨테이너."""
+    recorded = bool(cluster.sql(
+        "SELECT 1 FROM user_groups ug JOIN `groups` g ON g.group_id = ug.group_id "
+        f"WHERE ug.user_id={int(user_id)} AND g.group_name='{safe(group_name)}';"))
+    ledger = cluster.config_server_python(
+        f"name, user = {group_name!r}, {username!r}\n"
+        "for line in open('/kube_share/group'):\n"
+        "    parts = line.rstrip('\\n').split(':')\n"
+        "    if parts[0] == name:\n"
+        "        print('MEMBER' if user in parts[3].split(',') else 'ABSENT')\n")
+    in_pods = []
+    for pod in pods:
+        out = cluster.sh(f'kubectl -n "$NS" exec {safe(pod)} -- getent group {safe(group_name)} || true')
+        in_pods.append(username in out.strip().split(":")[-1].split(","))
+    return {"recorded": recorded, "ledger": "MEMBER" in ledger, "pods": in_pods}

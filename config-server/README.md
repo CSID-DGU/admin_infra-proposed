@@ -36,8 +36,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `migrate` | route `POST /migrate` | 사용자 Pod GPU 노드 마이그레이션을 lock으로 감싸 실행한다. | JSON `{"username":..., "nodes":[...], "min_improvement_ratio":...}` | migrated/skipped/error JSON |
 | `create_or_resize_pvc` | route `POST /pvc` | 사용자/그룹 PVC를 생성하거나 기존 PVC 용량을 확장한다. | JSON `{"pvcs":[{"name","type","storage","pvc_name?"}]}` 또는 legacy username/storage | JSON `{results:[...]}` |
 | `delete_pvc` | route `DELETE /pvc` | PVC와 연결 NFS 디렉토리를 삭제한다. | JSON `{"pvcs":[{"name","type","pvc_name?"}]}` 또는 legacy username/type | JSON `{results:[...]}` |
-| `add_group` | route `PUT /accounts/groups` | 새 Linux group row를 추가한다. `gid` 생략 시 group 파일 기준으로 자동 할당한다. | JSON `name`, optional `gid`, optional `members` | 201 JSON `{group:{name,gid}}` |
-| `add_user_groups` | route `PUT /accounts/users/<username>/groups` | 사용자를 보조 그룹에 추가한다. | path username, JSON `groups` | JSON `{status,user,groups}` |
+| `register_group_change` | route `POST /operations/group` | 공용 그룹 작업(op=create 생성, add 멤버 추가, remove 멤버 제거)을 등록하고 바로 202를 돌려준다. 제어기가 AD·계정 원장(group)·NAS 팀 디렉터리·떠 있는 Pod를 차례로 맞춘다(`lifecycle_steps/group.py`). 이미 맞춰진 조각은 그대로 두므로 실패한 작업은 다시 등록하면 이어서 끝난다. 이름 충돌·없는 사용자나 그룹은 등록하지 않고 바로 거절한다. | JSON `request_id`, `op`, op별 `username`·`name`·`gid`·`members`·`groups` | 202 JSON `{request_id, job_id, status}`. 결과는 `GET /operations/group/<request_id>`(create는 `result.gid`) |
 | `register_password_change` | route `POST /operations/password` | 로그인 비밀번호 교체 작업을 등록하고 바로 202를 돌려준다. 제어기가 계정 원장(shadow)·모든 계정 Secret·떠 있는 Pod의 해시를 바꾸고(`lifecycle_steps/password.py`), 중간에 실패하면 옛 해시로 되돌린 뒤 작업을 실패로 끝낸다(`rolled_back`). 해시는 Pod에 표준입력으로 넘긴다. 결과는 `GET /operations/password/<request_id>`. | JSON `request_id`(비밀번호 재설정 신청 번호), `username`, `passwd_hash`(SHA-512 crypt) | 202 JSON `{request_id,job_id,status}` |
 
 ## `utils.py` 클래스와 함수

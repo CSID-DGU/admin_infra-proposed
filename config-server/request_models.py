@@ -13,7 +13,7 @@ import crypt
 import re
 import functools
 import unicodedata
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from flask import jsonify, request
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -211,12 +211,27 @@ class MigrateRequest(RequestBody):
         return _pod_name(value)
 
 
-class AddGroupRequest(RequestBody):
-    # 이 이름은 AD DC 로 가는 SSH 명령 문자열에 그대로 들어가고 sAMAccountName 이 된다.
+class GroupJobRequest(RequestBody):
+    """공용 그룹 작업 등록. op 에 따라 쓰는 필드가 다르다.
+
+    - create: name(그룹 이름), 선택 gid·members
+    - add: username, groups(더할 그룹 이름들)
+    - remove: username, name(뺄 그룹 이름)
+    """
+    request_id: str = Field(description="admin_be 그룹 작업 번호(양의 정수)", examples=["7"])
+    op: Literal["create", "add", "remove"]
+    # 이름들은 AD DC 로 가는 SSH 명령 문자열에 그대로 들어가고 sAMAccountName 이 된다.
     # 원격 스크립트도 같은 규칙으로 막지만, 보내는 쪽에서 먼저 거른다(#146).
-    name: UnixName = Field(examples=["developers"])
-    gid: Optional[int] = Field(default=None, description="생략하면 그룹 파일 기준으로 자동 할당")
+    username: Optional[UnixName] = Field(default=None, examples=["exp-np-001"])
+    name: Optional[UnixName] = Field(default=None, examples=["developers"])
+    gid: Optional[int] = Field(default=None, description="create 전용. 생략하면 그룹 파일 기준으로 자동 할당")
     members: List[UnixName] = []
+    groups: List[UnixName] = []
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
 
     @field_validator("gid", mode="before")
     @classmethod
@@ -227,9 +242,13 @@ class AddGroupRequest(RequestBody):
             raise ValueError("gid는 정수여야 합니다")
         return value
 
-
-class AddUserGroupsRequest(RequestBody):
-    groups: List[UnixName] = Field(min_length=1, examples=[["developers"]])
+    @model_validator(mode="after")
+    def _fields_for_op(self):
+        required = {"create": ("name",), "add": ("username", "groups"), "remove": ("username", "name")}[self.op]
+        missing = [field for field in required if not getattr(self, field)]
+        if missing:
+            raise ValueError(f"op={self.op}에는 {', '.join(missing)}가 필요합니다")
+        return self
 
 
 class PasswordChangeRequest(RequestBody):
@@ -252,7 +271,7 @@ class PasswordChangeRequest(RequestBody):
 
 
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  AddGroupRequest, AddUserGroupsRequest, PasswordChangeRequest)
+                  GroupJobRequest, PasswordChangeRequest)
 
 
 def _errors(exc: ValidationError):

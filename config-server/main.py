@@ -22,8 +22,8 @@ import subprocess
 from datetime import datetime
 
 from error import infra_error, k8s_error_fields
-from request_models import (is_valid_unix_name, validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
-                            DeletePodRequest, MigrateRequest, AddGroupRequest, AddUserGroupsRequest,
+from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
+                            DeletePodRequest, MigrateRequest, GroupJobRequest,
                             PasswordChangeRequest, SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
@@ -170,6 +170,10 @@ def _enforce_account_prefix():
         if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke",
                             "/operations/password"):
             names.append(body.get("username"))
+        if request.path == "/operations/group":
+            names.append(body.get("username"))
+            members = body.get("members")
+            names.extend(members if isinstance(members, list) else [])
         if request.path == "/operations/revoke" and str(body.get("pod_name") or "").startswith("ailab-"):
             names.append(_pod_username(body["pod_name"]))
     bad = [n for n in names if n is not None and not str(n).startswith(ACCOUNT_PREFIX)]
@@ -708,13 +712,6 @@ def _ensure_team_dir(name: str, gid: int) -> None:
     create_team_directory(name, int(gid))
 
 
-def _remove_group_line(name: str) -> None:
-    """그룹 파일에서 한 줄을 지운다. AD 반영 실패 시 방금 쓴 줄을 되돌리는 용도."""
-    with ledger_lock():
-        write_group_lines([l for l in read_group_lines()
-                           if (parse_group_line(l) or {}).get("name") != name])
-
-
 def _set_group_membership(groupnames, username: str, member: bool) -> None:
     """group 파일에서 username의 멤버십을 더하거나 뺀다. AD 호출 동안 원장 잠금을 쥐지 않도록
     호출자가 앞서 읽은 내용을 쓰지 않고 잠금 안에서 다시 읽어, 그 사이 다른 Pod가 쓴 줄을 덮어쓰지 않는다."""
@@ -986,310 +983,9 @@ def get_reserved_names():
     return jsonify(names=sorted(RESERVED_ACCOUNT_NAMES)), 200
 
 
-# ----------- Group management -----------
-@accounts_bp.route("/groups", methods=["POST"])
-@validate_body(AddGroupRequest)
-def add_group(body: AddGroupRequest):
-    """
-    그룹 생성 API
+# ----------- 공용 그룹 -----------
+# 생성·멤버 추가·제거는 작업으로만 한다(POST /operations/group, lifecycle_steps/group.py).
 
-    시스템에 새로운 Linux 그룹을 생성합니다.
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 그룹 생성
-
-    consumes:
-    - application/json
-
-    parameters:
-
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/AddGroupRequest'
-
-    responses:
-
-      201:
-        description: 그룹 생성 성공
-        schema:
-          type: object
-          properties:
-            group:
-              type: object
-              properties:
-                name:
-                  type: string
-                  example: developers
-                gid:
-                  type: integer
-                  example: 10001
-        examples:
-          application/json:
-            group:
-              name: developers
-              gid: 10001
-      400:
-        description: 잘못된 요청
-      409:
-        description: 그룹 이미 존재
-    """
-    name, gid, members = body.name, body.gid, body.members
-
-    # Validate that all members exist as users
-    passwd_lines = read_passwd_lines()
-    existing_users = {parse_passwd_line(l)["name"] for l in passwd_lines if parse_passwd_line(l)}
-    # AD 에서 사용자와 그룹은 sAMAccountName 을 공유한다 — 같은 이름이면 나중에 계정 생성이
-    # 실패하므로 여기서 막는다(#146).
-    if name in existing_users:
-        return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_CONFLICTS_USER",
-                                   f"group name collides with an existing user: {name}")), 400
-    # 이미지가 이미 쥔 이름이면 Pod 가 기동하지 못한다 — 여기서 막지 않으면 원인이 그룹 이름이라는
-    # 것을 기동 실패 로그에서 알아내야 한다(#152).
-    if name in RESERVED_GROUP_NAMES:
-        return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_RESERVED",
-                                   f"group name is reserved by the container image: {name}")), 409
-    if members:
-        invalid_members = [m for m in members if m not in existing_users]
-        if invalid_members:
-            return jsonify(infra_error("ADD_GROUP", "INVALID_GROUP_MEMBER",
-                                       f"invalid members (users not found): {', '.join(invalid_members)}")), 400
-
-    ensure_etc_layout()
-    with ledger_lock(), LockedFile(app.config["GROUP_PATH"], "r+") as f:
-        g_lines = f.read().splitlines()
-
-        if any((parse_group_line(gl) or {}).get("name") == name for gl in g_lines):
-            return jsonify(infra_error("ADD_GROUP", "GROUP_NAME_EXISTS", f"group already exists (name: {name})")), 409
-
-        if gid is None:
-            try:
-                issued_max = read_issued_id_max("shared_gid")
-            except Exception:
-                app.logger.exception("[ACCOUNTS] gid 발급 기록을 읽지 못해 그룹 생성 중단: %s", name)
-                return jsonify(infra_error("ADD_GROUP", "ISSUED_ID_RECORD_FAILED",
-                                           "cannot read issued gid record")), 500
-            gid = _allocate_next_gid(g_lines, min_gid=SHARED_GID_MIN, issued_max=issued_max)
-            if SHARED_GID_MAX is not None and gid > SHARED_GID_MAX:
-                return jsonify(infra_error("ADD_GROUP", "GID_RANGE_EXHAUSTED", f"gid range {SHARED_GID_MIN}~{SHARED_GID_MAX} exhausted")), 500
-        elif gid < SHARED_GID_MIN or (SHARED_GID_MAX is not None and gid > SHARED_GID_MAX):
-            # 호출자가 gid를 직접 주는 경로 — 개인 그룹 대역(=uid 대역)을 침범하면 여기서 막는다.
-            return jsonify(infra_error("ADD_GROUP", "GID_OUT_OF_RANGE", f"gid {gid} outside shared gid range {SHARED_GID_MIN}~{SHARED_GID_MAX}")), 400
-        elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
-            return jsonify(infra_error("ADD_GROUP", "GROUP_GID_EXISTS", f"group already exists (gid: {gid})")), 409
-
-        # 직접 준 gid(옛 팀을 원래 번호로 되살리는 운영 경로)도 기록해, 자동 배정이 그 번호를 다시 주지 않게 한다.
-        try:
-            record_issued_id("shared_gid", gid)
-        except Exception:
-            app.logger.exception("[ACCOUNTS] gid 발급 기록 실패로 그룹 생성 중단: %s(%s)", name, gid)
-            return jsonify(infra_error("ADD_GROUP", "ISSUED_ID_RECORD_FAILED",
-                                       "cannot record issued gid")), 500
-        new_group = {
-            "name": name,
-            "passwd": "x",
-            "gid": gid,
-            "members": sorted(members)
-        }
-
-        g_lines.append(format_group_entry(new_group))
-        f.seek(0)
-        f.write("\n".join(g_lines) + "\n")
-        f.truncate()
-
-    # AD 에 올려야 NAS 가 이 그룹을 인정한다(#146). 여기서 실패하면 파일에만 있고 실제로는
-    # 안 먹는 그룹이 남으므로, 방금 쓴 줄을 되돌리고 실패로 답한다.
-    try:
-        _create_ad_group(name, gid)
-        for m in sorted(members):
-            _add_ad_group_member(name, m)
-    except Exception as e:
-        app.logger.exception("[ACCOUNTS] AD 그룹 생성 실패, group 파일 롤백: %s(%s)", name, gid)
-        try:
-            _remove_group_line(name)
-        except Exception:
-            app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
-        return jsonify(infra_error("ADD_GROUP", "AD_GROUP_CREATE_FAILED",
-                                   f"failed to create group in AD: {name}")), 500
-
-    # 팀 디렉터리가 없으면 그룹은 있어도 같이 쓸 자리가 없다. AD 그룹과 디렉터리 생성이 모두
-    # 멱등이라 줄을 되돌려 두면 같은 요청을 다시 보내 이어서 끝낼 수 있다.
-    try:
-        _ensure_team_dir(name, gid)
-    except Exception:
-        app.logger.exception("[ACCOUNTS] 팀 디렉터리 생성 실패, group 파일 롤백: %s(%s)", name, gid)
-        try:
-            _remove_group_line(name)
-        except Exception:
-            app.logger.exception("[ACCOUNTS] 롤백까지 실패 — 수동 정리 필요: %s(%s)", name, gid)
-        return jsonify(infra_error("ADD_GROUP", "TEAM_DIR_CREATE_FAILED",
-                                   f"failed to create team directory: {name}")), 500
-
-    return jsonify({"group": {"name": name, "gid": gid}}), 201
-
-# ----------- Add user to supplementary groups -----------
-@accounts_bp.route("/users/<username>/groups", methods=["POST"])
-@validate_body(AddUserGroupsRequest)
-def add_user_groups(username: str, body: AddUserGroupsRequest):
-    """
-    사용자 보조 그룹 추가 API
-
-    특정 사용자를 하나 이상의 supplementary group에 추가합니다.
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 사용자 그룹 추가
-
-    parameters:
-
-      - in: path
-        name: username
-        required: true
-        type: string
-        example: user2100
-      - in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/AddUserGroupsRequest'
-
-    responses:
-
-      200:
-        description: 그룹 추가 성공
-      404:
-        description: 사용자 또는 그룹 없음
-      400:
-        description: groups 필드 누락
-    """
-    groups = body.groups
-
-    # Verify user exists and capture their name
-    user_found = False
-    for line in read_passwd_lines():
-        rec = parse_passwd_line(line)
-        if rec and rec["name"] == username:
-            user_found = True
-            break
-    if not user_found:
-        return jsonify(infra_error("ADD_USER_GROUPS", "USER_NOT_FOUND", f"user not found: {username}")), 404
-
-    g_lines = read_group_lines()
-    names = set(groups)
-
-    # Ensure all requested groups existed
-    existing_group_names = {parse_group_line(gl)["name"] for gl in g_lines if parse_group_line(gl)}
-    missing = [g for g in groups if g not in existing_group_names]
-    if missing:
-        return jsonify(infra_error("ADD_USER_GROUPS", "GROUP_NOT_FOUND", f"groups not found: {', '.join(missing)}")), 404
-
-    # AD 를 먼저 맞춘다 — 실패해도 group 파일이 더럽혀지지 않는다. 그룹·사용자 모두 이미
-    # 존재해야 하는 경로라 여기서 만들 것은 없고 멤버십만 더한다(#146).
-    try:
-        for g in sorted(names):
-            _add_ad_group_member(g, username)
-    except Exception:
-        app.logger.exception("[ACCOUNTS] AD 그룹 멤버 추가 실패: %s -> %s", username, sorted(names))
-        return jsonify(infra_error("ADD_USER_GROUPS", "AD_GROUP_MEMBER_FAILED",
-                                   f"failed to add {username} to groups in AD")), 500
-
-    # 신청 승인은 신규·재사용 계정 모두 이 경로로 그룹을 더한다. 팀 디렉터리가 생기기 전에
-    # 만든 그룹도 여기서 채워야 멤버가 같이 쓸 자리가 생긴다(#154). 멱등이라 매번 불러도 된다.
-    gids = {r["name"]: r["gid"] for gl in g_lines if (r := parse_group_line(gl))}
-    try:
-        for g in sorted(names):
-            _ensure_team_dir(g, gids[g])
-    except TeamDirGroupMismatch as e:
-        app.logger.error("[ACCOUNTS] 팀 디렉터리 gid 불일치: %s", e)
-        return jsonify(infra_error("ADD_USER_GROUPS", "TEAM_DIR_GROUP_MISMATCH", str(e))), 409
-    except Exception:
-        app.logger.exception("[ACCOUNTS] 팀 디렉터리 생성 실패: %s", sorted(names))
-        return jsonify(infra_error("ADD_USER_GROUPS", "TEAM_DIR_CREATE_FAILED",
-                                   f"failed to create team directories: {', '.join(sorted(names))}")), 500
-
-    _set_group_membership(names, username, member=True)
-
-    # 이미 떠 있는 Pod 는 기동 때 구운 /etc/group 을 그대로 쓴다 — 여기서 채워야 재생성 없이
-    # 새 세션부터 그룹이 보인다(admin_infra_server#25). 권한 원천(AD)은 이미 반영됐으므로
-    # 실패해도 요청은 성공으로 둔다.
-    pods = sync_running_pod_groups(username, {g: gids[g] for g in names})
-    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names)), "pods": pods})
-
-# ----------- Remove user from a supplementary group -----------
-@accounts_bp.route("/users/<username>/groups/<groupname>", methods=["DELETE"])
-def remove_user_group(username: str, groupname: str):
-    """
-    사용자 보조 그룹 제거 API
-
-    사용자를 공용 그룹에서 뺍니다. 이미 빠져 있어도 성공입니다. 팀 디렉터리와 그 안의 파일은
-    건드리지 않습니다.
-
-    ---
-    tags:
-    - Accounts
-
-    summary: 사용자 그룹 제거
-
-    parameters:
-
-      - in: path
-        name: username
-        required: true
-        type: string
-        example: user2100
-      - in: path
-        name: groupname
-        required: true
-        type: string
-        example: developers
-
-    responses:
-
-      200:
-        description: 제거 성공(이미 빠져 있던 경우 포함)
-      400:
-        description: 이름 형식 오류
-      404:
-        description: 그룹 없음
-      409:
-        description: 사용자의 primary 그룹
-      500:
-        description: AD 반영 실패
-    """
-    # 두 이름 모두 AD DC 로 가는 SSH 명령 문자열에 그대로 들어간다(#146).
-    for value in (username, groupname):
-        if not is_valid_unix_name(value):
-            return jsonify(infra_error("REMOVE_USER_GROUP", "INVALID_NAME", f"invalid name: {value}")), 400
-
-    g_lines = read_group_lines()
-    group = next((r for gl in g_lines if (r := parse_group_line(gl)) and r["name"] == groupname), None)
-    if not group:
-        return jsonify(infra_error("REMOVE_USER_GROUP", "GROUP_NOT_FOUND", f"group not found: {groupname}")), 404
-
-    # 회수된 계정은 passwd 에 없을 수 있다 — 그때도 남은 멤버십을 치울 수 있게 거부하지 않는다.
-    user = next((r for pl in read_passwd_lines() if (r := parse_passwd_line(pl)) and r["name"] == username), None)
-    if user and user["gid"] == group["gid"]:
-        return jsonify(infra_error("REMOVE_USER_GROUP", "PRIMARY_GROUP",
-                                   f"{groupname} is the primary group of {username}")), 409
-
-    # 추가와 같은 순서 — AD 가 실패하면 group 파일은 그대로 두어 재시도가 같은 상태에서 시작한다.
-    try:
-        _remove_ad_group_member(groupname, username)
-    except Exception:
-        app.logger.exception("[ACCOUNTS] AD 그룹 멤버 제거 실패: %s -> %s", username, groupname)
-        return jsonify(infra_error("REMOVE_USER_GROUP", "AD_GROUP_MEMBER_FAILED",
-                                   f"failed to remove {username} from {groupname} in AD")), 500
-
-    _set_group_membership([groupname], username, member=False)
-
-    pods = remove_running_pod_groups(username, [groupname])
-    return jsonify({"status": "removed", "user": username, "group": groupname, "pods": pods})
 
 # ----------- 로그인 비밀번호 -----------
 # 교체는 작업으로만 한다(POST /operations/password, lifecycle_steps/password.py). 아래는 그 단계와
@@ -1429,6 +1125,10 @@ from lifecycle_steps.migrate import (  # noqa: E402
     step_migrate_select_target, step_migrate_inherit_password, step_migrate_cleanup_old, MIGRATE_STEPS,
 )
 from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
+from lifecycle_steps.group import (  # noqa: E402
+    step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS,
+    check_create as check_group_create, check_add as check_group_add, check_remove as check_group_remove,
+)
 
 # 작업 실행 엔진은 application/jobs.py로 이동했다(얇은 이동). 아래 재수출은 기존 소비자
 # (라우트·제어기·테스트의 main.* 참조)를 무수정으로 유지한다.
@@ -1649,26 +1349,46 @@ def register_password_change(body: PasswordChangeRequest):
     return _register_job("password", body.request_id, body.username, job)
 
 
-@app.route("/operations/nas-gss-flush", methods=["POST"])
-def trigger_nas_gss_flush():
+@app.route("/operations/group", methods=["POST"])
+@validate_body(GroupJobRequest)
+def register_group_change(body: GroupJobRequest):
     """
-    NAS GSS 캐시 온디맨드 flush 트리거 (#161)
+    공용 그룹 작업 등록
 
-    그룹 변경 승인 직후 admin_be가 부른다. 30분 크론(reconcile_krb5.py)과 같은 조건(NAS
-    winbind가 이미 대장을 따라잡았을 때만)으로 flush하되, 승인 직후부터 짧은 간격으로 최대
-    10분간 재시도한다. 요청은 즉시 202로 끝나고 실제 작업은 백그라운드에서 돈다 — admin_be의
-    승인 트랜잭션을 막지 않기 위함이라, 이 응답은 "재시도를 시작했다/이미 돌고 있다"만 뜻하지
-    flush 성공을 보장하지 않는다(실패해도 30분 크론이 안전망으로 남아있다).
+    그룹 생성(op=create), 사용자의 그룹 추가(op=add)·제거(op=remove)를 작업으로 등록하고 바로 202를
+    돌려준다. 제어기가 AD · 계정 원장 · NAS 팀 디렉터리 · 떠 있는 Pod 를 차례로 맞춘다. 이미 맞춰진 조각은
+    그대로 두므로 실패한 작업은 다시 등록하면 이어서 끝난다. 이름 충돌·없는 사용자나 그룹처럼 다시 해도
+    같은 결과인 입력은 등록하지 않고 바로 거절한다.
+    결과는 GET /operations/group/<request_id>로 조회한다(create 는 result.gid 에 배정된 번호).
     ---
     tags:
     - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/GroupJobRequest'
     responses:
-      202: {description: 재시도 루프를 새로 띄웠거나 이미 돌고 있음}
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      404: {description: 사용자 또는 그룹 없음}
+      409: {description: 이름·번호 충돌, 기본 그룹 제거, 또는 같은 번호의 작업이 아직 끝나지 않음}
     """
-    # main.py를 import하는 reconcile_krb5.py를 순환 임포트 없이 쓰려고 함수 안에서 늦게 불러온다.
-    from reconcile_krb5 import trigger_nas_gss_flush_ondemand
-    started = trigger_nas_gss_flush_ondemand()
-    return jsonify({"status": "accepted", "started_new_loop": started}), 202
+    try:
+        if body.op == "create":
+            check_group_create(body.name, body.gid, body.members)
+            job = {"op": "create", "username": body.username or body.name, "name": body.name,
+                   "gid": body.gid, "members": body.members}
+        elif body.op == "add":
+            check_group_add(body.username, body.groups)
+            job = {"op": "add", "username": body.username, "groups": body.groups}
+        else:
+            check_group_remove(body.username, body.name)
+            job = {"op": "remove", "username": body.username, "name": body.name}
+    except StepFailed as e:
+        return jsonify(e.body), e.status
+    return _register_job("group", body.request_id, job["username"], job)
 
 
 @app.route("/operations/<kind>/<request_id>", methods=["GET"])
@@ -1684,7 +1404,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}

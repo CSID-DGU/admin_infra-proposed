@@ -79,6 +79,7 @@ RERUN_SAFE = {
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
     "step_change_login_password",
+    "step_group_create", "step_group_add_member", "step_group_remove_member",
 }
 
 PRE_STEP = {
@@ -269,11 +270,12 @@ def _execute_step(step, ctx, kind, request_id, username):
             time.sleep(_main.RETRY_DELAY_SEC)
 
 JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE,
-               "password": Action.CHANGE_PASSWORD}
+               "password": Action.CHANGE_PASSWORD, "group": Action.CHANGE_GROUP}
 
-# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호)로 등록하는 작업은
-# 접두어를 붙여, 같은 숫자의 컨테이너 신청 기록과 섞이지 않게 한다 — 신청 번호만으로 기록을 읽는 조회가 있다.
-JOB_KEY_PREFIX = {"password": "password-reset-"}
+# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호, 그룹 작업 번호)로
+# 등록하는 작업은 접두어를 붙여, 같은 숫자의 컨테이너 신청 기록과 섞이지 않게 한다 — 신청 번호만으로 기록을
+# 읽는 조회가 있다.
+JOB_KEY_PREFIX = {"password": "password-reset-", "group": "group-op-"}
 
 
 def job_key(kind, request_id):
@@ -286,6 +288,8 @@ _JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
 def _job_steps(kind, job):
     if kind == "password":
         return list(_main.PASSWORD_CHANGE_STEPS)
+    if kind == "group":
+        return list(_main.GROUP_STEPS[job["op"]])
     if kind == "migrate":
         steps = list(_main.MIGRATE_STEPS)
         if _main.VERIFY_MODE == "full":
@@ -320,6 +324,9 @@ def _job_ctx(kind, request_id, job):
     ctx = {"request_id": request_id, "username": job["username"]}
     if kind == "password":
         ctx["passwd_hash"] = job["passwd_hash"]
+    if kind == "group":
+        ctx.update(group_name=job.get("name"), group_requested_gid=job.get("gid"),
+                   group_members=job.get("members") or [], group_names=job.get("groups") or [])
     if kind == "provision":
         ctx["config_by_request"] = True
         if job.get("account"):
@@ -412,6 +419,8 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
         }
         if kind == "password":
             result = {"secrets": ctx.get("password_secrets") or [], "pods": ctx.get("password_pods") or {}}
+        if kind == "group":
+            result = {"gid": ctx.get("group_gid"), "pods": ctx.get("group_pods") or {}}
         if kind == "migrate":
             skipped = bool(ctx.get("skipped"))
             result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),

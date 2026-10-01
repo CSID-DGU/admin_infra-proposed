@@ -45,9 +45,9 @@ def _invalid(r):
     ("post", "/operations/migrate", {"request_id": "1", "username": "u", "nodes": []}, "nodes"),
     ("post", "/operations/migrate", {"request_id": "1", "username": "u", "nodes": ["farm1"], "min_improvement_ratio": 1.5}, "min_improvement_ratio"),
     ("post", "/operations/migrate", {"username": "u", "nodes": ["farm1"]}, "request_id"),
-    ("post", "/groups", {"gid": 1}, "name"),
-    ("post", "/users/u/groups", {"groups": []}, "groups"),
-    ("post", "/groups", {"name": "g", "gid": True}, "gid"),
+    ("post", "/operations/group", {"request_id": "1", "op": "create", "name": "g", "gid": True}, "gid"),
+    ("post", "/operations/group", {"request_id": "1", "op": "rename", "name": "g"}, "op"),
+    ("post", "/operations/group", {"op": "create", "name": "g"}, "request_id"),
 ])
 def test_invalid_bodies_share_one_error_shape(client, method, path, payload, field):
     body = _invalid(getattr(client, method)(path, json=payload))
@@ -108,11 +108,12 @@ _BAD_NAMES = ("Bob", "1abc", "a b", "a;id", "a:b", "a\nb", "../x", "$(id)", "a" 
     lambda n: rm.ProvisionAccount(passwd_base64="cHc=", supplementary_groups=[{"name": n, "gid": 1}]),
     lambda n: rm.RevokeRequest(request_id="1", username=n or "x y", delete_account=True),
     lambda n: rm.MigrateRequest(request_id="1", username=n, nodes=["farm1"]),
-    lambda n: rm.AddGroupRequest(name=n),
-    lambda n: rm.AddGroupRequest(name="g", members=[n]),
-    lambda n: rm.AddUserGroupsRequest(groups=[n]),
+    lambda n: rm.GroupJobRequest(request_id="1", op="create", name=n),
+    lambda n: rm.GroupJobRequest(request_id="1", op="create", name="g", members=[n]),
+    lambda n: rm.GroupJobRequest(request_id="1", op="add", username="u", groups=[n]),
+    lambda n: rm.GroupJobRequest(request_id="1", op="remove", username=n, name="g"),
 ], ids=["provision.username", "provision.groups", "account.primary_group", "account.groups",
-        "revoke.username", "migrate.username", "group.name", "group.members", "user_groups.groups"])
+        "revoke.username", "migrate.username", "group.name", "group.members", "group.groups", "group.username"])
 def test_every_body_name_field_rejects_non_unix_names(build, bad):
     with pytest.raises(ValidationError):
         build(bad)
@@ -121,7 +122,7 @@ def test_every_body_name_field_rejects_non_unix_names(build, bad):
 @pytest.mark.parametrize("good", ("u", "_svc", "exp-np-001", "a_b-9", "a" * 32))
 def test_unix_names_are_accepted(good):
     assert rm.ProvisionRequest(request_id="1", username=good).username == good
-    assert rm.AddUserGroupsRequest(groups=[good]).groups == [good]
+    assert rm.GroupJobRequest(request_id="1", op="add", username=good, groups=[good]).groups == [good]
 
 
 def test_bad_name_in_body_is_400_before_route(client):
@@ -130,12 +131,26 @@ def test_bad_name_in_body_is_400_before_route(client):
 
 
 def test_group_gid_rules():
-    assert rm.AddGroupRequest(name="g", gid="12").gid == 12
-    assert rm.AddGroupRequest(name="g", gid="").gid is None
-    assert rm.AddGroupRequest(name="g").members == []
+    def create(**fields):
+        return rm.GroupJobRequest(request_id="1", op="create", name="g", **fields)
+    assert create(gid="12").gid == 12
+    assert create(gid="").gid is None
+    assert create().members == []
     for bad in (True, "abc", 1.5):
         with pytest.raises(ValidationError):
-            rm.AddGroupRequest(name="g", gid=bad)
+            create(gid=bad)
+
+
+@pytest.mark.parametrize("fields", [
+    {"op": "create"},
+    {"op": "add", "username": "u"},
+    {"op": "add", "groups": ["g"]},
+    {"op": "remove", "username": "u"},
+    {"op": "remove", "name": "g"},
+])
+def test_group_job_requires_the_fields_of_its_op(fields):
+    with pytest.raises(ValidationError):
+        rm.GroupJobRequest(request_id="1", **fields)
 
 
 def test_migrate_dump_omits_absent_ratio_so_default_applies():
