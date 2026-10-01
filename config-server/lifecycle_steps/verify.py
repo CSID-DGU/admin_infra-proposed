@@ -270,12 +270,24 @@ def step_capture_access_targets(ctx):
     ctx["verify_node"] = rows[0][1] if rows else ctx.get("node_name")
 
 
+def _ports_held_by_others(cur, ports, pod_name):
+    """검사 대상 포트 중 지금 다른 Pod에 배정돼 있는 번호."""
+    if not ports:
+        return set()
+    marks = ",".join(["%s"] * len(ports))
+    cur.execute(f"SELECT node_port FROM nodeport_allocations WHERE pod_name<>%s AND node_port IN ({marks})",
+                (pod_name, *ports))
+    return {r[0] for r in cur.fetchall()}
+
+
 def step_verify_revoked(ctx):
     """회수 차단 확인. 연결 실패 단독은 증거가 아니다(논문 §5.1) — 순서:
     (1) 자원 부재 관찰: Pod 404 · Service 없음 · 포트 할당 행 없음
     (2) 시험 경로 생존 증명: 노드 ssh 포트 접속 성공 (실패면 판정 불능 → 재시도/DEGRADED)
     (3) 옛 NodePort 전부 닫힘
-    세 관찰이 일치할 때만 차단으로 기록한다."""
+    세 관찰이 일치할 때만 차단으로 기록한다.
+    포트는 Pod가 내려가기 전에 반납되므로, 그 사이 다른 Pod가 같은 번호를 배정받아 열어 둘 수 있다.
+    그런 포트는 이 Pod로 가는 길이 아니므로 (3)에서 뺀다."""
     def check(ctx):
         pod_name = ctx["pod_name"]
         ns = app.config["NAMESPACE"]
@@ -294,12 +306,15 @@ def step_verify_revoked(ctx):
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM nodeport_allocations WHERE pod_name=%s", (pod_name,))
                 db_rows = cur.fetchone()[0]
+                reassigned = _ports_held_by_others(cur, ctx.get("verify_ports") or [], pod_name)
         finally:
             conn.close()
         detail = {"scope": "k8s+db+tcp", "pod_absent": pod_absent,
                   "services": len(services), "db_rows": db_rows}
+        if reassigned:
+            detail["reassigned_ports"] = sorted(reassigned)
 
-        ports = ctx.get("verify_ports") or []
+        ports = [p for p in ctx.get("verify_ports") or [] if p not in reassigned]
         node_name = ctx.get("verify_node") or ctx.get("node_name")
         if ports and node_name:
             node = _main._get_farm_node_info(node_name)
