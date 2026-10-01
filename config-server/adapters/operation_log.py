@@ -91,6 +91,8 @@ class Action(str, Enum):
     PROVISION = "PROVISION"
     REVOKE = "REVOKE"
     MIGRATE = "MIGRATE"
+    # 로그인 비밀번호 교체. 컨테이너 신청이 아니라 비밀번호 재설정 신청에 딸린 작업이라 request_id에 접두어가 붙는다.
+    CHANGE_PASSWORD = "CHANGE_PASSWORD"
     # 컨테이너 준비 대기(WAIT_READY) 안의 세부 단계. Pod 이벤트로 판정하며 다른 단계와 같이 START/SUCCESS/FAIL로 남는다.
     PULL_IMAGE = "PULL_IMAGE"            # 노드에 이미지를 받는 중 (이미 있으면 기록되지 않음)
     START_CONTAINER = "START_CONTAINER"  # 이미지 준비 뒤 컨테이너 생성·시작·준비 확인

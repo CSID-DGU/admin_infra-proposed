@@ -11,6 +11,7 @@ VERBS = {
     "user", "apply", "approve", "reject", "cancel", "reclaim_container", "reclaim_account",
     "deactivate", "reactivate", "migrate", "wait", "expect_status", "expect_user", "remember_uid",
     "expect_codes", "expect_pod", "expect_node_changed", "fault", "heal", "sleep", "wait_job", "wait_account", "wait_codes",
+    "reset_password", "wait_password", "expect_password",
 }
 FAULT_VERBS = {"fault"}
 _TRANSITION = re.compile(r"^[A-Z]+>[A-Z]+$")

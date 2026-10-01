@@ -4,6 +4,7 @@ import pytest
 
 @pytest.mark.parametrize("method,path", [
     ("post", "/delete-pod"), ("post", "/migrate"), ("put", "/accounts/groups"), ("put", "/accounts/users/u/groups"),
+    ("put", "/accounts/users/u/password"),
 ])
 def test_old_paths_are_gone(api, method, path):
     assert getattr(api, method)(path, json={}).status_code in (404, 405)

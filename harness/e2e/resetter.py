@@ -146,8 +146,15 @@ class Resetter:
     def _delete_rows(self):
         users = f"SELECT user_id FROM users WHERE ubuntu_username LIKE '{self.prefix}%' OR email = '{self.admin_email}'"
         reqs = f"SELECT request_id FROM requests WHERE user_id IN ({users})"
+        # 비밀번호 재설정 신청은 users를 가리킨다. 이 표가 생기기 전의 admin_be가 떠 있는 스택에서도 돌 수 있게
+        # 표가 있을 때만 지운다.
+        has_resets = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                                      "AND table_name = 'password_reset_requests';")
+        resets = (f"DELETE FROM password_reset_requests WHERE user_id IN (SELECT * FROM ({users}) t) "
+                  f"OR reviewed_by IN (SELECT * FROM ({users}) t);\n") if has_resets else ""
         self.cluster.sql(
             "START TRANSACTION;\n"
+            f"{resets}"
             f"DELETE FROM pod_external_ports WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM port_requests WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM change_request WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"

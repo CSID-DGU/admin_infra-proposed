@@ -14,7 +14,7 @@
 CREATE TABLE IF NOT EXISTS operation_log (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   job_id        BIGINT,                 -- 작업 번호(v2.0): 작업 시작 행의 id. 제어기가 실행한 작업의 모든 행에 붙음. 동기 경로는 NULL
-  request_id    VARCHAR(64) NOT NULL,   -- 승인 번호. admin_be가 보내는 신청 PK를 그대로 사용
+  request_id    VARCHAR(64) NOT NULL,   -- 승인 번호. admin_be가 보내는 신청 PK를 그대로 사용 (비밀번호 교체 작업은 password-reset-<재설정 신청 번호>)
   username      VARCHAR(64) NOT NULL,
   pod_name      VARCHAR(255),           -- 알기 전엔 NULL, Pod 이름이 정해지면 채움
   node_name     VARCHAR(64),            -- 마찬가지로 노드가 정해지면 채움
@@ -48,7 +48,7 @@ PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 CREATE TABLE IF NOT EXISTS job_control (
   job_id      BIGINT PRIMARY KEY,      -- operation_log 작업 시작 행의 id
   request_id  VARCHAR(64)  NOT NULL,
-  action      VARCHAR(64)  NOT NULL,   -- PROVISION / REVOKE
+  action      VARCHAR(64)  NOT NULL,   -- PROVISION / REVOKE / MIGRATE / CHANGE_PASSWORD
   owner       VARCHAR(128) NOT NULL,   -- 제어기 프로세스 식별자 (host-pid-난수)
   lease_until DOUBLE       NOT NULL,   -- epoch 초. 지나면 다른 제어기가 인수한다
   done_steps  TEXT,                    -- 끝난 단계 이름 JSON 배열

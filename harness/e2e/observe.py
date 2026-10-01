@@ -22,6 +22,25 @@ def user_row(cluster, user_id):
     return {"uid": int(uid) if uid else None, "gid": int(gid) if gid else None, "account": account}
 
 
+def password_reset_status(cluster, user_id):
+    """이 사용자의 가장 최근 비밀번호 재설정 신청 상태(PENDING·PROCESSING·APPLIED·DENIED). 없으면 None."""
+    rows = cluster.sql(f"SELECT status FROM password_reset_requests WHERE user_id={int(user_id)} "
+                       "ORDER BY password_reset_request_id DESC LIMIT 1;")
+    return rows[0][0] if rows else None
+
+
+def recorded_password_hash(cluster, user_id):
+    """admin_be가 이 사용자의 SSH 비밀번호로 기록해 둔 해시. 비교에만 쓰고 어디에도 남기지 않는다."""
+    rows = cluster.sql(f"SELECT IFNULL(ubuntu_password_hash,'') FROM users WHERE user_id={int(user_id)};")
+    return rows[0][0] if rows and rows[0][0] else None
+
+
+def pod_password_hash(cluster, pod_name, username):
+    """컨테이너 안 /etc/shadow에 들어 있는 로그인 비밀번호 해시. 비교에만 쓰고 어디에도 남기지 않는다."""
+    out = cluster.sh(f'kubectl -n "$NS" exec {safe(pod_name)} -- getent shadow {safe(username)} | cut -d: -f2')
+    return out.strip() or None
+
+
 def oplog_codes(cluster, request_id):
     """이 신청 번호로 남은 작업 기록의 오류 코드 집합."""
     rows = cluster.sql(f"SELECT DISTINCT error_code FROM operation_log WHERE request_id='{int(request_id)}' "
