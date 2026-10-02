@@ -38,7 +38,7 @@ def _invalid(r):
      "account.passwd_hash"),
     ("post", "/operations/provision", {"request_id": "1", "username": "u", "account": {}}, "account"),
     ("post", "/operations/provision", {"request_id": "1", "username": "u",
-                                       "account": {"passwd_base64": "cHc=", "supplementary_groups": [{"name": "g"}]}},
+                                       "account": {"passwd_base64": "cHc=", "supplementary_groups": [{"name": "g", "gid": 0}]}},
      "account.supplementary_groups.0.gid"),
     ("post", "/operations/revoke", {"request_id": "1", "pod_name": "other-pod"}, "pod_name"),
     ("delete", "/pods/other-pod", {}, "pod_name"),

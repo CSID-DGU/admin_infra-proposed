@@ -1151,7 +1151,7 @@ from lifecycle_steps.migrate import (  # noqa: E402
 )
 from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
 from lifecycle_steps.group import (  # noqa: E402
-    step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS,
+    step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS, step_resolve_new_groups,
     check_create as check_group_create, check_add as check_group_add, check_remove as check_group_remove,
 )
 

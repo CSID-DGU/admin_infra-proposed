@@ -478,10 +478,37 @@ def step_fetch_user_config(ctx):
             was_status=resp.status_code,
         ), 502)
 
+    _fill_new_group_gids(ctx, user_info)
     _main.log_operation(request_id=request_id, username=username,
                   action=Action.FETCH_USER_CONFIG, phase=Phase.SUCCESS)
     _main.app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
     ctx["user_info"] = user_info
+
+
+def _fill_new_group_gids(ctx, user_info):
+    """admin_be 는 새 공유 그룹(승인 대기 그룹)의 gid 를 작업이 끝난 뒤에야 기록하므로, 이 작업이 만든 그룹은
+    gid 없이(null) 온다. 이 작업이 정한 gid(step_resolve_new_groups)로 채운다. 채우지 못하면 그 그룹을 빼고
+    컨테이너를 만들지 않고 실패한다 — 빼면 그룹 없는 컨테이너가 성공으로 끝난다."""
+    groups = user_info.get("groups")
+    if not isinstance(groups, list):
+        return
+    resolved = {sg["name"]: int(sg["gid"]) for sg in ctx.get("supp_groups") or [] if sg.get("gid") is not None}
+    missing = []
+    for g in groups:
+        if not isinstance(g, dict) or g.get("gid") is not None:
+            continue
+        gid = resolved.get(g.get("name"))
+        if gid is None:
+            missing.append(str(g.get("name")))
+        else:
+            g["gid"] = gid
+    if missing:
+        detail = f"groups without gid that this job did not create: {', '.join(missing)}"
+        _main.log_operation(request_id=ctx["request_id"], username=ctx["username"],
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="GROUP_GID_UNRESOLVED", error_detail=detail)
+        raise _main.StepFailed(_main.infra_error("FETCH_USER_CONFIG", "GROUP_GID_UNRESOLVED", detail),
+                               409, retry=False)
 
 def step_prepare_pod(ctx):
     """Pod 이름을 정하고 같은 이름의 Pod가 없는지 확인한 뒤 후보 노드 목록을 만든다."""
