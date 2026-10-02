@@ -14,6 +14,9 @@ spec:
     metadata:
       labels:
         app: containerssh-config-server
+        # Service는 이 라벨까지 본다. 크론잡 Pod도 app 라벨이 같아(DB·Redis 접근 허용 규칙이 그 라벨을 쓴다)
+        # app만 보면 크론잡 Pod가 떠 있는 동안 요청 일부가 포트를 열지 않은 그 Pod로 가서 거절된다.
+        component: api
     spec:
       # 배포 롤링 업데이트가 진행 중인 요청(/delete-pod·/migrate 등, 최대 POD_READY_MAX_WAIT_SEC=500초
       # + 전후 단계)을 SIGTERM으로 끊지 않도록 gunicorn --graceful-timeout보다 여유 있게 잡는다.
