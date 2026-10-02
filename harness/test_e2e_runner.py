@@ -125,6 +125,24 @@ def test_fault_case_is_skipped_without_permission():
     assert result["result"] == "SKIP"
 
 
+def test_case_is_skipped_when_the_stack_runs_in_another_mode():
+    cluster = FakeCluster(stack="operation")
+    cluster.on(r"RUN_MODE", "baseline\n")
+    run = make_run(cluster, FakeApi())
+    case = {"id": "F06", "modes": ["noprobe", "full"], "steps": [{"user": "a"}]}
+    result = run.run_case(case, allow_faults=True)
+    assert result["result"] == "SKIP" and "baseline" in result["reason"]
+    assert not any("INSERT" in c for c in cluster.calls)
+
+
+def test_case_runs_when_the_stack_mode_is_listed():
+    cluster = FakeCluster()
+    cluster.on(r"RUN_MODE", "full\n")
+    run = make_run(cluster, FakeApi())
+    result = run.run_case({"id": "X3", "modes": ["noprobe", "full"], "steps": [{"sleep": 0}]}, allow_faults=True)
+    assert result["result"] == "PASS"
+
+
 def test_uid_must_stay_with_the_person():
     cluster = FakeCluster()
     cluster.on(r"SELECT user_id FROM users WHERE email", [("7",)])
