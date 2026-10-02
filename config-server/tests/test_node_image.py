@@ -1,4 +1,6 @@
 """노드 로컬 이미지 모듈: 이름·입력 검증, 도우미 Pod 정의, 도우미 결과 읽기, 누적 변경분 계산."""
+import types
+
 import pytest
 
 import node_image_cli
@@ -72,6 +74,7 @@ def test_failed_commit_of_running_container_unpauses_it(monkeypatch):
         ran.append(args[0])
         if args[0] == "commit":
             raise node_image.NodeImageError(fail_code, "killed mid-commit")
+        assert fail_code == "IMAGE_UNPAUSE_FAILED"
         return {"unpaused": True}
 
     monkeypatch.setattr(node_image, "_run_helper", helper)
@@ -84,3 +87,49 @@ def test_failed_commit_of_running_container_unpauses_it(monkeypatch):
     with pytest.raises(node_image.NodeImageError):
         node_image.commit(SETTINGS, "farm2", "containerd://" + CID, ref, running=False)
     assert ran == ["commit"]   # 멈춘 적이 없는 컨테이너는 풀 것이 없다
+
+
+class _FakeV1:
+    """도우미 Pod 하나의 일생: 만들고, 끝나기를 기다리고, 로그를 읽고, 지운다."""
+
+    def __init__(self, phase, log=""):
+        self.phase, self.log, self.deleted = phase, log, []
+
+    def create_namespaced_pod(self, namespace, body):
+        return types.SimpleNamespace(metadata=types.SimpleNamespace(name="ailab-image-helper-x"))
+
+    def read_namespaced_pod(self, name, namespace):
+        return types.SimpleNamespace(status=types.SimpleNamespace(phase=self.phase))
+
+    def read_namespaced_pod_log(self, name, namespace):
+        return self.log
+
+    def delete_namespaced_pod(self, name, namespace, grace_period_seconds=None):
+        self.deleted.append(name)
+
+
+def _with_v1(monkeypatch, v1):
+    monkeypatch.setattr(node_image.client, "CoreV1Api", lambda: v1)
+    monkeypatch.setattr(node_image.time, "sleep", lambda sec: None)
+    return v1
+
+
+def test_helper_failure_carries_callers_code_and_pod_is_removed(monkeypatch):
+    v1 = _with_v1(monkeypatch, _FakeV1("Failed", 'RESULT {"error": "rmi failed: conflict"}'))
+    with pytest.raises(node_image.NodeImageError) as e:
+        node_image.remove(SETTINGS, "farm2", node_image.ref_for("ns", "pod"))
+    assert e.value.code == "IMAGE_REMOVE_FAILED" and "conflict" in e.value.detail
+    assert v1.deleted == ["ailab-image-helper-x"]
+
+
+def test_helper_that_never_finishes_times_out_and_pod_is_removed(monkeypatch):
+    v1 = _with_v1(monkeypatch, _FakeV1("Running"))
+    stuck = node_image.HelperSettings(namespace="ns", image="img", socket="/s", timeout_sec=0)
+    with pytest.raises(node_image.NodeImageError) as e:
+        node_image.remove(stuck, "farm2", node_image.ref_for("ns", "pod"))
+    assert e.value.code == "IMAGE_HELPER_TIMEOUT" and v1.deleted == ["ailab-image-helper-x"]
+
+
+def test_successful_helper_returns_result(monkeypatch):
+    _with_v1(monkeypatch, _FakeV1("Succeeded", 'RESULT {"removed": true}'))
+    assert node_image.remove(SETTINGS, "farm2", node_image.ref_for("ns", "pod")) is True
