@@ -36,3 +36,22 @@ def test_no_other_values_file_turns_it_on():
         if ".git" in p.parts:
             continue
         assert "faultInjection: true" not in p.read_text(errors="ignore"), p
+
+
+def test_every_slack_webhook_key_in_prod_config_is_sunk_for_experiment_stacks():
+    """막을 채널을 손으로 적은 목록이 아니라 운영 설정의 키에서 뽑는지, 주소가 아니라 이름만 뽑는지 확인한다."""
+    import subprocess
+
+    text = STACK_UP.read_text()
+    function = re.search(r"^slack_webhook_keys\(\) \{.*?^\}$", text, re.S | re.M).group(0)
+    config = (
+        "app:\n  servers:\n    FARM:\n      request-channel: farm-request\n"
+        "slack-webhook-url:\n  # 주석\n  error-log: https://hooks.example/a\n  farm-admin: https://hooks.example/b\n"
+        "  farm-request: https://hooks.example/c\n\nslack:\n  bot-token: x\n")
+    out = subprocess.run(["bash", "-c", function + "\nslack_webhook_keys"], input=config, capture_output=True,
+                         text=True, check=True).stdout
+    assert out.split() == ["error-log", "farm-admin", "farm-request"]
+    assert "hooks.example" not in out and "bot-token" not in out
+    # 뽑은 키는 전부 닿지 않는 주소로 덮이고, operation만 덮어쓰기를 끈다
+    assert 'for key in $WEBHOOK_KEYS; do SINKS=' in text
+    assert re.search(r'\[ "\$STACK" = "operation" \] && SLACK_OVERRIDE=""', text)

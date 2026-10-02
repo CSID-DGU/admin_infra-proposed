@@ -346,7 +346,21 @@ PROD_CFG_HASH=$(kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o jsonpat
 # 메일(가입 인증 코드, 만료 안내)은 운영 설정 그대로 보낸다. 서명키는 새로 줘서 운영에서 발급한 토큰이
 # 여기서 통하지 않게 한다.
 SINK=http://127.0.0.1:9/
-SLACK_OVERRIDE=",\"slack-webhook-url\":{\"error-log\":\"$SINK\",\"noti\":\"$SINK\",\"farm-admin\":\"$SINK\",\"lab-admin\":\"$SINK\"},\"slack\":{\"bot-token\":\"disabled\"}"
+# 막을 채널 목록은 운영 설정에서 읽는다. 목록을 여기 적어 두면 운영에 채널이 하나 늘 때(예: 신청서 전용 채널)
+# 그 키만 덮어쓰이지 않아 실험 스택이 진짜 주소를 그대로 물려받는다. 주소는 읽지 않고 키 이름만 뽑는다.
+# slack_webhook_keys: 표준입력의 설정 파일(YAML)에서 slack-webhook-url 바로 아래 키 이름을 한 줄에 하나씩.
+slack_webhook_keys() {
+  awk '/^slack-webhook-url:/ {on = 1; next}
+       on && /^[^ #]/ {on = 0}
+       on && /^  [A-Za-z0-9_-]+:/ {sub(/:.*/, ""); gsub(/ /, ""); print}'
+}
+# end slack_webhook_keys
+WEBHOOK_KEYS=$( { printf '%s\n' error-log noti farm-admin lab-admin
+  kubectl -n "$PROD_BE_NS" get secret admin-prod-config -o go-template='{{range $k, $v := .data}}{{$v | base64decode}}{{"\n"}}{{end}}' \
+    | slack_webhook_keys; } | sort -u)
+SINKS=""
+for key in $WEBHOOK_KEYS; do SINKS="$SINKS${SINKS:+,}\"$key\":\"$SINK\""; done
+SLACK_OVERRIDE=",\"slack-webhook-url\":{$SINKS},\"slack\":{\"bot-token\":\"disabled\"}"
 [ "$STACK" = "operation" ] && SLACK_OVERRIDE=""
 # 모니터링 지표는 클러스터 공용 Prometheus를 읽기만 하므로 모든 스택이 같은 곳을 본다. 예전엔 닿지 않는
 # 주소로 돌려 두어 리소스 모니터링 화면이 늘 비어 있었다(admin_fe#169). 연결은 admin-be.yaml 정책이 연다.
