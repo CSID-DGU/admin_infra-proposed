@@ -70,7 +70,10 @@ def _pod_name(value):
 
 class SupplementaryGroup(RequestBody):
     name: UnixName = Field(examples=["ascp"])
-    gid: int = Field(examples=[20004])
+    # 비어 있으면 아직 인프라에 없는 새 공유 그룹이다(admin_be 의 승인 대기 그룹). 생성 작업이 이 이름으로
+    # gid 를 정해 그룹을 만들고, 정한 gid 를 작업 결과(result.groups)로 돌려준다.
+    gid: Optional[int] = Field(default=None, ge=1, examples=[20004],
+                               description="생략하면 새 그룹 — 생성 작업이 gid 를 발급한다")
 
 
 class ProvisionAccount(RequestBody):

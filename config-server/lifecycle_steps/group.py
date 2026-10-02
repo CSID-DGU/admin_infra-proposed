@@ -71,6 +71,83 @@ def check_remove(username, groupname):
                       f"{groupname} is the primary group of {username}", 409)
 
 
+def _issue_shared_gid(name, lines):
+    """공용 gid 대역에서 다음 번호를 정한다. 원장 잠금 안에서 불러야 한다 — 정한 번호를 줄로 쓰고 발급 기록에
+    올리기 전에 다른 작업이 같은 번호를 집지 않게 한다."""
+    try:
+        issued_max = _main.read_issued_id_max("shared_gid")
+    except Exception as e:
+        _main.app.logger.exception("[ACCOUNTS] gid 발급 기록을 읽지 못해 그룹 생성 중단: %s", name)
+        raise _failed("ADD_GROUP", "ISSUED_ID_RECORD_FAILED", "cannot read issued gid record", 500, cause=e)
+    gid = _main._allocate_next_gid(lines, min_gid=_main.SHARED_GID_MIN, issued_max=issued_max)
+    if _main.SHARED_GID_MAX is not None and gid > _main.SHARED_GID_MAX:
+        raise _failed("ADD_GROUP", "GID_RANGE_EXHAUSTED",
+                      f"gid range {_main.SHARED_GID_MIN}~{_main.SHARED_GID_MAX} exhausted", 500, retry=False)
+    return gid
+
+
+def _in_shared_band(gid):
+    return gid >= _main.SHARED_GID_MIN and (_main.SHARED_GID_MAX is None or gid <= _main.SHARED_GID_MAX)
+
+
+def _shared_group_gid(name, username):
+    """새 공유 그룹(gid 없이 온 보조 그룹)의 gid. 원장에 같은 이름의 줄이 있으면 그 gid 를, 없으면 새로 발급해
+    멤버 없는 줄을 써 두고 그 gid 를 돌려준다. 멤버 추가·AD·팀 디렉터리는 뒤의 계정·그룹 단계가 맞춘다.
+
+    같은 이름의 줄은 앞선 시도(이 작업의 이어하기, 같은 그룹을 고른 다른 신청의 실패한 작업)가 남긴 것이다 —
+    admin_be 는 자기 DB 에 있는 이름으로는 새 그룹을 만들지 않고, 같은 그룹의 생성 작업이 둘 동시에 돌지 않게
+    막는다. 그래서 멤버가 있어도 이어받는다(기존 계정의 실패한 작업은 멤버를 되돌리지 않는다). 공용 대역 밖의
+    줄(개인·시스템 그룹)은 이어받지 않는다."""
+    _main.ensure_etc_layout()
+    with _main.ledger_lock(), _main.LockedFile(_main.app.config["GROUP_PATH"], "r+") as f:
+        lines = f.read().splitlines()
+        existing = next((r for line in lines if (r := _main.parse_group_line(line)) and r["name"] == name), None)
+        if existing:
+            gid = existing["gid"]
+            if not _in_shared_band(gid):
+                raise _failed("ADD_GROUP", "GROUP_NAME_EXISTS",
+                              f"group name is taken outside the shared gid range: {name} ({gid})", 409, retry=False)
+            others = sorted(set(existing["members"]) - {username})
+            if others:
+                # 감사용 기록. 실사용자 이름은 남기지 않는다.
+                _main.app.logger.warning("[ACCOUNTS] 새 공유 그룹이 원장에 이미 있어 이어받음(다른 멤버 %d명): %s(%s)",
+                                         len(others), name, gid)
+            return gid
+        gid = _issue_shared_gid(name, lines)
+        try:
+            _main.record_issued_id("shared_gid", gid)
+        except Exception as e:
+            _main.app.logger.exception("[ACCOUNTS] gid 발급 기록 실패로 그룹 생성 중단: %s(%s)", name, gid)
+            raise _failed("ADD_GROUP", "ISSUED_ID_RECORD_FAILED", "cannot record issued gid", 500, cause=e)
+        lines.append(_main.format_group_entry({"name": name, "passwd": "x", "gid": gid, "members": []}))
+        f.seek(0)
+        f.write("\n".join(lines) + "\n")
+        f.truncate()
+    _main.app.logger.info("[ACCOUNTS] 새 공유 그룹 gid 발급: %s(%s)", name, gid)
+    return gid
+
+
+def step_resolve_new_groups(ctx):
+    """생성 작업의 보조 그룹 중 gid 없이 온 것(admin_be 의 승인 대기 그룹)에 gid 를 정해 ctx["supp_groups"]에 채운다.
+    뒤의 계정·그룹 단계는 모두 gid 를 전제로 하므로 맨 앞에서 돈다.
+
+    이어하기 때도 매번 다시 돈다(ALWAYS_RERUN) — 정한 gid 는 이어하기 컨텍스트에 남지 않고 작업 입력에서 다시
+    만들어진다. 같은 이름의 줄을 이어받으므로 몇 번 돌아도 같은 gid 가 나온다."""
+    supp_groups = ctx.get("supp_groups") or []
+    if all(sg.get("gid") is not None for sg in supp_groups):
+        return
+    username = ctx.get("name") or ctx["username"]
+    resolved = []
+    for sg in supp_groups:
+        if sg.get("gid") is not None:
+            resolved.append(sg)
+            continue
+        # 등록과 실행 사이에 원장이 바뀔 수 있어 실행 직전에 이름을 본다(계정명 충돌·이미지 예약 이름).
+        check_create(sg["name"], None, [])
+        resolved.append({**sg, "gid": _shared_group_gid(sg["name"], username)})
+    ctx["supp_groups"] = resolved
+
+
 def _write_group_line(name, gid, members):
     """그룹 줄을 원장에 쓰고 gid 를 돌려준다. 같은 이름의 줄이 이미 있으면 그 줄을 이어 쓴다 — 앞선 시도가
     남긴 줄이다(등록 전에 admin_be 가 자기 DB 로 이름 중복을 거른다). 다른 gid 를 요구하거나 요청에 없는
@@ -85,15 +162,7 @@ def _write_group_line(name, gid, members):
                 raise _failed("ADD_GROUP", "GROUP_NAME_EXISTS", f"group already exists (name: {name})", 409)
             gid = existing["gid"]
         elif gid is None:
-            try:
-                issued_max = _main.read_issued_id_max("shared_gid")
-            except Exception as e:
-                _main.app.logger.exception("[ACCOUNTS] gid 발급 기록을 읽지 못해 그룹 생성 중단: %s", name)
-                raise _failed("ADD_GROUP", "ISSUED_ID_RECORD_FAILED", "cannot read issued gid record", 500, cause=e)
-            gid = _main._allocate_next_gid(lines, min_gid=_main.SHARED_GID_MIN, issued_max=issued_max)
-            if _main.SHARED_GID_MAX is not None and gid > _main.SHARED_GID_MAX:
-                raise _failed("ADD_GROUP", "GID_RANGE_EXHAUSTED",
-                              f"gid range {_main.SHARED_GID_MIN}~{_main.SHARED_GID_MAX} exhausted", 500, retry=False)
+            gid = _issue_shared_gid(name, lines)
         elif any(r and r["gid"] == gid for r in records):
             raise _failed("ADD_GROUP", "GROUP_GID_EXISTS", f"group already exists (gid: {gid})", 409)
         if not existing:

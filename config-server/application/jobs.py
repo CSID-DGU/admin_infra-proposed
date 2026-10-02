@@ -80,7 +80,7 @@ RERUN_SAFE = {
     "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
     "step_change_login_password",
-    "step_group_create", "step_group_add_member", "step_group_remove_member",
+    "step_group_create", "step_group_add_member", "step_group_remove_member", "step_resolve_new_groups",
 }
 
 PRE_STEP = {
@@ -88,7 +88,8 @@ PRE_STEP = {
     "step_create_services": lambda ctx: _main.delete_nodeport_services(ctx["pod_name"], _main.app.config["NAMESPACE"]),
 }
 
-ALWAYS_RERUN = {"step_fetch_user_config", "step_migrate_inherit_password"}
+# step_resolve_new_groups: 새 공유 그룹에 정한 gid 는 이어하기 컨텍스트에 남지 않는다 — 매번 원장에서 다시 읽는다.
+ALWAYS_RERUN = {"step_fetch_user_config", "step_migrate_inherit_password", "step_resolve_new_groups"}
 
 DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
@@ -302,11 +303,17 @@ def _job_steps(kind, job):
     if kind == "provision":
         if job.get("account"):
             steps = _main.ACCOUNT_CREATE_STEPS + _main.POD_CREATE_STEPS
+            supp_groups = job["account"].get("supp_groups") or []
         elif job.get("supp_groups_only"):
             # 기존 계정 재사용 시 그룹만 추가
             steps = _main.SUPP_GROUPS_ONLY_STEPS + _main.POD_CREATE_STEPS
+            supp_groups = job["supp_groups_only"]
         else:
             steps = _main.POD_CREATE_STEPS
+            supp_groups = []
+        if any(sg.get("gid") is None for sg in supp_groups):
+            # gid 없이 온 새 공유 그룹이 있다 — 뒤의 단계가 모두 gid 를 쓰므로 맨 앞에서 정한다.
+            steps = [_main.step_resolve_new_groups] + steps
         if _main.VERIFY_MODE == "full":
             # 다섯 시험을 모두 통과해야 작업 SUCCESS 행이 남는다 — 통과 전엔 완료로 기록되지 않는다.
             steps = steps + verify.VERIFY_ACCESS_STEPS
@@ -420,6 +427,11 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             "pod_name": ctx.get("pod_name"), "node": ctx.get("node"),
             "ports": ctx.get("allocated_ports") or [],
         }
+        if kind == "provision":
+            # 이 작업의 보조 그룹과 그 gid. admin_be 는 gid 없이 보낸 새 그룹의 gid 를 이 값으로 채운다 — 빠지면
+            # 승인을 확정하지 않는다.
+            result["groups"] = [{"name": sg["name"], "gid": int(sg["gid"])}
+                                for sg in ctx.get("supp_groups") or [] if sg.get("gid") is not None]
         if kind == "password":
             result = {"secrets": ctx.get("password_secrets") or [], "pods": ctx.get("password_pods") or {}}
         if kind == "group":
