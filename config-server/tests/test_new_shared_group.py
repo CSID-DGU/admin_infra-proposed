@@ -270,11 +270,11 @@ def test_failed_job_then_reapproval_reuses_the_same_gid(env, ad):
 
 def test_resolve_step_is_idempotent(env, ad):
     with main.app.app_context():
-        first = {"username": "exp-np-ng", "supp_groups": [{"name": "vision-lab"}]}
+        first = {"request_id": "870", "username": "exp-np-ng", "supp_groups": [{"name": "vision-lab"}]}
         group_steps.step_resolve_new_groups(first)
         main.write_group_lines([l if not l.startswith("vision-lab:") else l + "exp-np-ng"
                                 for l in main.read_group_lines()])    # 뒤 단계가 멤버를 넣은 상태
-        again = {"username": "exp-np-ng", "supp_groups": [{"name": "vision-lab"}]}
+        again = {"request_id": "870", "username": "exp-np-ng", "supp_groups": [{"name": "vision-lab"}]}
         group_steps.step_resolve_new_groups(again)
     assert first["supp_groups"] == again["supp_groups"] == [{"name": "vision-lab", "gid": 70000}]
 

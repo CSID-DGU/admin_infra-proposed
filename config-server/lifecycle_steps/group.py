@@ -10,6 +10,11 @@ gid 가 어긋나 같은 요청을 다시 처리할 수 없게 된다.
 """
 
 
+import json
+
+from adapters.operation_log import Action, Phase
+
+
 class _MainProxy:
     def __getattr__(self, name):
         import main
@@ -137,15 +142,30 @@ def step_resolve_new_groups(ctx):
     if all(sg.get("gid") is not None for sg in supp_groups):
         return
     username = ctx.get("name") or ctx["username"]
+    # 작업 단계 기록에 "새 공유 그룹 준비"로 남긴다. action 은 계정 단계와 같은 CREATE_ACCOUNT 를 쓴다 — 작업
+    # 단위 action(CHANGE_GROUP 등)으로 START 를 남기면 제어기가 끝나지 않은 그룹 작업으로 잘못 집는다.
+    log = lambda phase, **kw: _main.log_operation(request_id=ctx["request_id"], username=username,
+                                                   resource_type="new_groups", action=Action.CREATE_ACCOUNT,
+                                                   phase=phase, **kw)
+    log(Phase.START)
     resolved = []
-    for sg in supp_groups:
-        if sg.get("gid") is not None:
-            resolved.append(sg)
-            continue
-        # 등록과 실행 사이에 원장이 바뀔 수 있어 실행 직전에 이름을 본다(계정명 충돌·이미지 예약 이름).
-        check_create(sg["name"], None, [])
-        resolved.append({**sg, "gid": _shared_group_gid(sg["name"], username)})
+    try:
+        for sg in supp_groups:
+            if sg.get("gid") is not None:
+                resolved.append(sg)
+                continue
+            # 등록과 실행 사이에 원장이 바뀔 수 있어 실행 직전에 이름을 본다(계정명 충돌·이미지 예약 이름).
+            check_create(sg["name"], None, [])
+            resolved.append({**sg, "gid": _shared_group_gid(sg["name"], username)})
+    except _main.StepFailed as e:
+        code = e.body.get("error") if isinstance(e.body, dict) else None
+        log(_main._fail_phase(e), error_code=str(code or "NEW_GROUP_FAILED")[:64], error_detail=str(e.body)[:1000])
+        raise
+    except Exception as e:
+        log(_main._fail_phase(e), error_code="NEW_GROUP_FAILED", error_detail=str(e)[:1000])
+        raise
     ctx["supp_groups"] = resolved
+    log(Phase.SUCCESS, error_detail=json.dumps({"groups": {sg["name"]: sg["gid"] for sg in resolved}}))
 
 
 def _write_group_line(name, gid, members):

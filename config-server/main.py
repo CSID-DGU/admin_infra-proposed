@@ -1565,6 +1565,9 @@ def get_job_steps(kind, request_id):
             "probe": resource_type if act in probe_actions else None,
             # 재시도 행의 resource_type은 다시 돌린 단계 이름이다
             "step": resource_type if phase == Phase.RETRY.value else None,
+            # 그 밖의 행은 단계가 다룬 대상(account·groups·new_groups·replication 등) — 같은 action 이라도
+            # 화면이 계정 생성과 공유 그룹 반영을 가려 보여 줄 수 있게 한다.
+            "resource": resource_type if act not in probe_actions and phase != Phase.RETRY.value else None,
             "error_code": error_code, "summary": _step_summary(detail),
         })
     return jsonify({"request_id": str(request_id), "kind": kind,
