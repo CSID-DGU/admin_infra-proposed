@@ -56,6 +56,10 @@ def unpause(socket, container):
 
 def remove(socket, ref):
     done = _nerdctl(socket, "rmi", ref)
+    if done.returncode != 0 and "must be forced" in done.stderr:
+        # Pod를 지운 직후에는 멈춘 컨테이너가 노드에 잠깐 남아 이미지를 붙잡는다. 멈춘 컨테이너뿐이면 강제로
+        # 지운다 — 실행 중인 컨테이너가 쓰는 이미지는 강제로도 지워지지 않는다("cannot be forced").
+        done = _nerdctl(socket, "rmi", "--force", ref)
     if done.returncode == 0:
         return {"removed": True}
     if "no such image" in done.stderr:

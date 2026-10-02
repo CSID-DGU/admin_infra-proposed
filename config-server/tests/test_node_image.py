@@ -133,3 +133,35 @@ def test_helper_that_never_finishes_times_out_and_pod_is_removed(monkeypatch):
 def test_successful_helper_returns_result(monkeypatch):
     _with_v1(monkeypatch, _FakeV1("Succeeded", 'RESULT {"removed": true}'))
     assert node_image.remove(SETTINGS, "farm2", node_image.ref_for("ns", "pod")) is True
+
+
+def _nerdctl_replies(monkeypatch, replies):
+    calls = []
+
+    def fake(socket, *args):
+        calls.append(args)
+        code, err = replies[len(calls) - 1]
+        return types.SimpleNamespace(returncode=code, stdout="", stderr=err)
+
+    monkeypatch.setattr(node_image_cli, "_nerdctl", fake)
+    return calls
+
+
+def test_remove_forces_only_when_a_stopped_container_holds_the_image(monkeypatch):
+    held = "conflict: unable to delete r (must be forced) - image is being used by stopped container abc"
+    calls = _nerdctl_replies(monkeypatch, [(1, held), (0, "")])
+    assert node_image_cli.remove("/s", "r") == {"removed": True}
+    assert calls == [("rmi", "r"), ("rmi", "--force", "r")]
+
+
+def test_remove_does_not_force_an_image_a_running_container_uses(monkeypatch):
+    running = "conflict: unable to delete r (cannot be forced) - image is being used by running container abc"
+    calls = _nerdctl_replies(monkeypatch, [(1, running)])
+    with pytest.raises(RuntimeError):
+        node_image_cli.remove("/s", "r")
+    assert calls == [("rmi", "r")]
+
+
+def test_remove_of_missing_image_is_not_an_error(monkeypatch):
+    _nerdctl_replies(monkeypatch, [(1, "no such image: r")])
+    assert node_image_cli.remove("/s", "r") == {"removed": False}
