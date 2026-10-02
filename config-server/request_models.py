@@ -191,9 +191,21 @@ class MigrateRequest(RequestBody):
     pod_name: Optional[str] = Field(default=None, description="옮길 Pod. 없으면 사용자의 실행 중인 Pod",
                                     examples=["ailab-exp-np-001-7f3a9c21"])
     username: UnixName = Field(examples=["exp-np-001"])
-    nodes: List[str] = Field(min_length=1, description="후보 노드 목록(현재 노드 포함)", examples=[["farm1", "farm2"]])
+    recreate: Optional[bool] = Field(default=None, description="true면 현재 노드에서 Pod를 다시 만든다")
+    keep_changes: Optional[bool] = Field(default=None, description="recreate일 때 컨테이너 변경분을 구워 유지(기본 true). "
+                                                                   "false면 기본 이미지로 초기화")
+    nodes: List[str] = Field(default_factory=list, validate_default=True,
+                             description="후보 노드 목록(현재 노드 포함). recreate면 쓰지 않는다",
+                             examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
     force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
+
+    @field_validator("nodes")
+    @classmethod
+    def _nodes_unless_recreate(cls, value, info):
+        if not value and not info.data.get("recreate"):
+            raise ValueError("nodes must not be empty unless recreate is true")
+        return value
 
     @field_validator("request_id", mode="before")
     @classmethod

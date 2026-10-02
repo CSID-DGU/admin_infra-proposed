@@ -39,6 +39,8 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   value: "{{ .Values.nodeport.min }}"
 - name: NODEPORT_MAX
   value: "{{ .Values.nodeport.max }}"
+- name: IMAGE_HELPER_IMAGE
+  value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
 - name: VERIFY_MODE
   value: "{{ .Values.verifyMode }}"
 {{- if .Values.faultInjection }}

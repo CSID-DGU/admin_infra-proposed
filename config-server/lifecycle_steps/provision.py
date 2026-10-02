@@ -625,6 +625,7 @@ def step_build_pod_spec(ctx):
             best_node,
             pod_name,
             request_id=request_id,
+            image=ctx.get("committed_image"),
         )
     except _main.PodSpecBuildError as e:
         _main.set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
@@ -965,7 +966,8 @@ def build_pod_spec(
     user_info: dict,
     target_node: str,
     pod_name: str,
-    request_id=None
+    request_id=None,
+    image=None
 ):
     # 생성 작업은 request_id로 진행 상황을 추적한다(한 사용자가 Pod를 여러 개
     # 동시에 만들 수 있어 username만으로는 서로 다른 시도가 섞인다). migrate 경로는
@@ -987,7 +989,9 @@ def build_pod_spec(
         )
     target_node = canonical
 
-    image = _main.load_user_image(username, user_info["image"])
+    # image가 오면 그 노드에 구워 둔 이미지다(같은 노드 재생성). 노드에만 있으므로 내려받지 않게 한다.
+    pull_policy = _main.node_image.PULL_POLICY if image else "IfNotPresent"
+    image = image or _main.load_user_image(username, user_info["image"])
 
     # passwd가 uid/gid의 단일 진실 소스 — WAS 값은 무시
     passwd_rec = None
@@ -1173,7 +1177,7 @@ def build_pod_spec(
                                             {
                                                 "name": "shell",
                                                 "image": image,
-                                                "imagePullPolicy": "IfNotPresent",
+                                                "imagePullPolicy": pull_policy,
                                                 "stdin": True,
                                                 "tty": True,
                                                 "ports": [

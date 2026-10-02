@@ -206,6 +206,38 @@ class Context:
         self._call("POST", f"/api/admin/requests/{self._req(alias)}/migrations", as_user=self.run.admin_id,
                    body={"nodes": [row["node"], others[0]], "force": True}, expect=expect)
 
+    def do_restart(self, arg):
+        """현재 노드에서 컨테이너를 다시 만든다. by는 admin(기본)·owner·사용자 별칭, keep은 변경분 유지(기본 true)."""
+        alias, expect = self._target(arg, "req")
+        options = arg if isinstance(arg, dict) else {}
+        row = observe.request_row(self.run.cluster, self._req(alias))
+        self.memo[f"{alias}.node_before"], self.memo[f"{alias}.pod_before"] = row["node"], row["pod"]
+        by = options.get("by", "admin")
+        if by == "admin":
+            path, caller = f"/api/admin/requests/{self._req(alias)}/restarts", self.run.admin_id
+        else:
+            path = f"/api/requests/{self._req(alias)}/restarts"
+            caller = self._owner(alias) if by == "owner" else self.users[by]["id"]
+        self._call("POST", path, as_user=caller, body={"keepChanges": options.get("keep", True)}, expect=expect)
+
+    def do_expect_restarted(self, alias):
+        row = observe.request_row(self.run.cluster, self._req(alias))
+        if row["node"] != self.memo[f"{alias}.node_before"]:
+            raise StepFailed(f"{alias}: 재시작인데 노드가 {self.memo[f'{alias}.node_before']}에서 {row['node']}로 바뀜")
+        if row["pod"] == self.memo[f"{alias}.pod_before"]:
+            raise StepFailed(f"{alias}: Pod가 {row['pod']} 그대로 — 다시 만들어지지 않음")
+
+    def do_mark_pod(self, alias):
+        row = observe.request_row(self.run.cluster, self._req(alias))
+        observe.pod_write_marker(self.run.cluster, row["pod"])
+
+    def do_expect_marker(self, arg):
+        for alias, want in arg.items():
+            row = observe.request_row(self.run.cluster, self._req(alias))
+            present = observe.pod_has_marker(self.run.cluster, row["pod"])
+            if present != (want == "present"):
+                raise StepFailed(f"{alias}: 컨테이너 표식이 {want}이어야 하는데 {'있음' if present else '없음'}")
+
     def do_wait(self, arg):
         timeout = arg.get("timeout", self.run.wait_timeout) if isinstance(arg, dict) else self.run.wait_timeout
         for alias, wanted in arg.items():

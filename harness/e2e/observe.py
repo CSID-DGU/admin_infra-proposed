@@ -41,6 +41,19 @@ def pod_password_hash(cluster, pod_name, username):
     return out.strip() or None
 
 
+# 홈 폴더(NAS) 밖, 컨테이너 자체에 쓰는 표식. 재시작 뒤 컨테이너 변경분이 이어졌는지 본다.
+POD_MARKER = "/opt/ailab-e2e-marker"
+
+
+def pod_write_marker(cluster, pod_name):
+    cluster.sh(f'kubectl -n "$NS" exec {safe(pod_name)} -- touch {POD_MARKER}')
+
+
+def pod_has_marker(cluster, pod_name):
+    out = cluster.sh(f'kubectl -n "$NS" exec {safe(pod_name)} -- sh -c "test -e {POD_MARKER} && echo yes || echo no"')
+    return out.strip() == "yes"
+
+
 def oplog_codes(cluster, request_id):
     """이 신청 번호로 남은 작업 기록의 오류 코드 집합."""
     rows = cluster.sql(f"SELECT DISTINCT error_code FROM operation_log WHERE request_id='{int(request_id)}' "
