@@ -73,10 +73,11 @@ STEP_OBSERVERS = {
 RERUN_SAFE = {
     "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
     "step_create_home", "step_wait_ready", "step_create_services",
-    "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s",
+    "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_remove_node_image",
     "step_cleanup_pod_node_krb5", "step_check_account_revocable",
     "step_delete_account", "step_remove_krb5",
-    "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_cleanup_old",
+    "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_commit_image",
+    "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
     "step_change_login_password",
     "step_group_create", "step_group_add_member", "step_group_remove_member",
@@ -93,7 +94,8 @@ DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 
 SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
                   "verify_ports", "verify_node", "home_created", "account_write_started",
-                  "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup")
+                  "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup", "committed_image",
+                  "committed_image_node")
 
 def _saved_ctx(ctx):
     return {k: ctx[k] for k in SAVED_CTX_KEYS if k in ctx}
@@ -340,7 +342,8 @@ def _job_ctx(kind, request_id, job):
     if kind == "migrate":
         # 새 Pod 이름은 Pod 준비 단계가 정한다. 기존 Pod는 old_pod_name으로 따로 둔다.
         ctx.update(config_by_request=True, old_pod_name=job.get("pod_name"), nodes=job["nodes"],
-                   min_ratio=job.get("min_improvement_ratio", 0.2), force=bool(job.get("force")))
+                   min_ratio=job.get("min_improvement_ratio", 0.2), force=bool(job.get("force")),
+                   recreate=bool(job.get("recreate")), keep_changes=bool(job.get("keep_changes")))
     return ctx
 
 def find_unfinished_jobs(limit=100):
@@ -425,7 +428,8 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             skipped = bool(ctx.get("skipped"))
             result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),
                           from_node=ctx.get("from_node"), to_node=None if skipped else ctx.get("node"),
-                          old_pod_name=ctx.get("old_pod_name"), old_pod_cleanup=ctx.get("old_pod_cleanup"))
+                          old_pod_name=ctx.get("old_pod_name"), old_pod_cleanup=ctx.get("old_pod_cleanup"),
+                          changes_kept=bool(ctx.get("committed_image")))
             if skipped:
                 result.update(pod_name=None, node=None, ports=[])
         _main.save_job_result(JOB_ACTIONS[kind].value, request_id, result)

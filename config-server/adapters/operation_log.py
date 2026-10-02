@@ -99,6 +99,8 @@ class Action(str, Enum):
     PULL_IMAGE = "PULL_IMAGE"            # 노드에 이미지를 받는 중 (이미 있으면 기록되지 않음)
     START_CONTAINER = "START_CONTAINER"  # 이미지 준비 뒤 컨테이너 생성·시작·준비 확인
     MOUNT_VOLUME = "MOUNT_VOLUME"        # 볼륨 마운트 재시도 중
+    # 같은 노드에서 Pod를 다시 만들기 전에 컨테이너 변경분을 그 노드의 이미지로 굽는다.
+    COMMIT_IMAGE = "COMMIT_IMAGE"
 
 
 class Phase(str, Enum):

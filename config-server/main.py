@@ -34,6 +34,7 @@ from adapters.operation_log import (Action, Phase, log_operation, current_job_id
                                     current_attempt, write_failure_count)
 
 from adapters import job_control
+from adapters import node_image
 from adapters.job_control import LeaseLost
 from lifecycle_steps import verify
 
@@ -215,6 +216,15 @@ app.config.from_mapping({
     # 설치 스크립트가 같은 이름으로 만든다. 등급이 없는 클러스터에서는 비워 두면 붙이지 않는다.
     "POD_PRIORITY_CLASS": os.getenv("POD_PRIORITY_CLASS", "ailab-user-workload"),
 
+    # 노드 로컬 이미지(adapters/node_image.py) — 같은 노드에서 Pod를 다시 만들 때 컨테이너 변경분을 굽는다.
+    # 도우미 Pod는 config-server와 같은 이미지를 쓴다(차트가 넣어 준다). 비어 있으면 굽기를 요청한 작업은 실패한다.
+    "IMAGE_HELPER_IMAGE": os.getenv("IMAGE_HELPER_IMAGE", ""),
+    "CONTAINERD_SOCKET": os.getenv("CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
+    "IMAGE_HELPER_TIMEOUT_SEC": int(os.getenv("IMAGE_HELPER_TIMEOUT_SEC", "900")),
+    # 구운 변경분의 누적 상한(압축 기준). 구우면 컨테이너의 임시 저장 사용량이 이미지로 옮겨 가 한도가
+    # 0부터 다시 시작하므로, 상한이 없으면 재생성을 반복해 DEFAULT_EPHEMERAL_STORAGE_LIMIT을 넘겨 쌓을 수 있다.
+    "USER_IMAGE_MAX_ADDED_BYTES": int(os.getenv("USER_IMAGE_MAX_ADDED_BYTES", str(50 * 1024 ** 3))),
+
     # NFS
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
@@ -340,6 +350,20 @@ class PodSpecBuildError(Exception):
 # ////////////////////// 단계 실행 (v2.0) //////////////////////
 # 생성·회수 흐름을 단계 함수로 나눈다. 제어기(controller.py)가 작업마다 단계 함수를 차례로 부른다.
 # 남아 있는 동기 경로(/delete-pod)도 같은 단계 함수를 요청 안에서 끝까지 실행한다.
+
+def node_image_settings():
+    return node_image.HelperSettings(
+        namespace=app.config["NAMESPACE"], image=app.config["IMAGE_HELPER_IMAGE"],
+        socket=app.config["CONTAINERD_SOCKET"], timeout_sec=app.config["IMAGE_HELPER_TIMEOUT_SEC"])
+
+
+def remove_node_image_quietly(node, ref):
+    """구운 이미지를 지운다. 남아도 노드의 이미지 자동 정리가 치우므로, 지우지 못해도 작업 결과는 바꾸지 않는다."""
+    try:
+        node_image.remove(node_image_settings(), node, ref)
+    except Exception:
+        app.logger.warning(f"[IMAGE] 이미지 삭제 실패 — 노드 자동 정리에 맡김: node={node} ref={ref}", exc_info=True)
+
 
 class StepFailed(Exception):
     """단계가 실패로 끝남. body·status는 동기 엔드포인트가 그대로 돌려주는 응답이다."""
@@ -1122,7 +1146,8 @@ from lifecycle_steps.revoke import (  # noqa: E402
 )
 
 from lifecycle_steps.migrate import (  # noqa: E402
-    step_migrate_select_target, step_migrate_inherit_password, step_migrate_cleanup_old, MIGRATE_STEPS,
+    step_migrate_select_target, step_migrate_inherit_password, step_migrate_commit_image,
+    step_migrate_cleanup_old, MIGRATE_STEPS,
 )
 from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
 from lifecycle_steps.group import (  # noqa: E402
@@ -1301,6 +1326,10 @@ def register_migrate(body: MigrateRequest):
     개선 비율을 보지 않음), 새 노드에 Pod를 만들어 준비되면 기존 Pod를 정리한다. 옮길 이유가 없으면 작업은
     성공으로 끝나고 결과의 status가 skipped다. 결과는 GET /operations/migrate/<request_id>로 조회한다.
     홈 디렉터리는 유지되고 컨테이너 안의 시스템 변경은 유지되지 않는다.
+
+    recreate가 true면 노드를 고르지 않고 현재 노드에서 Pod를 다시 만든다(GPU 목록 갱신·재시작). 이때
+    keep_changes(기본 true)면 컨테이너 변경분을 그 노드의 이미지로 구워 새 Pod에 이어 준다. 실행 중이던
+    프로세스는 이어지지 않는다. 굽지 못하면 작업은 실패하고 기존 Pod는 그대로 남는다.
     ---
     tags:
     - Operations
@@ -1315,7 +1344,8 @@ def register_migrate(body: MigrateRequest):
       400: {description: 입력 오류}
       409: {description: 같은 신청의 마이그레이션 작업이 아직 끝나지 않음}
     """
-    job = {"username": body.username, "pod_name": body.pod_name, "nodes": body.nodes, "force": bool(body.force)}
+    job = {"username": body.username, "pod_name": body.pod_name, "nodes": body.nodes, "force": bool(body.force),
+           "recreate": bool(body.recreate), "keep_changes": body.keep_changes is not False}
     if body.min_improvement_ratio is not None:
         job["min_improvement_ratio"] = body.min_improvement_ratio
     return _register_job("migrate", body.request_id, body.username, job)

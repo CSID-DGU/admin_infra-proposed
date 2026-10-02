@@ -113,11 +113,16 @@ def step_delete_pod_k8s(ctx):
         ), 500)
 
     pod_node_name = None
-    if _main.app.config.get("KRB5_REALM"):
-        try:
-            pod_node_name = v1.read_namespaced_pod(pod_name, ns).spec.node_name
-        except Exception:
-            _main.app.logger.warning("[DELETE POD] pod node lookup failed, farm 정리 건너뜀: %s", pod_name, exc_info=True)
+    try:
+        pod = v1.read_namespaced_pod(pod_name, ns)
+        if _main.app.config.get("KRB5_REALM"):
+            pod_node_name = pod.spec.node_name
+        # 구운 이미지로 떠 있던 Pod면 Pod를 지운 뒤 그 이미지도 지운다(step_remove_node_image).
+        image = next((c.image for c in (getattr(pod.spec, "containers", None) or [])), None)
+        if _main.node_image.is_user_image(image):
+            ctx["committed_image"], ctx["committed_image_node"] = image, pod.spec.node_name
+    except Exception:
+        _main.app.logger.warning("[DELETE POD] pod lookup failed, farm·이미지 정리 건너뜀: %s", pod_name, exc_info=True)
     ctx["pod_node_name"] = pod_node_name
 
     _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
@@ -261,10 +266,17 @@ def _new_delete_rollback():
         "podDeleted": False,
     }
 
+def step_remove_node_image(ctx):
+    """회수한 Pod가 쓰던 구운 이미지를 노드에서 지운다. 지우지 않으면 회수된 사용자의 변경분이 노드 디스크에 남는다."""
+    if ctx.get("committed_image"):
+        _main.remove_node_image_quietly(ctx["committed_image_node"], ctx["committed_image"])
+
+
 POD_DELETE_STEPS = [
     step_delete_services,
     step_release_nodeports,
     step_delete_pod_k8s,
+    step_remove_node_image,
     step_cleanup_pod_node_krb5,
 ]
 

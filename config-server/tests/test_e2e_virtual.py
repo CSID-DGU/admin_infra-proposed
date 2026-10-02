@@ -53,7 +53,13 @@ class FakeV1:
         name = body["metadata"]["name"]
         self.pods[name] = types.SimpleNamespace(
             metadata=types.SimpleNamespace(name=name, labels=body["metadata"]["labels"], uid=f"uid-{name}"),
-            spec=types.SimpleNamespace(node_name=body["spec"]["nodeName"]), body=body)
+            spec=types.SimpleNamespace(
+                node_name=body["spec"]["nodeName"],
+                containers=[types.SimpleNamespace(name=c["name"], image=c["image"]) for c in body["spec"]["containers"]]),
+            status=types.SimpleNamespace(container_statuses=[types.SimpleNamespace(
+                name=c["name"], container_id="containerd://" + f"{len(self.pods):064x}",
+                state=types.SimpleNamespace(running=object())) for c in body["spec"]["containers"]]),
+            body=body)
         return self.pods[name]
 
     def list_namespaced_pod(self, ns, label_selector):

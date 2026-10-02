@@ -57,7 +57,8 @@ def test_step_order_matches_current_flow():
         "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
         "step_create_pod_k8s", "step_wait_ready", "step_create_services"]
     assert [s.__name__ for s in main.POD_DELETE_STEPS] == [
-        "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_cleanup_pod_node_krb5"]
+        "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_remove_node_image",
+        "step_cleanup_pod_node_krb5"]
 
 
 # ---------- DELETE /pods/<name>은 단계 결과를 응답으로 돌려준다 ----------
