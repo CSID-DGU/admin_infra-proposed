@@ -165,6 +165,8 @@ def step_resolve_new_groups(ctx):
         log(_main._fail_phase(e), error_code="NEW_GROUP_FAILED", error_detail=str(e)[:1000])
         raise
     ctx["supp_groups"] = resolved
+    # 노드 등록은 AD 에 그룹이 생기기 전에 해도 된다 — 노드는 아직 없는 그룹의 줄을 건너뛰다가 그룹이 생기면 쓴다.
+    _register_idmap_groups([sg["name"] for sg in supp_groups if sg.get("gid") is None])
     log(Phase.SUCCESS, error_detail=json.dumps({"groups": {sg["name"]: sg["gid"] for sg in resolved}}))
 
 
@@ -215,6 +217,20 @@ def _flush_nas_group_cache():
         _main.app.logger.exception("[NAS GSS 온디맨드] 그룹 변경 후 트리거 실패 — 30분 크론에 맡김")
 
 
+def _register_idmap_groups(names):
+    """새 공유 그룹을 farm 멤버 노드의 NFS 이름 변환에 등록한다. 그래야 그 노드의 Pod 에서 사용자가 폴더를
+    이 그룹으로 열(chgrp) 수 있다. 등록은 백그라운드로 띄우고 바로 돌아온다.
+    실패해도 작업은 실패시키지 않는다 — 그룹을 만드는 일과 별개인 부가 작업이고, 30분 크론이 같은 등록을 다시 한다."""
+    if not names or not _main._ad_enabled():
+        return
+    try:
+        # reconcile_krb5 는 main 을 import 한다 — 순환을 피하려고 늦게 불러온다.
+        from reconcile_krb5 import trigger_idmap_sync_ondemand
+        trigger_idmap_sync_ondemand(names)
+    except Exception:
+        _main.app.logger.exception("[IDMAP 온디맨드] 새 공유 그룹 등록 트리거 실패 — 30분 크론에 맡김")
+
+
 def step_group_create(ctx):
     name, members = ctx["group_name"], ctx["group_members"]
     check_create(name, ctx.get("group_requested_gid"), members)
@@ -227,6 +243,7 @@ def step_group_create(ctx):
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 생성 실패: %s(%s)", name, gid)
         raise _failed("ADD_GROUP", "AD_GROUP_CREATE_FAILED", f"failed to create group in AD: {name}", 500, cause=e)
+    _register_idmap_groups([name])
     ctx["group_gid"] = gid
 
 
