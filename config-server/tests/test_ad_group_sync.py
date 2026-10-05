@@ -5,14 +5,6 @@ import main
 from lifecycle_steps import provision
 
 
-@pytest.fixture(autouse=True)
-def team_dirs(monkeypatch):
-    """NAS 에 팀 디렉터리를 만드는 호출을 가로챈다. 반환: 만든 (이름, gid) 목록"""
-    made = []
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: made.append((name, gid)))
-    return made
-
-
 @pytest.fixture
 def etc(tmp_path, monkeypatch):
     """계정 원장을 임시 파일로 돌리고 AD 호출을 가로챈다.
@@ -160,79 +152,12 @@ def test_group_name_charset_is_validated(etc, group_job):
     assert sent == []
 
 
-# ---------- 팀 공유 디렉터리 (#154) ----------
-
-def test_new_group_gets_a_team_directory(etc, group_job, team_dirs):
-    seed, sent = etc
-    r = group_job("create", **{"name": "teamx", "gid": 70000})
-    assert r.phase == "SUCCESS"
-    assert team_dirs == [("teamx", 70000)]
-
-
-def test_team_directory_is_made_after_the_ad_group(etc, group_job, monkeypatch):
-    """NAS 는 AD 그룹을 보고 판정한다. AD 에 없으면 chown 할 gid 도 NAS 가 모른다."""
-    seed, sent = etc
-    order = []
-    monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": order.append("ad") or "")
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: order.append("dir"))
-    group_job("create", **{"name": "teamx", "gid": 70000})
-    assert order == ["ad", "dir"]
-
-
-def test_team_directory_failure_is_finished_by_the_same_request(etc, group_job, monkeypatch):
+def test_step_retries_ad_failure(etc, monkeypatch):
     seed, sent = etc
 
-    def boom(name, gid):
-        raise RuntimeError("NAS SSH 실패")
-    monkeypatch.setattr(main, "create_team_directory", boom)
-    r = group_job("create", name="teamx")
-    assert r.phase == "FAIL"
-    assert r.error == "TEAM_DIR_CREATE_FAILED"
-    # 같은 요청을 다시 보내면 같은 gid 로 끝까지 간다 — AD 에는 이미 그 gid 로 그룹이 있다
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: None)
-    again = group_job("create", name="teamx")
-    assert again.phase == "SUCCESS" and again.gid == 70000
-    assert sent == ["group-create teamx 70000"] * 2
-
-
-def test_no_team_directory_when_ad_is_disabled(etc, group_job, monkeypatch, team_dirs):
-    seed, sent = etc
-    monkeypatch.setitem(main.app.config, "KRB5_REALM", "")
-    assert group_job("create", **{"name": "teamx", "gid": 70000}).phase == "SUCCESS"
-    assert team_dirs == []
-
-
-def test_step_fills_in_team_directory_for_older_groups(etc, team_dirs):
-    """이 변경 전에 만든 그룹은 디렉터리가 없다 — 멤버가 들어오는 프로비저닝에서 채운다."""
-    seed, sent = etc
-    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
-    with main.app.app_context():
-        provision.step_sync_ad_groups(ctx)
-    assert team_dirs == [("teamx", 70000)]
-
-
-def test_step_does_not_retry_team_dir_group_mismatch(etc, monkeypatch, logs):
-    """gid 가 다른 기존 디렉터리는 사람이 확인해야 풀린다 — 재시도 대상이면 같은 실패만 반복한다."""
-    seed, sent = etc
-
-    def mismatch(name, gid):
-        raise main.TeamDirGroupMismatch("이미 gid 70001 소유")
-    monkeypatch.setattr(main, "create_team_directory", mismatch)
-    ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
-    with main.app.app_context():
-        with pytest.raises(main.StepFailed) as err:
-            provision.step_sync_ad_groups(ctx)
-    assert err.value.retry is False
-    assert err.value.body["error"] == "TEAM_DIR_GROUP_MISMATCH"
-    assert any(r.get("error_code") == "TEAM_DIR_GROUP_MISMATCH" for r in logs)
-
-
-def test_step_retries_plain_nas_failure(etc, monkeypatch):
-    seed, sent = etc
-
-    def boom(name, gid):
-        raise ConnectionError("nas ssh refused")
-    monkeypatch.setattr(main, "create_team_directory", boom)
+    def boom(cmd, stdin_data=""):
+        raise ConnectionError("ad ssh refused")
+    monkeypatch.setattr(main, "_farm_ad_ssh", boom)
     ctx = {"request_id": "r1", "name": "alice", "supp_groups": [{"name": "teamx", "gid": 70000}]}
     with main.app.app_context():
         with pytest.raises(main.StepFailed) as err:
@@ -250,45 +175,6 @@ def test_adding_user_to_group_goes_to_ad(etc, group_job):
     r = group_job("add", username="alice", groups=["teamx"])
     assert r.phase == "SUCCESS"
     assert sent == ["group-addmember teamx alice"]
-
-
-def test_adding_user_to_older_group_fills_in_its_team_directory(etc, group_job, team_dirs):
-    """승인은 신규·재사용 계정 모두 이 경로를 탄다 — 디렉터리가 없던 옛 그룹도 여기서 채운다."""
-    seed, sent = etc
-    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
-         group=["alice:x:21000:", "teamx:x:70000:"])
-    assert group_job("add", username="alice", groups=["teamx"]).phase == "SUCCESS"
-    assert team_dirs == [("teamx", 70000)]
-
-
-def test_team_dir_failure_on_member_add_leaves_the_group_file_untouched(etc, group_job, monkeypatch):
-    seed, sent = etc
-    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
-         group=["alice:x:21000:", "teamx:x:70000:"])
-
-    def boom(name, gid):
-        raise RuntimeError("NAS SSH 실패")
-    monkeypatch.setattr(main, "create_team_directory", boom)
-    r = group_job("add", username="alice", groups=["teamx"])
-    assert r.phase == "FAIL"
-    assert r.error == "TEAM_DIR_CREATE_FAILED"
-    with main.app.app_context():
-        line = [l for l in main.read_group_lines() if l.startswith("teamx:")][0]
-        assert main.parse_group_line(line)["members"] == []
-
-
-def test_team_dir_mismatch_on_member_add_is_a_conflict(etc, group_job, monkeypatch):
-    seed, sent = etc
-    seed(passwd=["alice:x:21000:21000::/home/alice:/bin/bash"],
-         group=["alice:x:21000:", "teamx:x:70000:"])
-
-    def mismatch(name, gid):
-        raise main.TeamDirGroupMismatch("이미 gid 70001 소유")
-    monkeypatch.setattr(main, "create_team_directory", mismatch)
-    r = group_job("add", mode="full", username="alice", groups=["teamx"])
-    # 사람이 NAS 를 확인해야 풀리는 실패라 재시도 없이 바로 끝난다.
-    assert r.phase == "FAIL"
-    assert r.error == "TEAM_DIR_GROUP_MISMATCH"
 
 
 def test_ad_failure_leaves_the_group_file_untouched(etc, group_job, monkeypatch):

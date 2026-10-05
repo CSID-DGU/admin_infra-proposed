@@ -1,7 +1,7 @@
 """새 공유 그룹 — admin_be 가 gid 없이 보낸 보조 그룹을 생성 작업이 만들고, 정한 gid 를 결과로 돌려준다.
 
 admin_be 는 "새로 만들기" 때 그룹을 자기 DB 에만 만들고(gid 없음), 그 그룹을 고른 신청이 승인될 때 이 작업으로
-인프라 그룹(원장·AD·팀 디렉터리)을 만든다. 작업이 끝나기 전에는 admin_be 도 gid 를 모르므로 설정 조회(accept-info)의
+인프라 그룹(원장·AD)을 만든다. 작업이 끝나기 전에는 admin_be 도 gid 를 모르므로 설정 조회(accept-info)의
 그 그룹 gid 는 null 이다.
 """
 import pytest
@@ -22,15 +22,14 @@ def mode(request, monkeypatch):
 
 @pytest.fixture
 def ad(env, monkeypatch):
-    """AD·팀 디렉터리·NAS 캐시 호출을 가로챈다. 반환: AD 로 나간 원격 명령, 만든 팀 디렉터리."""
-    sent, dirs = [], []
+    """AD·NAS 캐시 호출을 가로챈다. 반환: AD 로 나간 원격 명령."""
+    sent = []
     monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": sent.append(cmd) or "")
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: dirs.append((name, gid)))
     import reconcile_krb5
     monkeypatch.setattr(reconcile_krb5, "trigger_nas_gss_flush_ondemand", lambda: True)
     monkeypatch.setattr(main, "SHARED_GID_MIN", 70000)
     monkeypatch.setattr(main, "SHARED_GID_MAX", 79999)
-    return sent, dirs
+    return sent
 
 
 def _was_with_groups(env, groups):
@@ -83,7 +82,7 @@ def test_jobs_without_new_groups_keep_their_steps(env, ad):
 # ---------- 새 계정 ----------
 
 def test_new_account_creates_the_new_group_and_returns_its_gid(env, ad):
-    sent, dirs = ad
+    sent = ad
     _was_with_groups(env, [{"gid": None, "name": "vision-lab"}])
     _provision_new_account(env, "810", "exp-np-ng", [{"name": "vision-lab"}])
 
@@ -96,7 +95,6 @@ def test_new_account_creates_the_new_group_and_returns_its_gid(env, ad):
     assert _ledger()["vision-lab"]["members"] == ["exp-np-ng"]
     assert res["result"]["groups"] == [{"name": "vision-lab", "gid": 70000}]
     assert "group-create vision-lab 70000" in sent              # AD 에도 같은 gid 로
-    assert ("vision-lab", 70000) in dirs                        # 팀 디렉터리
     assert _pod_groups_env(env) == ["vision-lab:70000"]         # 컨테이너 안 그룹도 같은 gid
 
 

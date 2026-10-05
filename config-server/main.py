@@ -55,8 +55,6 @@ from utils import (
     other_homes_owned_by,
     delete_user_home_directory,
     HomeOwnerMismatch,
-    create_team_directory,
-    TeamDirGroupMismatch,
     sync_running_pod_groups,
     remove_running_pod_groups,
     sync_running_pod_password,
@@ -728,14 +726,6 @@ def _remove_ad_group_member(groupname: str, username: str) -> None:
     _farm_ad_ssh(f"group-removemember {groupname} {username}")
 
 
-def _ensure_team_dir(name: str, gid: int) -> None:
-    """팀 공유 디렉터리를 만든다(#154). NAS 가 AD 그룹으로 권한을 판정하므로 AD 연동이
-    꺼진 환경에서는 만들어도 팀에게 열리지 않는다 — 그룹 동기화와 같은 조건으로 건너뛴다."""
-    if not _ad_enabled():
-        return
-    create_team_directory(name, int(gid))
-
-
 def _set_group_membership(groupnames, username: str, member: bool) -> None:
     """group 파일에서 username의 멤버십을 더하거나 뺀다. AD 호출 동안 원장 잠금을 쥐지 않도록
     호출자가 앞서 읽은 내용을 쓰지 않고 잠금 안에서 다시 읽어, 그 사이 다른 Pod가 쓴 줄을 덮어쓰지 않는다."""
@@ -1386,7 +1376,7 @@ def register_group_change(body: GroupJobRequest):
     공용 그룹 작업 등록
 
     그룹 생성(op=create), 사용자의 그룹 추가(op=add)·제거(op=remove)를 작업으로 등록하고 바로 202를
-    돌려준다. 제어기가 AD · 계정 원장 · NAS 팀 디렉터리 · 떠 있는 Pod 를 차례로 맞춘다. 이미 맞춰진 조각은
+    돌려준다. 제어기가 AD · 계정 원장 · 떠 있는 Pod 를 차례로 맞춘다. 이미 맞춰진 조각은
     그대로 두므로 실패한 작업은 다시 등록하면 이어서 끝난다. 이름 충돌·없는 사용자나 그룹처럼 다시 해도
     같은 결과인 입력은 등록하지 않고 바로 거절한다.
     결과는 GET /operations/group/<request_id>로 조회한다(create 는 result.gid 에 배정된 번호).
