@@ -54,6 +54,40 @@ def pod_has_marker(cluster, pod_name):
     return out.strip() == "yes"
 
 
+# 주인이 홈 아래에 만들어 E2E 공용 그룹과 공유하는 폴더.
+SHARE_DIR = "e2e-share"
+
+
+def pod_as_user(cluster, pod_name, username, script):
+    """컨테이너 안에서 그 계정의 로그인 셸로 스크립트를 돌리고 표준출력을 돌려준다. kubectl exec 는 root 라
+    NAS 가 그 계정의 권한으로 판정하지 않고 umask 도 로그인과 다르다."""
+    return cluster.sh(f'kubectl -n "$NS" exec -i {safe(pod_name)} -- su -l {safe(username)} -c "bash -s" '
+                      f'2>/dev/null <<"USEREOF" || true\n{script}\nUSEREOF\n')
+
+
+def share_home_dir(cluster, pod_name, username, group_name):
+    """계정 주인이 홈 아래 폴더에 파일을 하나 두고 그룹과 공유한다. 공유 명령이 성공했는지를 돌려준다."""
+    out = pod_as_user(cluster, pod_name, username,
+                      f"mkdir -p ~/{SHARE_DIR} && echo owner > ~/{SHARE_DIR}/owner.txt "
+                      f"&& group-dir-share ~/{SHARE_DIR} {safe(group_name)} >/dev/null && echo SHARED")
+    return "SHARED" in out.split()
+
+
+def shared_dir_access(cluster, pod_name, username, owner_pod, owner):
+    """다른 계정이 주인의 공유 폴더에서 할 수 있는 일: 주인 파일 읽기, 새 파일 쓰기, 주인 홈 목록 보기.
+    쓴 파일은 주인이 다시 읽어 본다 — 팀원이 만든 파일이 팀 그룹으로 생기지 않으면 주인도 읽지 못한다."""
+    path = f"/home/{safe(owner)}/{SHARE_DIR}"
+    mine = f"from-{safe(username)}.txt"
+    out = pod_as_user(cluster, pod_name, username,
+                      f"cat {path}/owner.txt >/dev/null 2>&1 && echo READ\n"
+                      f"{{ echo visitor > {path}/{mine}; }} 2>/dev/null && echo WRITE\n"
+                      f"ls /home/{safe(owner)} >/dev/null 2>&1 && echo LIST")
+    back = pod_as_user(cluster, owner_pod, owner, f"cat ~/{SHARE_DIR}/{mine} >/dev/null 2>&1 && echo BACK")
+    seen = set(out.split())
+    return {"read": "READ" in seen, "write": "WRITE" in seen, "list_home": "LIST" in seen,
+            "owner_reads_back": "BACK" in back.split()}
+
+
 def oplog_codes(cluster, request_id):
     """이 신청 번호로 남은 작업 기록의 오류 코드 집합."""
     rows = cluster.sql(f"SELECT DISTINCT error_code FROM operation_log WHERE request_id='{int(request_id)}' "
@@ -127,8 +161,9 @@ def group_operation(cluster, operation_id):
 
 
 def group_row(cluster, group_name):
-    rows = cluster.sql(f"SELECT group_id, ubuntu_gid FROM `groups` WHERE group_name='{safe(group_name)}';")
-    return {"id": int(rows[0][0]), "gid": int(rows[0][1])} if rows else None
+    """admin_be 의 그룹 기록. gid 는 승인 대기 그룹(이 그룹을 고른 신청이 아직 승인되지 않음)이면 None 이다."""
+    rows = cluster.sql(f"SELECT group_id, IFNULL(ubuntu_gid,'') FROM `groups` WHERE group_name='{safe(group_name)}';")
+    return {"id": int(rows[0][0]), "gid": int(rows[0][1]) if rows[0][1] else None} if rows else None
 
 
 def change_request_status(cluster, change_request_id):
