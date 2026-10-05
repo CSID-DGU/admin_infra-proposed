@@ -815,7 +815,11 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
         raise last_error
 
     if result.returncode != 0:
-        raise RuntimeError(f"farm SSH 실패 ({host}:{port}): {result.stderr.strip()}")
+        err = RuntimeError(f"farm SSH 실패 ({host}:{port}): {result.stderr.strip()}")
+        # 원격 스크립트가 실패하면서도 표준출력에 결과를 남기는 경우가 있다(예: idmap-group-sync 는 일부 그룹이
+        # 거절되면 종료 코드 1이지만 그룹별 결과를 출력한다). 메시지는 그대로 두고 출력만 예외에 붙여 전달한다.
+        err.stdout = result.stdout
+        raise err
     return result.stdout
 
 
