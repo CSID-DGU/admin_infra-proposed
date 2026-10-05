@@ -279,6 +279,23 @@ def test_resolve_step_is_idempotent(env, ad):
     assert first["supp_groups"] == again["supp_groups"] == [{"name": "vision-lab", "gid": 70000}]
 
 
+
+def test_unexpected_failure_is_logged_as_new_group_failed(env, ad, monkeypatch):
+    """StepFailed 가 아닌 예외(원장 파일 오류 등)도 작업 이력에 NEW_GROUP_FAILED 로 남긴다."""
+    records = []
+    monkeypatch.setattr(main, "log_operation", lambda **kw: records.append(kw))
+
+    def boom(name, username):
+        raise OSError("group 파일을 읽지 못함")
+    monkeypatch.setattr(group_steps, "_shared_group_gid", boom)
+    ctx = {"request_id": "880", "username": "exp-np-ng", "supp_groups": [{"name": "vision-lab"}]}
+    with main.app.app_context():
+        with pytest.raises(OSError):
+            group_steps.step_resolve_new_groups(ctx)
+    assert records[-1]["resource_type"] == "new_groups"
+    assert records[-1]["error_code"] == "NEW_GROUP_FAILED"
+
+
 # ---------- 설정 조회의 null gid ----------
 
 def test_null_gid_this_job_did_not_create_fails_instead_of_dropping_the_group(env, ad):

@@ -3,11 +3,11 @@ import tempfile
 import threading
 import time
 
-from main import (app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh,
+from main import (app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh, _ad_enabled,
                   _record_krb5_cleanup_pending, SHARED_GID_MIN, SHARED_GID_MAX)
 from utils import (get_db_connection, read_group_lines, parse_group_line,
                    read_passwd_lines, parse_passwd_line,
-                   nas_shared_gids_for_users, nas_flush_gss_cache)
+                   nas_shared_gids_for_users, nas_flush_gss_cache, _VALID_USERNAME_RE)
 from adapters.nas_gss_flush_lock import try_acquire_flush_lock, release_flush_lock
 
 
@@ -302,8 +302,92 @@ def trigger_nas_gss_flush_ondemand() -> bool:
     return True
 
 
+# ---- 공유 그룹 idmap 등록 ----
+#
+# AD 멤버 farm 노드(winbind use default domain = yes)는 chgrp 때 그룹 이름을 FARM\ 없이 NAS 에 보내고,
+# NAS 가 그 이름을 거부해 사용자가 홈 아래 폴더를 공유 그룹으로 열지 못한다. 노드의 ailab-krb5-admin
+# idmap-group-sync 가 그룹마다 /etc/idmapd.conf 에 정식 이름 한 줄을 넣어 이를 푼다. 여기서는 그 액션에
+# 공유 그룹 이름을 넘기기만 한다 — 줄을 쓸지(멤버 노드)·건너뛸지(DC)·이미 있는지는 노드가 판정한다.
+# 노드는 줄을 지우지 않고(여러 스택이 같은 노드를 쓴다), 그룹이 AD 에 아직 없어도 미리 써 둔다.
+
+IDMAP_SYNC_ACTION = "idmap-group-sync"
+_IDMAP_QUIET_STATES = ("idmap_group_state=present", "idmap_group_state=skipped")
+
+
+def _ledger_shared_group_names() -> list:
+    """대장의 공유 대역 그룹 이름(이름순). 개인 그룹·시스템 그룹은 대역 밖이라 빠진다."""
+    names = set()
+    for line in read_group_lines():
+        g = parse_group_line(line)
+        if not g or g["gid"] < SHARED_GID_MIN:
+            continue
+        if SHARED_GID_MAX is not None and g["gid"] > SHARED_GID_MAX:
+            continue
+        names.add(g["name"])
+    return sorted(names)
+
+
+def sync_idmap_groups(names) -> None:
+    """그룹 이름들을 farm 노드마다 idmap-group-sync 로 보낸다. 실패는 경고만 남기고 다음 노드로 넘어간다.
+
+    이름 형식이 틀린 그룹은 보내지 않는다. 노드는 그런 이름이 하나라도 있으면 종료 코드 1을 내고,
+    _farm_ssh 는 그때 표준출력을 버려서 같은 묶음의 다른 그룹 결과까지 볼 수 없게 된다."""
+    valid = sorted({n for n in names if _VALID_USERNAME_RE.match(n)})
+    invalid = sorted(set(names) - set(valid))
+    if invalid:
+        app.logger.warning(f"[IDMAP] 이름 형식이 맞지 않아 노드에 보내지 않음: {invalid}")
+    if not valid:
+        return
+    payload = "\n".join(valid) + "\n"
+    for node in app.config["FARM_NODES"]:
+        try:
+            out = _farm_ssh(node["host"], node["port"], IDMAP_SYNC_ACTION, stdin_data=payload)
+        except Exception as e:
+            # 같은 묶음에 노드의 로컬 그룹과 이름이 겹치는 그룹(conflict)이 있어도 여기로 온다. 그때도 나머지
+            # 그룹은 노드가 이미 썼고, 그룹별 결과는 예외에 붙은 표준출력에 있다 — 아래에서 그대로 남긴다.
+            # ssh -v 출력이 길어 메시지는 끝부분만 남긴다.
+            app.logger.warning(f"[IDMAP] {node['name']} 공유 그룹 등록 실패(다음 주기 재시도): {str(e)[-500:]}")
+            # 시간 초과(TimeoutExpired)에도 stdout 속성이 있지만 bytes 이거나 None 일 수 있다 — 문자열일 때만 쓴다.
+            out = getattr(e, "stdout", None)
+            out = out if isinstance(out, str) else ""
+        for line in out.splitlines():
+            if line.startswith("idmap_group_state=") and not line.startswith(_IDMAP_QUIET_STATES):
+                app.logger.info(f"[IDMAP] {node['name']}: {line}")
+
+
+def reconcile_idmap_groups() -> None:
+    """30분 크론. 대장의 공유 그룹 전체를 노드에 등록한다 — 생성 직후 등록이 빠진 노드(꺼져 있었음 등)와
+    이 등록이 생기기 전에 만든 그룹을 채운다. 이미 있는 줄은 노드가 그대로 둔다."""
+    if not _ad_enabled():
+        return
+    sync_idmap_groups(_ledger_shared_group_names())
+
+
+def trigger_idmap_sync_ondemand(names) -> bool:
+    """새 공유 그룹을 만든 직후 부른다. 데몬 스레드로 등록을 띄우고 바로 돌아온다 — 노드가 느리거나 응답이
+    없어도(_farm_ssh 는 노드당 최대 150초×2) 그룹 작업을 기다리게 하지 않는다. 등록이 끝나지 못하면
+    30분 크론이 채운다.
+
+    반환값은 스레드를 띄웠는지일 뿐, 등록 성공 여부가 아니다."""
+    names = sorted(set(names or []))
+    if not names or not app.config["FARM_NODES"]:
+        return False
+
+    def _run():
+        with app.app_context():
+            try:
+                sync_idmap_groups(names)
+            except Exception:
+                app.logger.exception("[IDMAP 온디맨드] 등록 중 예외 — 30분 크론에 맡김")
+
+    threading.Thread(target=_run, daemon=True, name="idmap-group-sync").start()
+    return True
+
+
 if __name__ == "__main__":
     with app.app_context():
         reconcile_krb5_cleanup_pending()
         reconcile_krb5_orphans()
         reconcile_nas_gss_cache()
+        # 맨 뒤에 둔다 — 노드가 응답하지 않아도 앞의 재조정은 이미 끝나 있다.
+        reconcile_idmap_groups()
