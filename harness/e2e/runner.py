@@ -59,7 +59,8 @@ class Run:
         self.admin_id = self._insert_user(email=admin_email(self.run_id), username=None, role="ADMIN")
         rows = self.cluster.sql("SELECT rsgroup_id FROM resource_groups WHERE server_name='FARM' ORDER BY rsgroup_id LIMIT 1;")
         self.resource_group = int(rows[0][0])
-        rows = self.cluster.sql("SELECT image_id FROM container_image ORDER BY image_id LIMIT 1;")
+        # 가장 나중에 등록한 이미지로 돌린다. 옛 이미지와 새 이미지가 함께 등록된 동안에도 내보낼 이미지를 시험한다.
+        rows = self.cluster.sql("SELECT image_id FROM container_image ORDER BY image_id DESC LIMIT 1;")
         self.image = int(rows[0][0])
 
     def farm_nodes(self):
@@ -157,6 +158,12 @@ class Context:
         expires = (dt.datetime.now() + dt.timedelta(days=arg.get("days", 3))).strftime("%Y-%m-%dT%H:%M:%S")
         body = {"resourceGroupId": self.run.resource_group, "imageId": self.run.image,
                 "usagePurpose": f"e2e {self.case} {PURPOSE_FILLER}", "formAnswers": {}, "expiresAt": expires}
+        if arg.get("group"):
+            # 신청서에서 E2E 공용 그룹을 고른다. 승인 대기 그룹이면 이 신청이 승인될 때 인프라에 만들어진다.
+            group = observe.group_row(self.run.cluster, self.run.group_name)
+            if not group:
+                raise StepFailed(f"그룹 {self.run.group_name}이 admin_be에 없음")
+            body["groupIds"] = [group["id"]]
         payload = self._call("POST", "/api/requests", as_user=user["id"], body=body)
         self.requests[arg["as"]] = int(payload["data"]["requestId"])
         self.memo[f"{arg['as']}.owner"] = user["id"]
@@ -358,7 +365,9 @@ class Context:
 
     # ---- 공용 그룹 ----
     def do_create_group(self, arg):
-        """사용자가 E2E 공용 그룹을 만든다. 만들기는 작업으로 등록만 되므로 끝나기는 wait_group 으로 기다린다."""
+        """사용자가 E2E 공용 그룹을 만든다. admin_be 는 그룹을 자기 기록에만 만들고(승인 대기), 그 그룹을 고른 신청이
+        승인될 때 인프라에 만든다 — 그래서 기다릴 작업이 없다. 예전 admin_be 는 만들기를 작업으로 등록했으므로
+        응답에 작업 번호가 있으면 wait_group 이 그 작업을 기다린다."""
         if observe.group_row(self.run.cluster, self.run.group_name):
             # 같은 실행의 앞선 사례가 이미 만들었다. 그 그룹을 그대로 쓴다.
             self.observed.append({"step": self.step_no, "group": "already exists"})
@@ -366,7 +375,8 @@ class Context:
             return
         payload = self._call("POST", "/api/groups", as_user=self.users[arg["user"]]["id"],
                              body={"groupName": self.run.group_name})
-        self.memo[f"{arg['as']}.operation"] = int(payload["data"]["operationId"])
+        operation_id = payload["data"].get("operationId")
+        self.memo[f"{arg['as']}.operation"] = int(operation_id) if operation_id is not None else None
 
     def do_wait_group(self, arg):
         """그룹 작업(만들기·빼기)이 원하는 상태(APPLIED·FAILED)가 될 때까지 기다린다."""
@@ -391,6 +401,8 @@ class Context:
         group = observe.group_row(self.run.cluster, self.run.group_name)
         if not group:
             raise StepFailed(f"그룹 {self.run.group_name}이 admin_be에 없음")
+        if group["gid"] is None:
+            raise StepFailed(f"그룹 {self.run.group_name}이 아직 승인 대기 — 이 그룹을 고른 신청이 먼저 승인돼야 함")
         self._call("POST", f"/api/requests/{self._req(alias)}/change", as_user=self._owner(alias),
                    body={"changeType": "GROUP", "newValue": json.dumps([group["gid"]]),
                          "reason": f"e2e {self.case} 공용 그룹 추가"})
@@ -440,6 +452,47 @@ class Context:
             answers = [seen["recorded"], seen["ledger"], *seen["pods"]]
             if any(answer != (want == "present") for answer in answers):
                 raise StepFailed(f"{alias}: 그룹 소속이 {want}이어야 하는데 {seen}")
+
+    def _pod_user(self, alias):
+        """신청 별칭 → (Pod 이름, 주인의 계정 이름)."""
+        row = observe.request_row(self.run.cluster, self._req(alias))
+        owner = next(u for u in self.users.values() if u["id"] == self._owner(alias))
+        return row["pod"], owner["name"]
+
+    def do_share_dir(self, alias):
+        """신청의 주인이 홈 아래 폴더를 E2E 공용 그룹과 공유한다(group-dir-share). 그룹 소속이 NAS 에 닿기 전에는
+        그룹 변경이 거부되므로 될 때까지 다시 한다."""
+        pod, owner = self._pod_user(alias)
+        shared = observe.wait_until(
+            lambda: observe.share_home_dir(self.run.cluster, pod, owner, self.run.group_name),
+            self.run.wait_timeout, self.run.interval)
+        self.observed.append({"step": self.step_no, "share": alias, "shared": bool(shared)})
+        if not shared:
+            raise StepFailed(f"{alias}: 홈 아래 폴더를 {self.run.group_name} 그룹과 공유하지 못함")
+
+    def do_expect_share(self, arg):
+        """{of: 주인의 신청, 다른 신청: open|closed}. open 은 주인 파일을 읽고, 새 파일을 쓰고, 그 파일을 주인이
+        읽을 수 있어야 한다. closed 는 읽기·쓰기가 모두 막혀야 한다. 어느 쪽이든 주인 홈의 목록은 보이면 안 된다.
+        그룹 변경이 NAS 에 닿기까지 몇 분 걸리므로 원하는 상태가 될 때까지 기다린다."""
+        owner_pod, owner = self._pod_user(arg["of"])
+        for alias, want in arg.items():
+            if alias == "of":
+                continue
+            pod, visitor = self._pod_user(alias)
+            seen = {}
+
+            def reached():
+                seen.update(observe.shared_dir_access(self.run.cluster, pod, visitor, owner_pod, owner))
+                if seen["list_home"]:
+                    return False
+                if want == "open":
+                    return seen["read"] and seen["write"] and seen["owner_reads_back"]
+                return not seen["read"] and not seen["write"]
+
+            ok = observe.wait_until(reached, self.run.wait_timeout, self.run.interval)
+            self.observed.append({"step": self.step_no, "share": arg["of"], "visitor": alias, **seen})
+            if not ok:
+                raise StepFailed(f"{alias}: 공유 폴더가 {want}이어야 하는데 {seen}")
 
     def do_expect_change_codes(self, arg):
         for alias, codes in arg.items():

@@ -180,24 +180,50 @@ cases:
       - expect_password: {r1: unchanged}
 
   - id: C12
-    title: 공용 그룹 만들기·추가·제거 — 셋 다 작업으로 반영되고, admin_be 기록·계정 원장·떠 있는 컨테이너가 함께 바뀐다
+    title: 공용 그룹 만들기·제거·추가 — 신청 승인 때 그룹이 만들어지고, 제거·추가가 작업으로 반영되며, admin_be 기록·계정 원장·떠 있는 컨테이너가 함께 바뀐다
     # 공용 그룹은 AD 에서 지울 수단이 없어 실사용자 스택에는 만들지 않는다.
     not_on: [operation]
     steps:
       - user: a
-      - apply: {user: a, as: r1}
-      - approve: r1
-      - wait: {r1: FULFILLED}
       - create_group: {user: a, as: g}
       - wait_group: {g: APPLIED}
+      - apply: {user: a, as: r1, group: true}
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - expect_member: {a: present}
+      - remove_group: {user: a, as: x}
+      - wait_group: {x: APPLIED}
       - expect_member: {a: absent}
       - request_group: {req: r1, as: c1}
       - approve_change: c1
       - wait_change: {c1: FULFILLED}
       - expect_member: {a: present}
-      - remove_group: {user: a, as: x}
+
+  - id: C14
+    title: 홈 아래 폴더 공유 — 같은 그룹 팀원은 읽고 쓰고, 그룹 밖 사용자와 그룹에서 빠진 사용자는 들어오지 못한다
+    # 공용 그룹은 AD 에서 지울 수단이 없어 실사용자 스택에는 만들지 않는다.
+    not_on: [operation]
+    steps:
+      - user: a
+      - user: b
+      - user: c
+      - create_group: {user: a, as: g}
+      - wait_group: {g: APPLIED}
+      - apply: {user: a, as: r1, group: true}
+      - apply: {user: b, as: r2, group: true}
+      - apply: {user: c, as: r3}
+      # 승인 대기 그룹은 한 번에 한 신청만 만들 수 있다. 첫 신청이 그룹을 만든 뒤 나머지를 승인한다.
+      - approve: r1
+      - wait: {r1: FULFILLED}
+      - approve: r2
+      - approve: r3
+      - wait: {r2: FULFILLED, r3: FULFILLED}
+      - expect_member: {a: present, b: present, c: absent}
+      - share_dir: r1
+      - expect_share: {of: r1, r2: open, r3: closed}
+      - remove_group: {user: b, as: x}
       - wait_group: {x: APPLIED}
-      - expect_member: {a: absent}
+      - expect_share: {of: r1, r2: closed}
 
   - id: F01
     title: 생성 중 제어기 Pod 사망 — 다른(새) 제어기가 이어받아 끝낸다

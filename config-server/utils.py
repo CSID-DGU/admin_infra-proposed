@@ -1109,43 +1109,10 @@ def _user_home_path(username: str) -> str:
     이름은 admin_be가 만들고 내부 토큰으로 보호되지만, 지우는 쪽에 방어를 두는 편이 맞다."""
     if not _VALID_USERNAME_RE.match(username):
         raise ValueError(f"invalid username for home directory: {username!r}")
-    # 팀 디렉터리와 같은 자리에 놓이므로 이 접두어는 홈으로 쓰지 않는다 — 지우는 경로가 팀 데이터를 지운다.
+    # 예전 팀 디렉터리(/home/_g_<팀>)가 같은 자리에 남아 있다. 이 접두어는 홈으로 쓰지 않는다 — 지우는 경로가 팀 데이터를 지운다.
     if username.startswith(TEAM_DIR_PREFIX):
         raise ValueError(f"username uses the reserved team directory prefix: {username!r}")
     return f"{os.environ['NFS_USER_SHARE_PATH']}/{username}"
-
-
-def team_dir_path(group_name: str) -> str:
-    if not _VALID_USERNAME_RE.match(group_name):
-        raise ValueError(f"invalid group name for team directory: {group_name!r}")
-    return f"{os.environ['NFS_USER_SHARE_PATH']}/{TEAM_DIR_PREFIX}{group_name}"
-
-
-class TeamDirGroupMismatch(RuntimeError):
-    """이미 있는 팀 디렉터리의 그룹이 배정하려는 gid 와 달라서 덮어쓰지 않고 멈춘 경우."""
-
-
-def create_team_directory(group_name: str, gid: int) -> None:
-    """팀 공유 디렉터리(/home/_g_<팀>)를 root:<gid> 2770 으로 만든다. 여러 번 불러도 같다.
-
-    user-share 전체가 Pod 의 /home 에 마운트되므로 Pod 쪽은 바꿀 것이 없다. setgid 비트가
-    새 파일의 그룹을 팀으로 고정하고, 로그인 umask 002 가 그룹 쓰기를 남긴다 — 사용자가
-    chgrp 할 일이 없다(#154). other 는 막는다. 팀 밖 사용자가 읽을 이유가 없다.
-
-    이미 있는 디렉터리의 그룹이 다르면 다른 팀의 데이터일 수 있어 건드리지 않는다."""
-    path = team_dir_path(group_name)
-    quoted = shlex.quote(path)
-    app.logger.info(f"[NAS SSH] ensuring team dir {path} gid={gid}")
-    with _nas_ssh_client() as ssh:
-        code, current = _ssh_capture(ssh, f"stat -c %g {quoted}")
-        if code == 0 and current.isdigit() and int(current) != int(gid):
-            raise TeamDirGroupMismatch(
-                f"팀 디렉터리 {path} 가 이미 gid {current} 소유인데 {gid} 로 배정하려 했습니다. "
-                f"다른 팀의 데이터일 수 있어 덮어쓰지 않습니다. NAS 에서 소유 그룹을 확인하십시오."
-            )
-        _ssh_run(ssh, f"sudo mkdir -p {quoted}")
-        _ssh_run(ssh, f"sudo chown 0:{int(gid)} {quoted}")
-        _ssh_run(ssh, f"sudo chmod 2770 {quoted}")
 
 
 def _home_owner_uid(ssh, quoted_path: str):
@@ -1191,7 +1158,11 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
     (2026-09-19 yoon6yo 사례: NAS 는 20016, 대장은 21000). 그 경우 Pod 는 Running 이고
     sshd 도 뜨기 때문에 내부 점검으로는 드러나지 않는다.
 
-    NAS 가 쓰는 값은 NAS 에서 `id -u 'FARM\\<사용자명>'` 으로 확인한다."""
+    NAS 가 쓰는 값은 NAS 에서 `id -u 'FARM\\<사용자명>'` 으로 확인한다.
+
+    홈은 711 이다. 다른 사용자는 목록을 볼 수 없고 지나가기만 할 수 있어서, 사용자가 홈 아래 폴더의 그룹을
+    팀 그룹으로 바꾸면(chgrp + chmod 2770) 그 팀원이 그룹 권한으로 들어온다. 그 밖의 파일은 컨테이너의
+    umask 007 이 others 권한을 빼 두므로 이름을 알아도 열리지 않는다(admin_infra_server container-images)."""
     path = _user_home_path(username)
     quoted = shlex.quote(path)
     app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
@@ -1210,7 +1181,7 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
         try:
             _ssh_run(ssh, f"sudo mkdir -p {quoted}")
             _ssh_run(ssh, f"sudo chown {int(uid)}:{int(gid)} {quoted}")
-            _ssh_run(ssh, f"sudo chmod 700 {quoted}")
+            _ssh_run(ssh, f"sudo chmod 711 {quoted}")
         except Exception as e:
             # 없던 홈을 만들다 끊겼으면 빈 홈이 남았을 수 있다 — 되돌림이 이 홈을 지울 수 있게 알린다.
             e.home_created = current is None

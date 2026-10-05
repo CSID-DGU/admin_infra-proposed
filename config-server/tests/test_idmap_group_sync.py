@@ -277,7 +277,6 @@ def group_env(ledger, monkeypatch):
     """관리자 그룹 생성 작업 대역. 반환: (AD 로 나간 명령, 등록에 넘긴 이름 목록)"""
     sent, registered = [], []
     monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": sent.append(cmd) or "")
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: None)
     monkeypatch.setattr(main, "SHARED_GID_MIN", 70000)
     monkeypatch.setattr(main, "SHARED_GID_MAX", 79999)
     monkeypatch.setattr(main, "UID_MIN", 21000)
@@ -340,7 +339,6 @@ def new_group_env(env, monkeypatch):
     """신청 경로 대역. 반환: 등록에 넘긴 이름 목록"""
     registered = []
     monkeypatch.setattr(main, "_farm_ad_ssh", lambda cmd, stdin_data="": "")
-    monkeypatch.setattr(main, "create_team_directory", lambda name, gid: None)
     monkeypatch.setattr(rec, "trigger_nas_gss_flush_ondemand", lambda: True)
     monkeypatch.setattr(rec, "trigger_idmap_sync_ondemand", lambda names: registered.append(sorted(names)) or True)
     monkeypatch.setattr(main, "SHARED_GID_MIN", 70000)

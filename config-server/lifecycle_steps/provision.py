@@ -1119,7 +1119,7 @@ def build_pod_spec(
         # docker run --gpus device=all --runtime=nvidia)도 개별 디바이스를 수동 마운트하지
         # 않는 방식이라 이 문제가 없었다.
 
-        # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        # NFS user-share 전체를 /home에 마운트 — 홈은 711(지나가기만 가능), 안의 파일은 umask 007로 others를 막는다
         # image-store PVC(pvc-image-store)는 제거 — 해당 PV의 NFS subdir가
         # 미치환 템플릿(user-share/${pvc.annotations.nfs.io/username})이라 모든 유저 파드가
         # mount access denied로 Ready 실패. MVP는 image-store 불필요.
@@ -1870,19 +1870,14 @@ def step_sync_ad_groups(ctx):
         for sg in supp_groups:
             _main._create_ad_group(sg["name"], int(sg["gid"]))
             _main._add_ad_group_member(sg["name"], name)
-            # 이 변경 전에 만든 그룹은 디렉터리가 없다. 멤버가 들어올 때 채워 둔다(#154).
-            _main._ensure_team_dir(sg["name"], int(sg["gid"]))
     except Exception as e:
-        # 팀 디렉터리 gid 불일치는 사람이 NAS 를 확인해야 풀린다 — 재시도는 같은 결과만 반복한다.
-        mismatch = isinstance(e, _main.TeamDirGroupMismatch)
-        code = "TEAM_DIR_GROUP_MISMATCH" if mismatch else "AD_GROUP_SYNC_FAILED"
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 반영 실패: user=%s", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="groups",
                       action=Action.CREATE_ACCOUNT, phase=_main._fail_phase(e),
-                      error_code=code, error_detail=str(e))
+                      error_code="AD_GROUP_SYNC_FAILED", error_detail=str(e))
         raise _main.StepFailed(_main.infra_error(
-            "SYNC_AD_GROUPS", code,
-            f"failed to sync supplementary groups to AD for {name}"), 500, cause=e, retry=not mismatch)
+            "SYNC_AD_GROUPS", "AD_GROUP_SYNC_FAILED",
+            f"failed to sync supplementary groups to AD for {name}"), 500, cause=e)
     _main.log_operation(request_id=request_id, username=name, resource_type="groups",
                   action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
 

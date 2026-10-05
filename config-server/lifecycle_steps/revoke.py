@@ -459,7 +459,7 @@ def step_delete_account(ctx):
             _main.write_shadow_lines(sh_new)
 
             # 모든 그룹의 멤버 목록에서 사용자를 빼고, 비게 된 개인(primary) 그룹만 지운다.
-            # 공용 그룹은 멤버가 0명이어도 남긴다 — AD 그룹·NAS 팀 디렉터리·admin_be 행은 그대로라
+            # 공용 그룹은 멤버가 0명이어도 남긴다 — AD 그룹·admin_be 행은 그대로라
             # 줄만 지우면 승인이 GROUP_NOT_FOUND 로 실패하고 빈 gid 가 다른 그룹에 다시 배정된다(#180).
             # 공용 그룹 삭제는 명시적 그룹 삭제 경로의 몫이다(#177).
             g_lines = _main.read_group_lines()

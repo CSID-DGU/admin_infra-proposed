@@ -13,7 +13,7 @@ VERBS = {
     "expect_codes", "expect_pod", "expect_node_changed", "fault", "heal", "sleep", "wait_job", "wait_account", "wait_codes",
     "reset_password", "wait_password", "expect_password",
     "create_group", "wait_group", "request_group", "approve_change", "wait_change", "remove_group",
-    "expect_member", "expect_change_codes",
+    "expect_member", "expect_change_codes", "share_dir", "expect_share",
     "restart", "expect_restarted", "mark_pod", "expect_marker",
 }
 FAULT_VERBS = {"fault"}

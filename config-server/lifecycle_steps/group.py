@@ -1,6 +1,6 @@
 """공용 그룹 작업 단계 — 그룹 생성, 사용자의 그룹 추가·제거.
 
-세 작업 모두 AD(권한의 원천) · 계정 원장(group 파일) · NAS 팀 디렉터리 · 떠 있는 Pod 를 차례로 맞춘다.
+세 작업 모두 AD(권한의 원천) · 계정 원장(group 파일) · 떠 있는 Pod 를 차례로 맞춘다.
 어느 조각이든 이미 맞춰져 있으면 그대로 두고 다음으로 가므로, 중간에 끊긴 작업은 처음부터 다시 실행하면
 이어서 끝난다. 그래서 실패해도 앞서 한 일을 되돌리지 않는다 — 되돌리면 AD 에 남은 그룹과 다시 배정한
 gid 가 어긋나 같은 요청을 다시 처리할 수 없게 된다.
@@ -97,7 +97,7 @@ def _in_shared_band(gid):
 
 def _shared_group_gid(name, username):
     """새 공유 그룹(gid 없이 온 보조 그룹)의 gid. 원장에 같은 이름의 줄이 있으면 그 gid 를, 없으면 새로 발급해
-    멤버 없는 줄을 써 두고 그 gid 를 돌려준다. 멤버 추가·AD·팀 디렉터리는 뒤의 계정·그룹 단계가 맞춘다.
+    멤버 없는 줄을 써 두고 그 gid 를 돌려준다. 멤버 추가·AD는 뒤의 계정·그룹 단계가 맞춘다.
 
     같은 이름의 줄은 앞선 시도(이 작업의 이어하기, 같은 그룹을 고른 다른 신청의 실패한 작업)가 남긴 것이다 —
     admin_be 는 자기 DB 에 있는 이름으로는 새 그룹을 만들지 않고, 같은 그룹의 생성 작업이 둘 동시에 돌지 않게
@@ -204,20 +204,6 @@ def _write_group_line(name, gid, members):
     return gid
 
 
-def _ensure_team_dirs(op, gids):
-    try:
-        for name, gid in sorted(gids.items()):
-            _main._ensure_team_dir(name, gid)
-    except _main.TeamDirGroupMismatch as e:
-        # 이미 있는 디렉터리의 gid 가 다르면 사람이 NAS 를 확인해야 풀린다 — 재시도는 같은 결과만 반복한다.
-        _main.app.logger.error("[ACCOUNTS] 팀 디렉터리 gid 불일치: %s", e)
-        raise _failed(op, "TEAM_DIR_GROUP_MISMATCH", str(e), 409, retry=False)
-    except Exception as e:
-        _main.app.logger.exception("[ACCOUNTS] 팀 디렉터리 생성 실패: %s", sorted(gids))
-        raise _failed(op, "TEAM_DIR_CREATE_FAILED",
-                      f"failed to create team directories: {', '.join(sorted(gids))}", 500, cause=e)
-
-
 def _flush_nas_group_cache():
     """NAS 는 맺어 둔 GSS 컨텍스트의 옛 그룹 목록을 쓴다 — 비워야 떠 있는 세션에 반영된다(#161).
     실패해도 30분 크론이 같은 일을 하므로 작업을 실패시키지 않는다."""
@@ -249,7 +235,7 @@ def step_group_create(ctx):
     name, members = ctx["group_name"], ctx["group_members"]
     check_create(name, ctx.get("group_requested_gid"), members)
     gid = _write_group_line(name, ctx.get("group_requested_gid"), members)
-    # AD 에 올려야 NAS 가 이 그룹을 인정한다(#146). 팀 디렉터리는 그 뒤에 만든다 — AD 에 없는 gid 는 NAS 가 모른다.
+    # AD 에 올려야 NAS 가 이 그룹을 인정한다(#146). 사용자가 홈 아래 폴더를 이 그룹으로 열면 NAS 가 AD 로 판정한다.
     try:
         _main._create_ad_group(name, gid)
         for member in sorted(members):
@@ -258,7 +244,6 @@ def step_group_create(ctx):
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 생성 실패: %s(%s)", name, gid)
         raise _failed("ADD_GROUP", "AD_GROUP_CREATE_FAILED", f"failed to create group in AD: {name}", 500, cause=e)
     _register_idmap_groups([name])
-    _ensure_team_dirs("ADD_GROUP", {name: gid})
     ctx["group_gid"] = gid
 
 
@@ -275,8 +260,6 @@ def step_group_add_member(ctx):
         _main.app.logger.exception("[ACCOUNTS] AD 그룹 멤버 추가 실패: %s -> %s", username, sorted(gids))
         raise _failed("ADD_USER_GROUPS", "AD_GROUP_MEMBER_FAILED",
                       f"failed to add {username} to groups in AD", 500, cause=e)
-    # 팀 디렉터리가 생기기 전에 만든 그룹도 여기서 채워야 멤버가 같이 쓸 자리가 생긴다(#154).
-    _ensure_team_dirs("ADD_USER_GROUPS", gids)
     _main._set_group_membership(gids, username, member=True)
     # 이미 떠 있는 Pod 는 기동 때 구운 /etc/group 을 그대로 쓴다(admin_infra_server#25). 권한 원천(AD)은
     # 이미 반영됐으므로 실패해도 작업은 성공으로 둔다.

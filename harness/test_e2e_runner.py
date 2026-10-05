@@ -4,7 +4,7 @@ import re
 import pytest
 
 from e2e.resetter import Resetter
-from e2e.runner import Run
+from e2e.runner import Context, Run, StepFailed
 
 
 class FakeCluster:
@@ -38,10 +38,12 @@ class FakeCluster:
 class FakeApi:
     def __init__(self, responses=None):
         self.calls = []
+        self.bodies = []
         self.responses = responses or {}
 
     def call(self, method, path, *, as_user, body=None):
         self.calls.append((method, path, as_user))
+        self.bodies.append(body)
         return self.responses.get((method, path), (200, {"data": {"requestId": 101}}))
 
 
@@ -206,6 +208,95 @@ def test_rejected_password_reset_must_leave_the_password_alone():
     wrong = make_run(cluster, api).run_case(
         {"id": "C11", "steps": steps + [{"expect_password": {"r1": "changed"}}]}, allow_faults=False)
     assert wrong["result"] == "FAIL" and "그대로" in wrong["error"]
+
+
+# ---------- 공용 그룹: 승인 대기 그룹과 홈 아래 폴더 공유 ----------
+
+def test_new_group_has_no_job_and_the_application_selects_it_by_group_id():
+    """admin_be 는 새 그룹을 자기 기록에만 만든다(작업 번호 없음, gid 없음). 그 그룹을 고른 신청이 인프라에 만든다."""
+    cluster = _fulfilled_cluster()
+    made = iter([[], [("3", "")]])
+    cluster.on(r"FROM `groups` WHERE group_name='exp-fu-e2e-team'", lambda _: next(made, [("3", "")]))
+    api = FakeApi({("POST", "/api/groups"): (201, {"data": {"groupId": 3, "ubuntuGid": None}})})
+    steps = [{"user": "a"}, {"create_group": {"user": "a", "as": "g"}}, {"wait_group": {"g": "APPLIED"}},
+             {"apply": {"user": "a", "as": "r1", "group": True}}]
+
+    result = make_run(cluster, api).run_case({"id": "C12", "steps": steps}, allow_faults=False)
+
+    assert result["result"] == "PASS"
+    assert api.bodies[api.calls.index(("POST", "/api/requests", 7))]["groupIds"] == [3]
+
+
+def test_change_request_for_a_group_that_is_still_pending_is_reported_as_such():
+    cluster = _fulfilled_cluster()
+    cluster.on(r"FROM `groups` WHERE group_name", [("3", "")])
+    steps = [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}, {"request_group": {"req": "r1", "as": "c1"}}]
+    result = make_run(cluster, FakeApi()).run_case({"id": "C12", "steps": steps}, allow_faults=False)
+    assert result["result"] == "FAIL" and "승인 대기" in result["error"]
+
+
+def _share_context(*, shared="SHARED\n", visitor="", back=""):
+    """주인 a(신청 r1)와 방문자 b(신청 r2). 컨테이너 안 명령의 출력만 정한다."""
+    cluster = FakeCluster()
+    cluster.on(r"WHERE request_id=101;", [("FULFILLED", "farm1", "pod-a")])
+    cluster.on(r"WHERE request_id=102;", [("FULFILLED", "farm2", "pod-b")])
+    cluster.on(r"group-dir-share", shared)
+    cluster.on(r"echo READ", visitor)
+    cluster.on(r"echo BACK", back)
+    ctx = Context(make_run(cluster, FakeApi()), "C14")
+    ctx.users = {"a": {"id": 7, "name": "exp-fu-a"}, "b": {"id": 8, "name": "exp-fu-b"}}
+    ctx.requests = {"r1": 101, "r2": 102}
+    ctx.memo = {"r1.owner": 7, "r2.owner": 8}
+    return ctx, cluster
+
+
+def test_owner_shares_a_home_folder_as_the_account_not_as_root():
+    ctx, cluster = _share_context()
+    ctx.do_share_dir("r1")
+    script = next(c for c in cluster.calls if "group-dir-share" in c)
+    assert "exec -i pod-a -- su -l exp-fu-a" in script
+    assert "group-dir-share ~/e2e-share exp-fu-e2e-team" in script
+
+
+def test_share_step_fails_when_the_share_command_never_succeeds():
+    ctx, _ = _share_context(shared="")
+    with pytest.raises(StepFailed, match="공유하지 못함"):
+        ctx.do_share_dir("r1")
+
+
+def test_teammate_reads_writes_and_the_owner_reads_the_teammates_file():
+    ctx, cluster = _share_context(visitor="READ\nWRITE\n", back="BACK\n")
+    ctx.do_expect_share({"of": "r1", "r2": "open"})
+    visit = next(c for c in cluster.calls if "echo READ" in c)
+    assert "exec -i pod-b -- su -l exp-fu-b" in visit and "/home/exp-fu-a/e2e-share/owner.txt" in visit
+
+
+def test_open_share_fails_when_the_owner_cannot_read_what_the_teammate_wrote():
+    """폴더 그룹만 바꾸고 setgid 를 빼면 팀원이 만든 파일이 팀원 개인 그룹으로 생겨 주인이 읽지 못한다."""
+    ctx, _ = _share_context(visitor="READ\nWRITE\n", back="")
+    with pytest.raises(StepFailed, match="owner_reads_back"):
+        ctx.do_expect_share({"of": "r1", "r2": "open"})
+
+
+def test_open_share_fails_when_the_teammate_cannot_read_the_owners_file():
+    ctx, _ = _share_context(visitor="WRITE\n", back="BACK\n")
+    with pytest.raises(StepFailed, match="open"):
+        ctx.do_expect_share({"of": "r1", "r2": "open"})
+
+
+def test_closed_share_passes_only_when_reading_and_writing_are_both_refused():
+    ctx, _ = _share_context(visitor="")
+    ctx.do_expect_share({"of": "r1", "r2": "closed"})
+    ctx, _ = _share_context(visitor="READ\n")
+    with pytest.raises(StepFailed, match="closed"):
+        ctx.do_expect_share({"of": "r1", "r2": "closed"})
+
+
+def test_a_listable_home_fails_the_share_check_even_for_a_teammate():
+    """홈은 지나가기만 되고 목록은 보이면 안 된다."""
+    ctx, _ = _share_context(visitor="READ\nWRITE\nLIST\n", back="BACK\n")
+    with pytest.raises(StepFailed, match="list_home"):
+        ctx.do_expect_share({"of": "r1", "r2": "open"})
 
 
 def test_resetter_refuses_operation_stack():
