@@ -79,7 +79,7 @@ RERUN_SAFE = {
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_commit_image",
     "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
-    "step_change_login_password",
+    "step_change_login_password", "step_delete_expired_home",
     "step_group_create", "step_group_add_member", "step_group_remove_member", "step_resolve_new_groups",
 }
 
@@ -273,12 +273,12 @@ def _execute_step(step, ctx, kind, request_id, username):
             time.sleep(_main.RETRY_DELAY_SEC)
 
 JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE,
-               "password": Action.CHANGE_PASSWORD, "group": Action.CHANGE_GROUP}
+               "password": Action.CHANGE_PASSWORD, "group": Action.CHANGE_GROUP, "home": Action.PURGE_HOME}
 
-# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호, 그룹 작업 번호)로
+# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호, 그룹 작업 번호, 홈 정리 번호)로
 # 등록하는 작업은 접두어를 붙여, 같은 숫자의 컨테이너 신청 기록과 섞이지 않게 한다 — 신청 번호만으로 기록을
 # 읽는 조회가 있다.
-JOB_KEY_PREFIX = {"password": "password-reset-", "group": "group-op-"}
+JOB_KEY_PREFIX = {"password": "password-reset-", "group": "group-op-", "home": "home-cleanup-"}
 
 
 def job_key(kind, request_id):
@@ -291,6 +291,8 @@ _JOB_KIND = {action.value: kind for kind, action in JOB_ACTIONS.items()}
 def _job_steps(kind, job):
     if kind == "password":
         return list(_main.PASSWORD_CHANGE_STEPS)
+    if kind == "home":
+        return list(_main.HOME_DELETE_STEPS)
     if kind == "group":
         return list(_main.GROUP_STEPS[job["op"]])
     if kind == "migrate":
@@ -333,6 +335,8 @@ def _job_ctx(kind, request_id, job):
     ctx = {"request_id": request_id, "username": job["username"]}
     if kind == "password":
         ctx["passwd_hash"] = job["passwd_hash"]
+    if kind == "home":
+        ctx["expected_uid"] = job["expected_uid"]
     if kind == "group":
         ctx.update(group_name=job.get("name"), group_requested_gid=job.get("gid"),
                    group_members=job.get("members") or [], group_names=job.get("groups") or [])
@@ -436,6 +440,9 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             result = {"secrets": ctx.get("password_secrets") or [], "pods": ctx.get("password_pods") or {}}
         if kind == "group":
             result = {"gid": ctx.get("group_gid"), "pods": ctx.get("group_pods") or {}}
+        if kind == "home":
+            # deleted 가 false 면 지울 홈이 이미 없었다는 뜻이다.
+            result = {"deleted": bool(ctx.get("home_deleted"))}
         if kind == "migrate":
             skipped = bool(ctx.get("skipped"))
             result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),

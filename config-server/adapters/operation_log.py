@@ -95,6 +95,9 @@ class Action(str, Enum):
     CHANGE_PASSWORD = "CHANGE_PASSWORD"
     # 공용 그룹 생성·멤버 추가·제거. admin_be 그룹 작업 번호에 딸린 작업이라 request_id에 접두어가 붙는다.
     CHANGE_GROUP = "CHANGE_GROUP"
+    # 보존 기간이 지난 홈 삭제. admin_be 홈 정리 번호에 딸린 작업이라 request_id에 접두어가 붙는다.
+    # 실제로 지운 단계는 DELETE_HOME 으로 따로 남는다(홈이 이미 없으면 남지 않는다).
+    PURGE_HOME = "PURGE_HOME"
     # 컨테이너 준비 대기(WAIT_READY) 안의 세부 단계. Pod 이벤트로 판정하며 다른 단계와 같이 START/SUCCESS/FAIL로 남는다.
     PULL_IMAGE = "PULL_IMAGE"            # 노드에 이미지를 받는 중 (이미 있으면 기록되지 않음)
     START_CONTAINER = "START_CONTAINER"  # 이미지 준비 뒤 컨테이너 생성·시작·준비 확인

@@ -24,7 +24,7 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, GroupJobRequest,
-                            PasswordChangeRequest, SHA512_CRYPT_RE)
+                            PasswordChangeRequest, HomeDeleteRequest, SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -167,7 +167,7 @@ def _enforce_account_prefix():
     body = request.get_json(silent=True)
     if isinstance(body, dict):
         if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke",
-                            "/operations/password"):
+                            "/operations/password", "/operations/home"):
             names.append(body.get("username"))
         if request.path == "/operations/group":
             names.append(body.get("username"))
@@ -1144,6 +1144,7 @@ from lifecycle_steps.migrate import (  # noqa: E402
     step_migrate_cleanup_old, MIGRATE_STEPS,
 )
 from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
+from lifecycle_steps.home import step_delete_expired_home, HOME_DELETE_STEPS  # noqa: E402
 from lifecycle_steps.group import (  # noqa: E402
     step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS, step_resolve_new_groups,
     check_create as check_group_create, check_add as check_group_add, check_remove as check_group_remove,
@@ -1373,6 +1374,34 @@ def register_password_change(body: PasswordChangeRequest):
     return _register_job("password", body.request_id, body.username, job)
 
 
+@app.route("/operations/home", methods=["POST"])
+@validate_body(HomeDeleteRequest)
+def register_home_delete(body: HomeDeleteRequest):
+    """
+    보존 기간이 지난 홈 삭제 작업 등록
+
+    사용이 끝난 계정의 홈을 NAS 에서 지우는 작업을 등록하고 바로 202를 돌려준다. 그 계정의 컨테이너가
+    남아 있거나, 생성·이동 작업이 돌고 있거나, 홈 소유자가 expected_uid 와 다르면 지우지 않고 작업을
+    실패로 끝낸다. 홈이 이미 없으면 성공이다(result.deleted 가 false). 계정과 uid 는 그대로 둔다.
+    결과는 GET /operations/home/<request_id>로 조회한다.
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/HomeDeleteRequest'
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 번호의 홈 삭제 작업이 아직 끝나지 않음}
+    """
+    job = {"username": body.username, "expected_uid": body.expected_uid}
+    return _register_job("home", body.request_id, body.username, job)
+
+
 @app.route("/operations/group", methods=["POST"])
 @validate_body(GroupJobRequest)
 def register_group_change(body: GroupJobRequest):
@@ -1428,7 +1457,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group, home]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}
