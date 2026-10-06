@@ -13,7 +13,8 @@ from contextlib import contextmanager
 import system
 
 LOCK_NAME = "experiment-lock"
-E2E_ADMIN_SQL = "SELECT email FROM users WHERE email LIKE 'e2e%-admin@example.com'"
+# 도메인은 가리지 않는다 — 예전 실행이 남긴 @example.com 관리자도 진행 중인 E2E로 본다.
+E2E_ADMIN_SQL = "SELECT email FROM users WHERE email LIKE 'e2e%-admin@%'"
 
 
 class LockError(Exception):

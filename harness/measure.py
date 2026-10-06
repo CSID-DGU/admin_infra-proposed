@@ -139,7 +139,7 @@ def cmd_pair(args, cfg):
                 raise measure_ports.StackSqlError(f"jwt_secret 을 읽지 못했다: {jwt.get('stderr', '')}")
             be = measure_ports.BeClient(host, ns, jwt["value"], clock=time.time)
             admin_id = measure_ports.create_user(
-                web, username=None, email=f"m{run_id}-admin@example.com",
+                web, username=None, email=f"m{run_id}-admin@e2e.local",
                 password=secrets.token_urlsafe(24), role="ADMIN")
             collector = real_collector.RealCollector(host, ns, password_of=passwords.__getitem__,
                                                      clock=time.monotonic)
@@ -149,7 +149,7 @@ def cmd_pair(args, cfg):
             passwords[bystander] = secrets.token_urlsafe(24)
             users.append(bystander)
             bystander_id = measure_ports.create_user(
-                web, username=bystander, email=f"{bystander}@example.com", password=passwords[bystander],
+                web, username=bystander, email=f"{bystander}@e2e.local", password=passwords[bystander],
                 role="USER")
             bystander_ports = measure_ports.real_ports(
                 be=be, web_sql=web, user_id=bystander_id, admin_id=admin_id, prefix=prefix,
@@ -165,7 +165,7 @@ def cmd_pair(args, cfg):
                     users.append(username)
                     passwords[username] = password
                     user_id = measure_ports.create_user(
-                        web, username=username, email=f"{username}@example.com", password=password, role="USER")
+                        web, username=username, email=f"{username}@e2e.local", password=password, role="USER")
                     base = f"{args.stack}-{run_id}-{rep:02d}"
                     _say(base, f"user={username} 를 만들었다")
                     ports = measure_ports.real_ports(

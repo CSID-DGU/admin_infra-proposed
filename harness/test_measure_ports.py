@@ -128,7 +128,7 @@ def test_token_has_access_type_and_valid_signature():
 
 
 def test_create_user_keeps_plaintext_out_of_sql(stack):
-    uid = mp.create_user(mp.StackSql(HOST, NS, "web_admin"), username="fullm01", email="u@example.com",
+    uid = mp.create_user(mp.StackSql(HOST, NS, "web_admin"), username="fullm01", email="u@e2e.local",
                          password=PASSWORD, role="USER")
     assert uid == 7
     insert = stack.statements[0][1]
