@@ -285,8 +285,20 @@ class PasswordChangeRequest(RequestBody):
         return value
 
 
+class HomeDeleteRequest(RequestBody):
+    """보존 기간이 지난 홈 삭제 작업 등록. 홈 소유자가 expected_uid 와 다르면 지우지 않는다."""
+    request_id: str = Field(description="admin_be 홈 정리 번호(양의 정수)", examples=["7"])
+    username: UnixName = Field(examples=["exp-np-001"])
+    expected_uid: int = Field(gt=0, description="admin_be 가 아는 이 계정의 uid", examples=[50001])
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
+
+
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  GroupJobRequest, PasswordChangeRequest)
+                  GroupJobRequest, PasswordChangeRequest, HomeDeleteRequest)
 
 
 def _errors(exc: ValidationError):

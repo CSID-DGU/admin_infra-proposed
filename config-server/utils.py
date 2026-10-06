@@ -1139,6 +1139,14 @@ def user_home_owner_uid(username: str):
         return _home_owner_uid(ssh, shlex.quote(_user_home_path(username)))
 
 
+def home_root_is_reachable() -> bool:
+    """홈들이 놓이는 NAS 경로가 보이는지. 이 경로가 안 보이면 "홈이 없다"는 조회 결과를 믿을 수 없다."""
+    root = shlex.quote(os.environ["NFS_USER_SHARE_PATH"])
+    with _nas_ssh_client() as ssh:
+        code, _ = _ssh_capture(ssh, f"test -d {root}")
+    return code == 0
+
+
 def other_homes_owned_by(uid: int, username: str) -> list:
     """username 말고 uid 소유인 홈 이름들. #201 이전에는 지워진 번호가 다른 사람에게 다시 나갔으므로,
     그 사람들도 회수돼 원장에 없으면 홈 소유자만이 번호를 나눠 쓴 흔적이다."""

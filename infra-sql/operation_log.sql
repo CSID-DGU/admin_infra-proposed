@@ -48,7 +48,7 @@ PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 CREATE TABLE IF NOT EXISTS job_control (
   job_id      BIGINT PRIMARY KEY,      -- operation_log 작업 시작 행의 id
   request_id  VARCHAR(64)  NOT NULL,
-  action      VARCHAR(64)  NOT NULL,   -- PROVISION / REVOKE / MIGRATE / CHANGE_PASSWORD
+  action      VARCHAR(64)  NOT NULL,   -- PROVISION / REVOKE / MIGRATE / CHANGE_PASSWORD / CHANGE_GROUP / PURGE_HOME
   owner       VARCHAR(128) NOT NULL,   -- 제어기 프로세스 식별자 (host-pid-난수)
   lease_until DOUBLE       NOT NULL,   -- epoch 초. 지나면 다른 제어기가 인수한다
   done_steps  TEXT,                    -- 끝난 단계 이름 JSON 배열
