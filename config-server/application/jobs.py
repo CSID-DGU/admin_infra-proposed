@@ -79,7 +79,7 @@ RERUN_SAFE = {
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_commit_image",
     "step_migrate_cleanup_old",
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
-    "step_change_login_password", "step_delete_expired_home",
+    "step_change_login_password", "step_delete_expired_home", "step_restore_missing_home",
     "step_group_create", "step_group_add_member", "step_group_remove_member", "step_resolve_new_groups",
 }
 
@@ -308,10 +308,11 @@ def _job_steps(kind, job):
             supp_groups = job["account"].get("supp_groups") or []
         elif job.get("supp_groups_only"):
             # 기존 계정 재사용 시 그룹만 추가
-            steps = _main.SUPP_GROUPS_ONLY_STEPS + _main.POD_CREATE_STEPS
+            steps = _main.SUPP_GROUPS_ONLY_STEPS + [_main.step_restore_missing_home] + _main.POD_CREATE_STEPS
             supp_groups = job["supp_groups_only"]
         else:
-            steps = _main.POD_CREATE_STEPS
+            # 기존 계정이라도 홈은 보존 기간이 지나 지워졌을 수 있다 — 컨테이너를 만들기 전에 확인한다.
+            steps = [_main.step_restore_missing_home] + _main.POD_CREATE_STEPS
             supp_groups = []
         if any(sg.get("gid") is None for sg in supp_groups):
             # gid 없이 온 새 공유 그룹이 있다 — 뒤의 단계가 모두 gid 를 쓰므로 맨 앞에서 정한다.

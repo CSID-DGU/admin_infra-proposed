@@ -411,7 +411,7 @@ def test_baseline_has_no_access_probes(baseline):
 def test_provision_steps():
     with_account = main._job_steps("provision", {"username": "u", "account": {"passwd_hash": "x"}})
     assert with_account == main.ACCOUNT_CREATE_STEPS + main.POD_CREATE_STEPS
-    assert main._job_steps("provision", {"username": "u"}) == main.POD_CREATE_STEPS
+    assert main._job_steps("provision", {"username": "u"}) == [main.step_restore_missing_home] + main.POD_CREATE_STEPS
 
 
 def test_revoke_keeps_home():
