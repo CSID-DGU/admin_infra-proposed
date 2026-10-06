@@ -91,7 +91,7 @@ def test_system_call_failure_is_unknown(stack, monkeypatch):
 @pytest.mark.parametrize("trace", ["admin", "policy"])
 def test_e2e_trace_blocks_before_create(stack, trace):
     if trace == "admin":
-        stack.admins = ["e2eabc-admin@example.com"]
+        stack.admins = ["e2eabc-admin@e2e.local"]
     else:
         stack.policies = ["networkpolicy.networking.k8s.io/e2e-fault-x"]
     with pytest.raises(stack_lock.E2ETraceFound) as e:

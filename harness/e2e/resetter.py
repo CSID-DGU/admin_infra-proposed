@@ -24,7 +24,7 @@ def e2e_group_name(stack_prefix):
 
 
 def admin_email(run_id):
-    return f"e2e{safe(run_id)}-admin@example.com".lower()
+    return f"e2e{safe(run_id)}-admin@e2e.local".lower()
 
 
 class Resetter:

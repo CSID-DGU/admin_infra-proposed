@@ -153,7 +153,7 @@ class Context:
     # ---- 단계 ----
     def do_user(self, alias):
         name = f"{self.run.prefix}{self.case}{safe(alias)}".lower()
-        uid = self.run._insert_user(email=f"{name}@example.com", username=name)
+        uid = self.run._insert_user(email=f"{name}@e2e.local", username=name)
         self.users[alias] = {"id": uid, "name": name}
 
     def do_apply(self, arg):
