@@ -473,9 +473,54 @@ def delete_pod_util(pod_name, namespace):
 #  NodePort Service 관련
 # ============================
 
+# 라벨 값 규칙(63자 이내, 영숫자로 시작·끝, 사이에는 - _ . 허용). 용도가 이 규칙에 맞을 때만 라벨로 단다.
+_LABEL_VALUE_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+PURPOSE_ANNOTATION = "ailab.dgu/usage-purpose"
+
+
+def nodeport_service_body(username: str, namespace: str, pod_name: str, port_info: dict):
+    """포트 하나의 NodePort Service 정의.
+
+    이름은 `ailab-<사용자>-<무작위 8자>`다. 용도는 신청자가 자유롭게 적는 글이라(한글·공백·괄호) 이름에 넣으면
+    쿠버네티스가 거절하고, 외부 포트는 컨테이너를 다시 만들 때 바뀔 수 있어 이름에 넣지 않는다. 이름으로 찾는
+    곳은 없다 — 조회·삭제는 모두 pod_name 라벨로 한다.
+
+    용도 원문은 주석(annotation)에 남기고, 라벨 값 규칙에 맞는 용도(ssh·jupyter 등)만 purpose 라벨로도 단다.
+    포트 이름은 서비스마다 포트가 하나라 붙이지 않는다."""
+    internal_port = port_info["internal_port"]  # Pod 내부 포트
+    external_port = port_info["external_port"]  # NodePort
+    purpose = str(port_info.get("usage_purpose") or "custom")
+
+    labels = {"app": "ailab-nodeport", "username": username, "pod_name": pod_name}
+    if _LABEL_VALUE_RE.match(purpose):
+        labels["purpose"] = purpose
+
+    return client.V1Service(
+        metadata=client.V1ObjectMeta(
+            name=f"ailab-{username}-{uuid.uuid4().hex[:8]}",
+            namespace=namespace,
+            labels=labels,
+            annotations={PURPOSE_ANNOTATION: purpose},
+        ),
+        spec=client.V1ServiceSpec(
+            type="NodePort",
+            selector={"pod_name": pod_name},
+            ports=[client.V1ServicePort(
+                protocol="TCP",
+                port=internal_port,
+                target_port=internal_port,
+                node_port=external_port
+            )]
+        )
+    )
+
+
 def create_nodeport_services(username: str, namespace: str, pod_name: str, extra_ports: List[dict]):
     """
     사용자 Pod용 NodePort Service 생성 (여러 포트 지원)
+
+    같은 Pod에 다시 부르기 전에는 delete_nodeport_services로 앞선 것을 지운다(작업 재시도의 사전 정리가 한다) —
+    이름이 매번 달라 덮어쓰지 않고, 같은 외부 포트의 서비스가 남아 있으면 쿠버네티스가 거절한다.
 
     Args:
         username: 사용자명
@@ -490,56 +535,15 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
     v1 = client.CoreV1Api()
 
     for port_info in extra_ports:
-        internal_port = port_info["internal_port"]  # Pod 내부 포트
-        external_port = port_info["external_port"]  # NodePort (10000-15000)
-        purpose = port_info.get("usage_purpose", "custom")
-
-        service_name = f"ailab-{username}-{purpose}-{external_port}"
-
-        app.logger.debug(
-            f"[SERVICE CREATE] service={service_name} "
-            f"{internal_port}->{external_port}"
-        )
-
-        service_body = client.V1Service(
-            metadata=client.V1ObjectMeta(
-                name=service_name,
-                namespace=namespace,
-                labels={
-                    "app": "ailab-nodeport",
-                    "username": username,
-                    "pod_name": pod_name,
-                    "purpose": purpose
-                }
-            ),
-            spec=client.V1ServiceSpec(
-                type="NodePort",
-                selector={"pod_name": pod_name},
-                ports=[client.V1ServicePort(
-                    name=purpose,
-                    protocol="TCP",
-                    port=internal_port,
-                    target_port=internal_port,
-                    node_port=external_port
-                )]
-            )
-        )
-
+        service_body = nodeport_service_body(username, namespace, pod_name, port_info)
+        service_name = service_body.metadata.name
         try:
-            # 기존 Service가 있으면 삭제 후 재생성
-            try:
-                v1.delete_namespaced_service(service_name, namespace)
-                app.logger.debug(f"[SERVICE CREATE] old service deleted {service_name}")
-            except client.exceptions.ApiException as e:
-                if e.status != 404:
-                    raise
-
             v1.create_namespaced_service(namespace, service_body)
             app.logger.info(
                 f"[SERVICE CREATE] created {service_name} "
-                f"nodeport={external_port}"
+                f"{port_info['internal_port']}->{port_info['external_port']}"
             )
-        except Exception as e:
+        except Exception:
             app.logger.exception(f"[SERVICE CREATE] failed for {service_name}")
             raise
 
