@@ -18,6 +18,9 @@ from .resetter import admin_email, e2e_group_name, run_prefix
 
 # admin_be는 사용 목적을 50자 이상 받는다(be#633).
 PURPOSE_FILLER = "자동 점검용 시험 신청입니다. 컨테이너 생성과 회수 흐름이 정상인지 확인합니다."
+# 포트 용도는 신청자가 자유롭게 적는 글이다. 실제 신청처럼 한글·공백·괄호를 넣어, 이 글이 쿠버네티스 이름에
+# 들어가 생성이 실패하는 일(2026-10-06 operation)을 모든 사례가 함께 지킨다.
+PORT_REQUESTS = [{"internalPort": 5173, "usagePurpose": "프론트엔드 (React, Vite)"}]
 
 _CRYPT_HASH = re.compile(r"^\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
 
@@ -157,7 +160,8 @@ class Context:
         user = self.users[arg["user"]]
         expires = (dt.datetime.now() + dt.timedelta(days=arg.get("days", 3))).strftime("%Y-%m-%dT%H:%M:%S")
         body = {"resourceGroupId": self.run.resource_group, "imageId": self.run.image,
-                "usagePurpose": f"e2e {self.case} {PURPOSE_FILLER}", "formAnswers": {}, "expiresAt": expires}
+                "usagePurpose": f"e2e {self.case} {PURPOSE_FILLER}", "formAnswers": {}, "expiresAt": expires,
+                "portRequests": PORT_REQUESTS}
         if arg.get("group"):
             # 신청서에서 E2E 공용 그룹을 고른다. 승인 대기 그룹이면 이 신청이 승인될 때 인프라에 만들어진다.
             group = observe.group_row(self.run.cluster, self.run.group_name)
