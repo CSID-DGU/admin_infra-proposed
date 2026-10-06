@@ -33,7 +33,8 @@ def store(monkeypatch):
 @pytest.fixture
 def nas(monkeypatch):
     """NAS·클러스터·작업 목록 대역. owner 는 홈 소유자 uid(None 이면 홈 없음), deleted 는 지운 이름 목록."""
-    state = types.SimpleNamespace(owner=UID, pods=[], unfinished=[], deleted=[], delete_error=None)
+    state = types.SimpleNamespace(owner=UID, pods=[], unfinished=[], deleted=[], delete_error=None,
+                                  root_reachable=True)
 
     class FakeV1:
         def list_namespaced_pod(self, namespace, label_selector):
@@ -51,6 +52,7 @@ def nas(monkeypatch):
     monkeypatch.setattr(main, "find_unfinished_jobs", lambda limit=100: list(state.unfinished))
     monkeypatch.setattr(main, "user_home_owner_uid", lambda username: state.owner)
     monkeypatch.setattr(main, "delete_user_home_directory", delete)
+    monkeypatch.setattr(main, "home_root_is_reachable", lambda: state.root_reachable)
     return state
 
 
@@ -185,3 +187,21 @@ def test_delete_failure_is_recorded_and_not_reported_as_success(logs, store, nas
 
     assert (Phase.FAIL, "HOME_DELETE_FAILED") in _home_steps(logs)
     assert logs[-1]["action"] == Action.PURGE_HOME and logs[-1]["phase"] != Phase.SUCCESS
+
+
+def test_missing_home_is_not_success_when_the_home_root_is_unreachable(logs, store, nas):
+    nas.owner, nas.root_reachable = None, False
+
+    _run(store)
+
+    assert nas.deleted == []
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "HOME_ROOT_UNREACHABLE"
+
+
+def test_home_is_kept_when_the_unfinished_job_list_is_truncated(logs, store, nas):
+    nas.unfinished = [("password", str(i), "bob", i) for i in range(home._UNFINISHED_JOB_SCAN_LIMIT)]
+
+    _run(store)
+
+    assert nas.deleted == []
+    assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "HOME_IN_USE"

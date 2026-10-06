@@ -2,7 +2,7 @@
 
 지우는 것은 되돌릴 수 없다. 그래서 지우기 전에 세 가지를 확인하고, 하나라도 어긋나면 지우지 않고 실패로 끝낸다.
 ① 그 계정의 컨테이너가 없다 ② 그 계정의 생성·이동 작업이 돌고 있지 않다 ③ 홈의 소유자가 admin_be 가 아는
-그 계정의 uid 다. 홈이 이미 없으면 성공이다 — 같은 작업이 두 번 와도 결과가 같다.
+그 계정의 uid 다. 홈이 이미 없으면 성공이다 — 같은 작업이 두 번 와도 결과가 같다. 확인하지 못한 것은 통과로 치지 않는다.
 보존 기간이 지났는지는 admin_be 가 판단한다. 여기서는 지금 지워도 되는 상태인지만 본다.
 """
 from kubernetes import client
@@ -35,7 +35,11 @@ def _require_home_unused(username):
         _main.app.config["NAMESPACE"], label_selector=f"username={username}").items
     if pods:
         _refuse("HOME_IN_USE", f"{len(pods)} pod(s) of {username!r} still use this home")
-    running = [kind for kind, _, job_user, _ in _main.find_unfinished_jobs(limit=_UNFINISHED_JOB_SCAN_LIMIT)
+    unfinished = _main.find_unfinished_jobs(limit=_UNFINISHED_JOB_SCAN_LIMIT)
+    if len(unfinished) >= _UNFINISHED_JOB_SCAN_LIMIT:
+        # 한도에 걸려 잘린 목록이다. 이 계정의 작업이 잘린 쪽에 있을 수 있으므로 없다고 단정하지 않는다.
+        _refuse("HOME_IN_USE", f"too many unfinished jobs to confirm none uses the home of {username!r}")
+    running = [kind for kind, _, job_user, _ in unfinished
                if job_user == username and kind in _HOME_USING_JOB_KINDS]
     if running:
         _refuse("HOME_IN_USE", f"{running[0]} job of {username!r} is not finished")
@@ -48,6 +52,10 @@ def step_delete_expired_home(ctx):
 
     owner = _main.user_home_owner_uid(username)
     if owner is None:
+        # 홈이 없는 것과 홈들이 놓인 경로가 안 보이는 것은 조회 결과가 같다. 뒤쪽을 성공으로 끝내면
+        # 지우지 않은 홈이 지운 것으로 기록돼 다시 시도되지 않는다.
+        if not _main.home_root_is_reachable():
+            _refuse("HOME_ROOT_UNREACHABLE", f"cannot confirm the home of {username!r} is gone")
         ctx["home_deleted"] = False
         _main.app.logger.info(f"[HOME] 지울 홈이 이미 없음: {username}")
         return
