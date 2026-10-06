@@ -17,6 +17,8 @@ VERBS = {
     "restart", "expect_restarted", "mark_pod", "expect_marker",
 }
 FAULT_VERBS = {"fault"}
+# config-server의 실행 방식(main.py의 _ALLOWED_RUN_MODES)과 같다.
+RUN_MODES = {"baseline", "noprobe", "full"}
 _TRANSITION = re.compile(r"^[A-Z]+>[A-Z]+$")
 
 
@@ -41,6 +43,9 @@ def validate(data):
         for t in case.get("covers", []):
             if not _TRANSITION.match(t):
                 raise CatalogError(f"{cid}: 전이 표기는 'FROM>TO' 형식이어야 함: {t}")
+        modes = case.get("modes")
+        if modes is not None and (not modes or set(modes) - RUN_MODES):
+            raise CatalogError(f"{cid}: modes는 {sorted(RUN_MODES)} 중에서 하나 이상이어야 함: {modes}")
         kinds = [k for k in ("steps", "junit", "pytest") if k in case]
         if len(kinds) != 1:
             raise CatalogError(f"{cid}: steps·junit·pytest 중 정확히 하나만 있어야 함 (현재 {kinds})")
