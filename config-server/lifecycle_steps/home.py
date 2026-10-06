@@ -1,4 +1,5 @@
 """사용이 끝난 계정의 홈 삭제 단계 — 마지막 컨테이너가 끝나고 보존 기간이 지난 홈을 NAS 에서 지운다.
+지워진 뒤 그 계정이 다시 승인되면 컨테이너를 만들기 전에 빈 홈을 다시 만든다(step_restore_missing_home).
 
 지우는 것은 되돌릴 수 없다. 그래서 지우기 전에 세 가지를 확인하고, 하나라도 어긋나면 지우지 않고 실패로 끝낸다.
 ① 그 계정의 컨테이너가 없다 ② 그 계정의 생성·이동 작업이 돌고 있지 않다 ③ 홈의 소유자가 admin_be 가 아는
@@ -80,3 +81,51 @@ def step_delete_expired_home(ctx):
 
 
 HOME_DELETE_STEPS = [step_delete_expired_home]
+
+
+def _ledger_ids(username):
+    for line in _main.read_passwd_lines():
+        rec = _main.parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            return rec["uid"], rec["gid"]
+    return None
+
+
+def step_restore_missing_home(ctx):
+    """이미 있는 계정으로 컨테이너를 만들 때, 홈이 없으면 계정 대장의 uid·gid 로 다시 만든다.
+
+    계정은 남기고 홈만 지우는 경로(보존 기간 경과)가 있어서, 계정이 있다고 홈도 있는 것은 아니다. 홈 없이
+    진행하면 노드가 홈 소유자를 끝내 확인하지 못해 keytab 배포 앞에서 한도까지 기다리다 실패한다.
+    이미 있는 홈은 사용자 데이터라 손대지 않는다 — 소유자·권한도 그대로 둔다."""
+    request_id, username = ctx["request_id"], ctx["username"]
+    ids = _ledger_ids(username)
+    if ids is None:
+        # 대장에 없는 계정은 뒤의 Pod 사양 단계가 제 오류로 멈춘다. 여기서 uid 를 지어내지 않는다.
+        return
+    uid, gid = ids
+    try:
+        if _main.user_home_owner_uid(username) is not None:
+            return
+        if not _main.home_root_is_reachable():
+            raise RuntimeError("home root is not reachable on the NAS")
+    except Exception as e:
+        _main.log_operation(request_id=request_id, username=username, resource_type="storage",
+                            action=Action.CREATE_HOME, phase=_main._fail_phase(e),
+                            error_code="NAS_SSH_FAILED", error_detail=str(e)[:1000])
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"cannot confirm the home of {username!r}"), 500, cause=e)
+
+    _main.log_operation(request_id=request_id, username=username, resource_type="storage",
+                        action=Action.CREATE_HOME, phase=Phase.START)
+    try:
+        _main.create_user_home_directory(username, uid, gid)
+    except Exception as e:
+        _main.log_operation(request_id=request_id, username=username, resource_type="storage",
+                            action=Action.CREATE_HOME, phase=_main._fail_phase(e),
+                            error_code="NAS_SSH_FAILED", error_detail=str(e)[:1000])
+        raise _main.StepFailed(_main.infra_error(
+            "CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {username}"),
+            500, cause=e)
+    _main.log_operation(request_id=request_id, username=username, resource_type="storage",
+                        action=Action.CREATE_HOME, phase=Phase.SUCCESS)
+    _main.app.logger.info(f"[HOME] 없어진 홈을 다시 만듦: {username} uid={uid}")

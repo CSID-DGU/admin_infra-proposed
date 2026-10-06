@@ -331,5 +331,5 @@ def test_full_mode_appends_verify_steps(monkeypatch):
 
 def test_noprobe_mode_is_unchanged(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_MODE", "noprobe")
-    assert main._job_steps("provision", {"username": "u"}) == main.POD_CREATE_STEPS
+    assert main._job_steps("provision", {"username": "u"}) == [main.step_restore_missing_home] + main.POD_CREATE_STEPS
     assert main._job_steps("revoke", {"pod_name": "p"}) == main.POD_DELETE_STEPS

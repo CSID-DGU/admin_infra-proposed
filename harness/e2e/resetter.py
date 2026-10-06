@@ -165,6 +165,10 @@ class Resetter:
                                          "AND table_name = 'group_operations';")
         group_ops = (f"DELETE FROM group_operations WHERE user_id IN (SELECT * FROM ({users}) t) "
                      f"OR requested_by IN (SELECT * FROM ({users}) t);\n") if has_group_ops else ""
+        # 홈 정리 기록은 users 를 가리킨다. 보존 기간을 줄여 홈 삭제까지 돌린 실행에서만 생긴다.
+        has_cleanups = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                                        "AND table_name = 'home_cleanups';")
+        cleanups = f"DELETE FROM home_cleanups WHERE user_id IN (SELECT * FROM ({users}) t);\n" if has_cleanups else ""
         e2e_group = f"SELECT group_id FROM `groups` WHERE group_name = '{safe(self.group_name)}'"
         group = (f"DELETE FROM `groups` WHERE group_name = '{safe(self.group_name)}' "
                  f"AND NOT EXISTS (SELECT 1 FROM user_groups WHERE group_id IN (SELECT * FROM ({e2e_group}) t)) "
@@ -175,6 +179,7 @@ class Resetter:
             "START TRANSACTION;\n"
             f"{resets}"
             f"{group_ops}"
+            f"{cleanups}"
             f"DELETE FROM pod_external_ports WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM port_requests WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM change_request WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"

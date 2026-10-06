@@ -205,3 +205,84 @@ def test_home_is_kept_when_the_unfinished_job_list_is_truncated(logs, store, nas
 
     assert nas.deleted == []
     assert logs[-1]["phase"] == Phase.FAIL and logs[-1]["error_code"] == "HOME_IN_USE"
+
+
+# ---------- 지워진 홈 다시 만들기(기존 계정 재승인) ----------
+
+@pytest.fixture
+def ledger(monkeypatch, nas):
+    """계정 대장에 alice(uid·gid = UID)가 있고, 홈 생성 호출을 기록한다."""
+    created = []
+    monkeypatch.setattr(main, "read_passwd_lines", lambda: [f"alice:x:{UID}:{UID}::/home/alice:/bin/bash"])
+
+    def create(username, uid, gid):
+        created.append((username, uid, gid))
+        return True
+
+    monkeypatch.setattr(main, "create_user_home_directory", create)
+    return created
+
+
+def _restore(username="alice"):
+    with main.app.app_context():
+        home.step_restore_missing_home({"request_id": "9", "username": username})
+
+
+def _create_home_logs(logs):
+    return [(l["phase"], l.get("error_code")) for l in logs if l["action"] == Action.CREATE_HOME]
+
+
+def test_existing_account_provision_checks_home_before_pod_steps():
+    assert main._job_steps("provision", {"username": "u"})[0] is main.step_restore_missing_home
+    with_groups = main._job_steps("provision", {"username": "u", "supp_groups_only": [{"name": "g", "gid": 70001}]})
+    assert with_groups.index(main.step_restore_missing_home) < with_groups.index(main.POD_CREATE_STEPS[0])
+    # 새 계정은 계정 단계가 홈을 만든다.
+    assert main.step_restore_missing_home not in main._job_steps(
+        "provision", {"username": "u", "account": {"passwd_hash": "x"}})
+
+
+def test_missing_home_is_recreated_with_ledger_ids(logs, nas, ledger):
+    nas.owner = None
+
+    _restore()
+
+    assert ledger == [("alice", UID, UID)]
+    assert _create_home_logs(logs) == [(Phase.START, None), (Phase.SUCCESS, None)]
+
+
+def test_existing_home_is_left_alone(logs, nas, ledger):
+    _restore()
+
+    assert ledger == [] and logs == []
+
+
+def test_home_is_not_recreated_when_home_root_is_unreachable(logs, nas, ledger):
+    nas.owner, nas.root_reachable = None, False
+
+    with pytest.raises(main.StepFailed):
+        _restore()
+
+    assert ledger == []
+    assert _create_home_logs(logs) == [(Phase.FAIL, "NAS_SSH_FAILED")]
+
+
+def test_account_missing_from_ledger_creates_nothing(logs, nas, ledger):
+    nas.owner = None
+
+    _restore("bob")
+
+    assert ledger == [] and logs == []
+
+
+def test_recreate_failure_fails_the_step(logs, nas, ledger, monkeypatch):
+    nas.owner = None
+
+    def boom(username, uid, gid):
+        raise RuntimeError("nas down")
+
+    monkeypatch.setattr(main, "create_user_home_directory", boom)
+
+    with pytest.raises(main.StepFailed):
+        _restore()
+
+    assert _create_home_logs(logs) == [(Phase.START, None), (Phase.FAIL, "NAS_SSH_FAILED")]
