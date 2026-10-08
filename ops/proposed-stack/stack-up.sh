@@ -226,6 +226,10 @@ else
     --from-literal=admin_user="$(rnd)" --from-literal=admin_redis="$(rnd)" --from-literal=jwt_secret="$(rnd 32)" >/dev/null
   echo "새로 생성"
 fi
+# 백업 전용 계정의 비밀번호. 이미 떠 있는 스택의 Secret에는 이 키가 없으므로 없을 때만 더한다.
+if [ -z "$(kubectl -n "$NS" get secret stack-db -o jsonpath='{.data.backup_user}')" ]; then
+  kubectl -n "$NS" patch secret stack-db --type merge -p "{\"stringData\":{\"backup_user\":\"$(rnd)\"}}" >/dev/null
+fi
 kubectl -n "$NS" create secret generic config-server-db-secret --from-literal=password="$(getpw pod_port_user)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "$NS" create secret generic log-mysql-secret \
@@ -282,6 +286,14 @@ kubectl -n "$NS" rollout status statefulset/mysql --timeout=10m
     u=${pair%%:*}; db=${pair##*:}; pw=$(getpw "$u")
     echo "CREATE USER IF NOT EXISTS '$u'@'%' IDENTIFIED BY '$pw'; ALTER USER '$u'@'%' IDENTIFIED BY '$pw'; GRANT ALL ON $db.* TO '$u'@'%';"
   done
+  # 백업 작업은 읽기 권한만 가진 전용 계정으로 뜬다(mysql-backup.yaml). root를 쓰면 백업 Pod가 DB 전체를
+  # 바꿀 수 있고, 계정 정보(mysql 스키마)까지 덤프에 실린다.
+  bpw=$(getpw backup_user)
+  echo "CREATE USER IF NOT EXISTS 'backup_user'@'%' IDENTIFIED BY '$bpw'; ALTER USER 'backup_user'@'%' IDENTIFIED BY '$bpw';"
+  for db in pod_port_db operation_state_db web_admin; do
+    echo "GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES ON $db.* TO 'backup_user'@'%';"
+  done
+  echo "GRANT SHOW_ROUTINE ON *.* TO 'backup_user'@'%';"
   echo "FLUSH PRIVILEGES;"
 } | kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" 2>/dev/null'
 kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" pod_port_db 2>/dev/null' < "$ROOT/infra-sql/pod_port_db.sql"
