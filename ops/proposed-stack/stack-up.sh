@@ -23,6 +23,8 @@ fi
 PROD_NS=ailab-infra
 PROD_RELEASE=containerssh-config-server
 PROD_BE_NS=default
+# DB 백업을 둘 노드. DB가 있는 노드(mysql.yaml의 farm2)와 달라야 한다.
+DB_BACKUP_NODE=${DB_BACKUP_NODE:-farm7}
 
 # 할당 값은 uid-ranges.yaml 한 곳에 선언돼 있다(admin_infra-proposed#118). case문에 손으로
 # 적지 않는 이유와 실제 겪은 충돌 사고들은 그 파일 머리말 주석 참고.
@@ -41,6 +43,7 @@ NP_MIN=$(yaml_field "$STACK_LINE" np_min)
 NP_MAX=$(yaml_field "$STACK_LINE" np_max)
 CONFIG_NODEPORT=$(yaml_field "$STACK_LINE" config_nodeport)
 PREFIX=$(yaml_field "$STACK_LINE" prefix)
+KEEP_DATA=$(yaml_field "$STACK_LINE" keep_data)
 # NodePort는 이 클러스터 쿠버네티스 API 서버의 기본 허용 범위(30000~32767) 밖이면 서비스 생성이
 # 422로 거부된다(2026-09-18 e2e 점검 중 실측으로 발견) — 배포가 한참 진행된 뒤에야 드러나므로
 # 여기서 미리 막는다.
@@ -223,6 +226,10 @@ else
     --from-literal=admin_user="$(rnd)" --from-literal=admin_redis="$(rnd)" --from-literal=jwt_secret="$(rnd 32)" >/dev/null
   echo "새로 생성"
 fi
+# 백업 전용 계정의 비밀번호. 이미 떠 있는 스택의 Secret에는 이 키가 없으므로 없을 때만 더한다.
+if [ -z "$(kubectl -n "$NS" get secret stack-db -o jsonpath='{.data.backup_user}')" ]; then
+  kubectl -n "$NS" patch secret stack-db --type merge -p "{\"stringData\":{\"backup_user\":\"$(rnd)\"}}" >/dev/null
+fi
 kubectl -n "$NS" create secret generic config-server-db-secret --from-literal=password="$(getpw pod_port_user)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "$NS" create secret generic log-mysql-secret \
@@ -279,12 +286,31 @@ kubectl -n "$NS" rollout status statefulset/mysql --timeout=10m
     u=${pair%%:*}; db=${pair##*:}; pw=$(getpw "$u")
     echo "CREATE USER IF NOT EXISTS '$u'@'%' IDENTIFIED BY '$pw'; ALTER USER '$u'@'%' IDENTIFIED BY '$pw'; GRANT ALL ON $db.* TO '$u'@'%';"
   done
+  # 백업 작업은 읽기 권한만 가진 전용 계정으로 뜬다(mysql-backup.yaml). root를 쓰면 백업 Pod가 DB 전체를
+  # 바꿀 수 있고, 계정 정보(mysql 스키마)까지 덤프에 실린다.
+  bpw=$(getpw backup_user)
+  echo "CREATE USER IF NOT EXISTS 'backup_user'@'%' IDENTIFIED BY '$bpw'; ALTER USER 'backup_user'@'%' IDENTIFIED BY '$bpw';"
+  for db in pod_port_db operation_state_db web_admin; do
+    echo "GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES ON $db.* TO 'backup_user'@'%';"
+  done
+  echo "GRANT SHOW_ROUTINE ON *.* TO 'backup_user'@'%';"
   echo "FLUSH PRIVILEGES;"
 } | kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" 2>/dev/null'
 kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" pod_port_db 2>/dev/null' < "$ROOT/infra-sql/pod_port_db.sql"
 kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" operation_state_db 2>/dev/null' < "$ROOT/infra-sql/operation_log.sql"
 kubectl -n "$NS" exec -i mysql-0 -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" operation_state_db 2>/dev/null' < "$ROOT/infra-sql/trial_manifest.sql"
 echo "DB 3개(pod_port_db, operation_state_db, web_admin)와 테이블 준비 완료"
+
+step "DB 보존·백업"
+# local-path 저장소는 저장소 요청(PVC)을 지우면 데이터 폴더까지 지운다(정책 Delete). 데이터를 지켜야 하는
+# 스택(uid-ranges.yaml의 keep_data)은 PVC를 지워도 폴더가 남게 한다. 실험 스택은 내릴 때 같이 지워지는
+# 편이 맞아 그대로 둔다.
+if [ "$KEEP_DATA" = "true" ]; then
+  DB_PV=$(kubectl -n "$NS" get pvc data-mysql-0 -o jsonpath='{.spec.volumeName}')
+  kubectl patch pv "$DB_PV" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null
+  echo "DB 저장소 삭제 정책: $(kubectl get pv "$DB_PV" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')"
+fi
+render "$HERE/mysql-backup.yaml" | sed -e "s|__BACKUP_NODE__|$DB_BACKUP_NODE|" | kubectl apply -f -
 
 step "Redis"
 render "$HERE/redis.yaml" | kubectl apply -f -
