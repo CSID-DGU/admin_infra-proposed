@@ -551,6 +551,21 @@ def test_pod_gets_priority_class(env):
     assert pod.body["spec"]["priorityClassName"] == main.app.config["POD_PRIORITY_CLASS"]
 
 
+def test_pod_survives_node_outage(env):
+    """노드가 5분 넘게 꺼져 있으면 쿠버네티스가 Pod를 지우고, 멈춘 컨테이너의 변경분도 같이 사라진다.
+    노드 응답 없음을 유예 없이 견뎌야 노드가 돌아온 뒤 같은 노드에서 변경분을 살려 다시 만들 수 있다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "115", "username": "exp-np-outage",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    pod = next(p for p in e.v1.pods.values() if "exp-np-outage" in p.metadata.name)
+    tolerations = {t["key"]: t for t in pod.body["spec"]["tolerations"]}
+    for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"):
+        assert tolerations[key]["effect"] == "NoExecute"
+        assert "tolerationSeconds" not in tolerations[key]
+
+
 def test_pod_env_carries_ticket_cache_path(env):
     """홈은 인증이 필요한 NFS라 노드 쪽 준비 직후 한순간 쓸 수 없다. entrypoint는 그때 티켓 캐시
     경로가 없으면 기동을 실패로 끝내므로, Pod에 그 경로를 넘긴다."""

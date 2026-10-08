@@ -364,6 +364,14 @@ POD_FAILURE_LOG_CHARS = 2000
 POD_RESTART_STEP = "step_build_pod_spec"
 ACCOUNT_RESTART_STEP = "step_create_account"
 
+# 노드가 꺼지거나 끊기면 쿠버네티스는 5분 뒤 그 노드의 Pod를 지운다(기본 유예). 사용자 Pod는 한 노드에 묶여
+# 있고 스스로 다시 뜨지 않으므로 지워져도 얻는 것이 없고, 멈춘 컨테이너에 남은 변경분만 함께 사라져 같은
+# 노드에서 다시 만들 때 살릴 수 없게 된다. 유예 없이 견디게 해 노드가 돌아올 때까지 Pod를 남긴다.
+NODE_OUTAGE_TOLERATIONS = [
+    {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute"},
+    {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute"},
+]
+
 
 def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
     ns = _main.app.config["NAMESPACE"]
@@ -1200,6 +1208,7 @@ def build_pod_spec(
                                         # 이 항목을 넣지 않는다(없는 등급을 지정하면 Pod 생성이 거부된다).
                                         **({"priorityClassName": _main.app.config["POD_PRIORITY_CLASS"]}
                                            if _main.app.config["POD_PRIORITY_CLASS"] else {}),
+                                        "tolerations": NODE_OUTAGE_TOLERATIONS,
                                         "containers": [
                                             {
                                                 "name": "shell",
