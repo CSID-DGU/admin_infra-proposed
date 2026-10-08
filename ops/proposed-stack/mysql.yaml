@@ -42,10 +42,13 @@ spec:
               command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
             initialDelaySeconds: 30
             periodSeconds: 10
+          # 디스크 요청값이 없으면 노드 디스크가 찰 때 kubelet이 "요청보다 많이 쓰는 Pod"로 보아 우선순위와
+          # 무관하게 먼저 내린다. 한도는 걸지 않는다 — 넘었다고 이 Pod를 내릴 이유가 없다.
           resources:
             requests:
               cpu: 250m
               memory: 512Mi
+              ephemeral-storage: 2Gi
             limits:
               cpu: "1"
               memory: 1Gi
@@ -119,6 +122,9 @@ spec:
         - podSelector:
             matchLabels:
               app: containerssh-config-controller
+        - podSelector:
+            matchLabels:
+              app: stack-mysql-backup
       ports:
         - protocol: TCP
           port: 3306

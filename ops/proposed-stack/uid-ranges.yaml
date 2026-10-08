@@ -25,6 +25,8 @@
 #                            나눠 쓰면 공용 그룹이 다음 uid 번호를 선점해 그 계정의 primary 그룹이
 #                            남의 팀 그룹이 된다. AD·NAS 공유는 uid와 같으므로 스택별로도 나눈다.
 #                            전 구간이 farm smb.conf 의 idmap range(1000-299999) 안이어야 한다.
+#   keep_data             — true면 DB 저장소를 PVC가 지워져도 남기는 정책(Retain)으로 둔다. 실사용 데이터가
+#                            있는 스택에만 쓴다(없으면 false로 본다).
 #   np_min/np_max          — 사용자 컨테이너 NodePort 대역. 반드시 30000~32767 안이어야 하고
 #                            (이 클러스터 쿠버네티스 API 서버의 실제 허용 범위), 사용자가 외부에서
 #                            접속해야 하는 스택은 pfSense 개방 구간 30000~30097 안이어야 한다.
@@ -43,4 +45,4 @@
 - {stack: baseline,  uid_min: 60000, uid_max: 64999, shared_gid_min: 90000, shared_gid_max: 94999, np_min: 32500, np_max: 32749, config_nodeport: 30382, prefix: "exp-bl-"}
 - {stack: noprobe,   uid_min: 50000, uid_max: 54999, shared_gid_min: 80000, shared_gid_max: 84999, np_min: 32000, np_max: 32249, config_nodeport: 30182, prefix: "exp-np-"}
 - {stack: full,      uid_min: 55000, uid_max: 59999, shared_gid_min: 85000, shared_gid_max: 89999, np_min: 32250, np_max: 32499, config_nodeport: 30282, prefix: "exp-fu-"}
-- {stack: operation, uid_min: 21000, uid_max: 49999, shared_gid_min: 70000, shared_gid_max: 79999, np_min: 30000, np_max: 30079, config_nodeport: 30482, prefix: ""}
+- {stack: operation, uid_min: 21000, uid_max: 49999, shared_gid_min: 70000, shared_gid_max: 79999, np_min: 30000, np_max: 30079, config_nodeport: 30482, prefix: "", keep_data: true}
