@@ -24,7 +24,7 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, GroupJobRequest,
-                            PasswordChangeRequest, HomeDeleteRequest, SHA512_CRYPT_RE)
+                            PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest, SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -168,7 +168,7 @@ def _enforce_account_prefix():
     body = request.get_json(silent=True)
     if isinstance(body, dict):
         if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke",
-                            "/operations/password", "/operations/home"):
+                            "/operations/password", "/operations/home", "/operations/port"):
             names.append(body.get("username"))
         if request.path == "/operations/group":
             names.append(body.get("username"))
@@ -1147,6 +1147,7 @@ from lifecycle_steps.migrate import (  # noqa: E402
 from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE_STEPS  # noqa: E402
 from lifecycle_steps.home import (  # noqa: E402
     step_delete_expired_home, step_restore_missing_home, HOME_DELETE_STEPS)
+from lifecycle_steps.port import step_change_ports, PORT_CHANGE_STEPS  # noqa: E402
 from lifecycle_steps.group import (  # noqa: E402
     step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS, step_resolve_new_groups,
     check_create as check_group_create, check_add as check_group_add, check_remove as check_group_remove,
@@ -1404,6 +1405,36 @@ def register_home_delete(body: HomeDeleteRequest):
     return _register_job("home", body.request_id, body.username, job)
 
 
+@app.route("/operations/port", methods=["POST"])
+@validate_body(PortChangeRequest)
+def register_port_change(body: PortChangeRequest):
+    """
+    추가 포트 변경 작업 등록
+
+    떠 있는 Pod 의 추가 포트를 ports(바뀐 뒤 전체 목록)에 맞추는 작업을 등록하고 바로 202를 돌려준다.
+    Pod 는 다시 만들지 않는다 — 빠진 포트의 Service 와 외부 포트를 놓고, 새 포트의 외부 포트를 잡아 Service 를
+    만든다. 기본 포트(ssh·jupyter)와 noVNC 포트는 건드리지 않는다. 이미 맞춰진 조각은 그대로 두므로 실패한
+    작업은 다시 등록하면 이어서 끝난다.
+    결과는 GET /operations/port/<request_id>로 조회한다(result.ports 는 기본 포트를 포함한 전체 목록).
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/PortChangeRequest'
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류(예약 포트, 중복, 개수 초과 포함)}
+      409: {description: 같은 번호의 포트 변경 작업이 아직 끝나지 않음}
+    """
+    job = {"username": body.username, "pod_name": body.pod_name,
+           "ports": [p.model_dump() for p in body.ports]}
+    return _register_job("port", body.request_id, body.username, job)
+
+
 @app.route("/operations/group", methods=["POST"])
 @validate_body(GroupJobRequest)
 def register_group_change(body: GroupJobRequest):
@@ -1459,7 +1490,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group, home]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group, home, port]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}

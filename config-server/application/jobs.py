@@ -81,6 +81,7 @@ RERUN_SAFE = {
     "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
     "step_change_login_password", "step_delete_expired_home", "step_restore_missing_home",
     "step_group_create", "step_group_add_member", "step_group_remove_member", "step_resolve_new_groups",
+    "step_change_ports",
 }
 
 PRE_STEP = {
@@ -273,12 +274,14 @@ def _execute_step(step, ctx, kind, request_id, username):
             time.sleep(_main.RETRY_DELAY_SEC)
 
 JOB_ACTIONS = {"provision": Action.PROVISION, "revoke": Action.REVOKE, "migrate": Action.MIGRATE,
-               "password": Action.CHANGE_PASSWORD, "group": Action.CHANGE_GROUP, "home": Action.PURGE_HOME}
+               "password": Action.CHANGE_PASSWORD, "group": Action.CHANGE_GROUP, "home": Action.PURGE_HOME,
+               "port": Action.CHANGE_PORT}
 
-# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호, 그룹 작업 번호, 홈 정리 번호)로
+# 작업 기록의 request_id 칸은 컨테이너 신청 번호다. 다른 번호(비밀번호 재설정 신청 번호, 그룹 작업 번호, 홈 정리 번호, 포트 작업 번호)로
 # 등록하는 작업은 접두어를 붙여, 같은 숫자의 컨테이너 신청 기록과 섞이지 않게 한다 — 신청 번호만으로 기록을
 # 읽는 조회가 있다.
-JOB_KEY_PREFIX = {"password": "password-reset-", "group": "group-op-", "home": "home-cleanup-"}
+JOB_KEY_PREFIX = {"password": "password-reset-", "group": "group-op-", "home": "home-cleanup-",
+                  "port": "port-change-"}
 
 
 def job_key(kind, request_id):
@@ -293,6 +296,8 @@ def _job_steps(kind, job):
         return list(_main.PASSWORD_CHANGE_STEPS)
     if kind == "home":
         return list(_main.HOME_DELETE_STEPS)
+    if kind == "port":
+        return list(_main.PORT_CHANGE_STEPS)
     if kind == "group":
         return list(_main.GROUP_STEPS[job["op"]])
     if kind == "migrate":
@@ -338,6 +343,8 @@ def _job_ctx(kind, request_id, job):
         ctx["passwd_hash"] = job["passwd_hash"]
     if kind == "home":
         ctx["expected_uid"] = job["expected_uid"]
+    if kind == "port":
+        ctx.update(pod_name=job["pod_name"], wanted_ports=job["ports"])
     if kind == "group":
         ctx.update(group_name=job.get("name"), group_requested_gid=job.get("gid"),
                    group_members=job.get("members") or [], group_names=job.get("groups") or [])

@@ -297,8 +297,60 @@ class HomeDeleteRequest(RequestBody):
         return _request_id(value)
 
 
+# 포트 변경이 건드리지 않는 포트: 모든 Pod 의 기본 포트(ssh·jupyter)와 Pod 기동 때만 켤 수 있는 noVNC.
+PROTECTED_PORTS = frozenset({22, 8888, 6080})
+# 용도 이름으로 기본 포트를 찾고(ssh·jupyter) noVNC 를 켜므로(novnc·vnc), 추가 포트의 용도로는 받지 않는다.
+RESERVED_PURPOSES = frozenset({"ssh", "jupyter", "novnc", "vnc"})
+MAX_EXTRA_PORTS = 10
+
+
+class PortSpec(RequestBody):
+    internal_port: int = Field(ge=1, le=65535, examples=[3000])
+    # nodeport_allocations.purpose 가 255자다.
+    usage_purpose: str = Field(default="custom", min_length=1, max_length=255, examples=["웹 서버"])
+
+    @field_validator("internal_port", mode="before")
+    @classmethod
+    def _port(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("internal_port는 정수여야 합니다")
+        return value
+
+    @field_validator("usage_purpose")
+    @classmethod
+    def _purpose(cls, value):
+        if value.lower() in RESERVED_PURPOSES:
+            raise ValueError(f"usage_purpose로 쓸 수 없는 이름입니다: {value}")
+        return value
+
+
+class PortChangeRequest(RequestBody):
+    """떠 있는 Pod 의 추가 포트 변경 작업 등록. ports 는 바뀐 뒤 추가 포트 전체 목록이다(빈 목록이면 모두 뺀다)."""
+    request_id: str = Field(description="admin_be 포트 작업 번호(양의 정수)", examples=["7"])
+    username: UnixName = Field(examples=["exp-np-001"])
+    pod_name: str = Field(examples=["ailab-exp-np-001-7f3a9c21"])
+    ports: List[PortSpec] = Field(max_length=MAX_EXTRA_PORTS)
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
+
+    @model_validator(mode="after")
+    def _ports(self):
+        if not self.pod_name.startswith(POD_NAME_PREFIX):
+            raise ValueError(f"pod_name은 {POD_NAME_PREFIX}로 시작해야 합니다")
+        numbers = [p.internal_port for p in self.ports]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("같은 internal_port를 두 번 보낼 수 없습니다")
+        reserved = sorted(PROTECTED_PORTS.intersection(numbers))
+        if reserved:
+            raise ValueError(f"기본 포트·noVNC 포트는 바꿀 수 없습니다: {reserved}")
+        return self
+
+
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  GroupJobRequest, PasswordChangeRequest, HomeDeleteRequest)
+                  GroupJobRequest, PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest)
 
 
 def _errors(exc: ValidationError):
