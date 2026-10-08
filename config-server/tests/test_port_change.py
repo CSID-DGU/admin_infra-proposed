@@ -254,4 +254,5 @@ def test_service_create_failure_is_not_reported_as_success(logs, store, cluster,
     _run(store, [{"internal_port": 3000, "usage_purpose": "web"}])
 
     assert logs[-1]["action"] == Action.CHANGE_PORT and logs[-1]["phase"] != Phase.SUCCESS
+    assert "PORT_CHANGE_FAILED" in {entry.get("error_code") for entry in logs}
     assert saved == {}
