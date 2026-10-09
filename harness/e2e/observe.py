@@ -23,9 +23,11 @@ def user_row(cluster, user_id):
 
 
 def password_reset_status(cluster, user_id):
-    """이 사용자의 가장 최근 비밀번호 재설정 신청 상태(PENDING·PROCESSING·APPLIED·DENIED). 없으면 None."""
-    rows = cluster.sql(f"SELECT status FROM password_reset_requests WHERE user_id={int(user_id)} "
-                       "ORDER BY password_reset_request_id DESC LIMIT 1;")
+    """이 사용자의 가장 최근 비밀번호 변경 요청 상태(PENDING·PROCESSING·FULFILLED·DENIED). 없으면 None.
+    상태는 변경 요청(change_request, 종류 PASSWORD)에 있고, password_reset_requests 는 그 요청을 가리킨다."""
+    rows = cluster.sql("SELECT c.status FROM password_reset_requests r "
+                       "JOIN change_request c ON c.change_request_id = r.change_request_id "
+                       f"WHERE r.user_id={int(user_id)} ORDER BY r.password_reset_request_id DESC LIMIT 1;")
     return rows[0][0] if rows else None
 
 

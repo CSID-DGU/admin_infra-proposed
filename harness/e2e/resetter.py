@@ -152,12 +152,14 @@ class Resetter:
     def _delete_rows(self):
         users = f"SELECT user_id FROM users WHERE ubuntu_username LIKE '{self.prefix}%' OR email = '{self.admin_email}'"
         reqs = f"SELECT request_id FROM requests WHERE user_id IN ({users})"
-        # 비밀번호 재설정 신청은 users를 가리킨다. 이 표가 생기기 전의 admin_be가 떠 있는 스택에서도 돌 수 있게
+        # 비밀번호 변경 요청은 change_request(종류 PASSWORD, 대상 신청 없음)와 그 요청을 가리키는
+        # password_reset_requests 두 곳에 있다. 이 표가 생기기 전의 admin_be가 떠 있는 스택에서도 돌 수 있게
         # 표가 있을 때만 지운다.
         has_resets = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
                                       "AND table_name = 'password_reset_requests';")
-        resets = (f"DELETE FROM password_reset_requests WHERE user_id IN (SELECT * FROM ({users}) t) "
-                  f"OR reviewed_by IN (SELECT * FROM ({users}) t);\n") if has_resets else ""
+        resets = (f"DELETE FROM password_reset_requests WHERE user_id IN (SELECT * FROM ({users}) t);\n"
+                  f"DELETE FROM change_request WHERE request_id IS NULL "
+                  f"AND requested_by IN (SELECT * FROM ({users}) t);\n") if has_resets else ""
         # 그룹 작업은 users·change_request·groups 를 가리킨다. E2E 공용 그룹은 admin_be 기록만 지운다 — 인프라의
         # 그룹(AD·원장·팀 디렉터리)은 지울 수단이 없어 남기고, 다음 실행의 생성 작업이 그대로 이어받는다.
         # 다른 실행의 사용자가 아직 속해 있으면 그 실행이 쓰는 중이므로 그룹 행은 두고 간다.

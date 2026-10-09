@@ -337,7 +337,7 @@ class Context:
                    body={"newPassword": secrets.token_urlsafe(24)}, expect=expect)
 
     def do_wait_password(self, arg):
-        """가장 최근 비밀번호 재설정 신청이 원하는 상태(PENDING·PROCESSING·APPLIED·DENIED)가 될 때까지 기다린다.
+        """가장 최근 비밀번호 변경 요청이 원하는 상태(PENDING·PROCESSING·FULFILLED·DENIED)가 될 때까지 기다린다.
         초기화는 컨테이너에 반영하는 작업만 등록하고 돌아오므로, 적용은 그 작업이 끝난 뒤다."""
         timeout = arg.get("timeout", self.run.wait_timeout)
         for alias, wanted in arg.items():
@@ -407,9 +407,11 @@ class Context:
             raise StepFailed(f"그룹 {self.run.group_name}이 admin_be에 없음")
         if group["gid"] is None:
             raise StepFailed(f"그룹 {self.run.group_name}이 아직 승인 대기 — 이 그룹을 고른 신청이 먼저 승인돼야 함")
-        self._call("POST", f"/api/requests/{self._req(alias)}/change", as_user=self._owner(alias),
-                   body={"changeType": "GROUP", "newValue": json.dumps([group["gid"]]),
-                         "reason": f"e2e {self.case} 공용 그룹 추가"})
+        # 사유는 100자 이상이어야 받는다(admin_be SingleChangeRequestDTO).
+        self._call("POST", "/api/users/me/change-requests", as_user=self._owner(alias),
+                   body={"requestId": int(self._req(alias)), "changeType": "GROUP",
+                         "newValue": json.dumps([group["gid"]]),
+                         "reason": f"e2e {self.case} 공용 그룹 추가".ljust(100, ".")})
         rows = self.run.cluster.sql("SELECT MAX(change_request_id) FROM change_request "
                                     f"WHERE request_id={int(self._req(alias))} AND change_type='GROUP';")
         self.memo[f"{arg['as']}.change"] = int(rows[0][0])
