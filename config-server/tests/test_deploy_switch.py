@@ -55,3 +55,13 @@ def test_every_slack_webhook_key_in_prod_config_is_sunk_for_experiment_stacks():
     # 뽑은 키는 전부 닿지 않는 주소로 덮이고, operation만 덮어쓰기를 끈다
     assert 'for key in $WEBHOOK_KEYS; do SINKS=' in text
     assert re.search(r'\[ "\$STACK" = "operation" \] && SLACK_OVERRIDE=""', text)
+
+
+def test_only_operation_stack_writes_issuance_sheet():
+    # 문서 ID·키는 운영 설정에서 모든 스택이 물려받는다. 켜는 값은 operation에만 넣고, 나머지는 꺼 둔다.
+    text = STACK_UP.read_text()
+    assert """ISSUANCE_SHEET_OVERRIDE=',"issuance-sheet":{"enabled":false}'""" in text
+    assert re.search(
+        r'''\[ "\$STACK" = "operation" \] && ISSUANCE_SHEET_OVERRIDE=',"issuance-sheet":\{"enabled":true\}'$''',
+        text, re.M)
+    assert '$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE,"prometheus"' in text
