@@ -64,8 +64,9 @@ spec:
               cpu: 250m
               memory: 512Mi
               ephemeral-storage: 1Gi
+            # CPU 한도는 두지 않는다. JVM 기동은 CPU를 몰아 쓰는데 1코어로 묶으면 배포마다 기동만 25초가 걸린다.
+            # 평소 몫은 requests로 보장되고, 메모리만 한도로 막는다.
             limits:
-              cpu: "1"
               memory: 1Gi
       volumes:
         - name: app-config

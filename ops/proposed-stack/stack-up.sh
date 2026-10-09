@@ -500,14 +500,17 @@ def check(label, cond, detail=""):
 was = os.environ.get("ADMIN_BE_INTERNAL_URL", "")
 # admin_be를 막 교체한 직후에는 옛 Pod 주소로 가는 연결이 잠시 남을 수 있어 1분까지 기다린다.
 err = ""
-for _ in range(12):
+deadline = time.monotonic() + 60
+while True:
     try:
         requests.get(f"{was}/api/requests/config/{name}", headers=api.headers, timeout=5)
         err = ""
         break
     except Exception as e:
         err = type(e).__name__
-        time.sleep(5)
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(1)
 check("admin_be(WAS) 응답", not err, err)
 # 접두어 없는 이름은 거절돼야 한다. 막히지 않더라도 request_id가 숫자가 아니어서 400으로 끝나 작업은 등록되지 않는다.
 # 단, 실운영(operation)은 접두어 강제를 일부러 꺼둬서(PREFIX=) 실사용자가 원하는 이름을 그대로
@@ -524,7 +527,8 @@ def settled(label, fn, ok):
     """프론트엔드 이미지가 바뀐 배포는 새 Pod가 서비스·ingress에 붙기까지 잠시 연결 오류·502가 난다.
     admin_be 응답 확인처럼 1분까지 다시 시도한 뒤 판정한다."""
     detail = ""
-    for _ in range(12):
+    deadline = time.monotonic() + 60
+    while True:
         try:
             code = fn().status_code
             if ok(code):
@@ -533,7 +537,9 @@ def settled(label, fn, ok):
             detail = code
         except Exception as e:
             detail = type(e).__name__
-        time.sleep(5)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     check(label, False, detail)
 
 if fe:
@@ -597,14 +603,16 @@ def account_status():
 def new_password():
     return base64.b64encode(os.urandom(12).hex().encode()).decode()
 
-def wait(fn, times=24, gap=5):
-    """비동기라 결과가 바로 나오지 않는다. 참이 될 때까지 기다렸다가 돌려준다."""
-    for _ in range(times):
+def wait(fn, limit=120, gap=1):
+    """비동기라 결과가 바로 나오지 않는다. 참이 될 때까지(최대 limit초) 기다렸다가 돌려준다."""
+    deadline = time.monotonic() + limit
+    while True:
         value = fn()
         if value:
             return value
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(gap)
-    return None
 
 if account_status() == 200:  # 이전 실행에서 남은 시험 계정은 회수 작업으로 먼저 정리
     api.post(f"{base}/operations/revoke", timeout=30, json={
@@ -690,7 +698,8 @@ else
   SLACK_CHECK='t hooks.slack.com 443 && echo "NG  Slack(443) 연결이 열려 있음" || echo "OK  Slack(443) 차단"'
 fi
 NET=$(kubectl -n "$NS" exec "$BE_POD" -- bash -c '
-  t() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+  # 막혀 있어야 정상인 대상은 이 시간을 끝까지 기다린다. 클러스터 안·메일·Slack 연결은 1초 안에 붙는다.
+  t() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
   t smtp.gmail.com 587 && echo "OK  메일(SMTP 587) 연결됨" || echo "NG  메일(SMTP 587) 연결 안 됨"
   '"$SLACK_CHECK"'
   t my-mysql.ailab-be.svc.cluster.local 3306 && echo "NG  운영 DB 연결이 열려 있음" || echo "OK  운영 DB 차단"
