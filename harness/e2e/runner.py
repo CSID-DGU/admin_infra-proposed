@@ -16,8 +16,8 @@ from .catalog import is_fault_case
 from .ports import safe
 from .resetter import admin_email, e2e_group_name, run_prefix
 
-# admin_be는 사용 목적을 50자 이상 받는다(be#633).
-PURPOSE_FILLER = "자동 점검용 시험 신청입니다. 컨테이너 생성과 회수 흐름이 정상인지 확인합니다."
+# admin_be는 사용 목적을 200자 이상 받는다(be#682). 모자란 만큼 마침표로 채운다.
+PURPOSE_FILLER = "자동 점검용 시험 신청입니다. 컨테이너 생성과 회수 흐름이 정상인지 확인합니다.".ljust(200, ".")
 # 포트 용도는 신청자가 자유롭게 적는 글이다. 실제 신청처럼 한글·공백·괄호를 넣어, 이 글이 쿠버네티스 이름에
 # 들어가 생성이 실패하는 일(2026-10-06 operation)을 모든 사례가 함께 지킨다.
 PORT_REQUESTS = [{"internalPort": 5173, "usagePurpose": "프론트엔드 (React, Vite)"}]
