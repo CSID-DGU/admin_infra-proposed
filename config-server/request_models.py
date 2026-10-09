@@ -39,6 +39,10 @@ def _request_id(value):
     return str(int(text))
 
 
+# 접속이 차단된 계정의 작업이 새로 만드는 Service 도 막힌 채로 만들게 하는 표시(이동·포트 변경 공통). 생성 작업에는
+# 없다 — 접속이 차단된 계정에는 컨테이너를 새로 만들지 않는다(admin_be 가 승인을 거절한다).
+ACCESS_BLOCKED_DESCRIPTION = "true면 이 작업이 만드는 접속 포트를 막힌 채로 만든다(접속이 차단된 계정)"
+
 _VALID_UNIX_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
@@ -202,6 +206,7 @@ class MigrateRequest(RequestBody):
                              examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
     force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
+    access_blocked: Optional[bool] = Field(default=None, description=ACCESS_BLOCKED_DESCRIPTION)
 
     @field_validator("nodes")
     @classmethod
@@ -330,6 +335,7 @@ class PortChangeRequest(RequestBody):
     username: UnixName = Field(examples=["exp-np-001"])
     pod_name: str = Field(examples=["ailab-exp-np-001-7f3a9c21"])
     ports: List[PortSpec] = Field(max_length=MAX_EXTRA_PORTS)
+    access_blocked: Optional[bool] = Field(default=None, description=ACCESS_BLOCKED_DESCRIPTION)
 
     @field_validator("request_id", mode="before")
     @classmethod
@@ -349,8 +355,21 @@ class PortChangeRequest(RequestBody):
         return self
 
 
+class AccessChangeRequest(RequestBody):
+    """계정의 접속 차단·해제 작업 등록. 그 계정의 모든 Pod 의 모든 접속 포트가 대상이다."""
+    request_id: str = Field(description="admin_be 접속 작업 번호(양의 정수)", examples=["7"])
+    username: UnixName = Field(examples=["exp-np-001"])
+    blocked: bool = Field(description="true면 차단, false면 해제")
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def _rid(cls, value):
+        return _request_id(value)
+
+
 REQUEST_MODELS = (ProvisionRequest, RevokeRequest, DeletePodRequest, MigrateRequest,
-                  GroupJobRequest, PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest)
+                  GroupJobRequest, PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest,
+                  AccessChangeRequest)
 
 
 def _errors(exc: ValidationError):

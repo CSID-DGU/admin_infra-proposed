@@ -923,7 +923,8 @@ def step_create_services(ctx):
                   node_name=best_node, resource_type="service",
                   action=Action.CREATE_SERVICE, phase=Phase.START)
     try:
-        _main.create_nodeport_services(username, ns, pod_name, ctx["allocated_ports"])
+        _main.create_nodeport_services(username, ns, pod_name, ctx["allocated_ports"],
+                                       blocked=bool(ctx.get("access_blocked")))
     except client.exceptions.ApiException as e:
         _main.app.logger.exception("[CREATE POD] service creation failed")
         _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")

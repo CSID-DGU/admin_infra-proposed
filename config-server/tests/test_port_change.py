@@ -64,7 +64,7 @@ def cluster(monkeypatch):
             state.rows[p["internal_port"]] = (state.next_port, p["usage_purpose"], username)
             state.next_port += 1
 
-    def create(username, namespace, pod_name, ports):
+    def create(username, namespace, pod_name, ports, blocked=False):
         if state.create_error:
             raise state.create_error
         for p in ports:

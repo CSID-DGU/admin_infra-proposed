@@ -476,9 +476,20 @@ def delete_pod_util(pod_name, namespace):
 # 라벨 값 규칙(63자 이내, 영숫자로 시작·끝, 사이에는 - _ . 허용). 용도가 이 규칙에 맞을 때만 라벨로 단다.
 _LABEL_VALUE_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 PURPOSE_ANNOTATION = "ailab.dgu/usage-purpose"
+# 접속이 차단된 계정의 Service 선택자에 붙이는 조건. 이 라벨은 어떤 Pod 에도 달지 않으므로 조건이 붙은 Service 는
+# 넘길 대상이 없어 외부 포트로 온 연결이 거절된다. Service 는 남으므로 외부 포트 배정은 그대로다.
+ACCESS_BLOCK_LABEL = "ailab.dgu/access-blocked"
 
 
-def nodeport_service_body(username: str, namespace: str, pod_name: str, port_info: dict):
+def service_selector(pod_name: str, blocked: bool = False) -> dict:
+    """사용자 Pod 의 Service 선택자. blocked 면 대상이 없는 선택자다."""
+    selector = {"pod_name": pod_name}
+    if blocked:
+        selector[ACCESS_BLOCK_LABEL] = "true"
+    return selector
+
+
+def nodeport_service_body(username: str, namespace: str, pod_name: str, port_info: dict, blocked: bool = False):
     """포트 하나의 NodePort Service 정의.
 
     이름은 `ailab-<사용자>-<무작위 8자>`다. 용도는 신청자가 자유롭게 적는 글이라(한글·공백·괄호) 이름에 넣으면
@@ -486,7 +497,7 @@ def nodeport_service_body(username: str, namespace: str, pod_name: str, port_inf
     곳은 없다 — 조회·삭제는 모두 pod_name 라벨로 한다.
 
     용도 원문은 주석(annotation)에 남기고, 라벨 값 규칙에 맞는 용도(ssh·jupyter 등)만 purpose 라벨로도 단다.
-    포트 이름은 서비스마다 포트가 하나라 붙이지 않는다."""
+    포트 이름은 서비스마다 포트가 하나라 붙이지 않는다. blocked 면 접속이 차단된 계정의 Service 로 만든다."""
     internal_port = port_info["internal_port"]  # Pod 내부 포트
     external_port = port_info["external_port"]  # NodePort
     purpose = str(port_info.get("usage_purpose") or "custom")
@@ -504,7 +515,7 @@ def nodeport_service_body(username: str, namespace: str, pod_name: str, port_inf
         ),
         spec=client.V1ServiceSpec(
             type="NodePort",
-            selector={"pod_name": pod_name},
+            selector=service_selector(pod_name, blocked),
             ports=[client.V1ServicePort(
                 protocol="TCP",
                 port=internal_port,
@@ -515,7 +526,8 @@ def nodeport_service_body(username: str, namespace: str, pod_name: str, port_inf
     )
 
 
-def create_nodeport_services(username: str, namespace: str, pod_name: str, extra_ports: List[dict]):
+def create_nodeport_services(username: str, namespace: str, pod_name: str, extra_ports: List[dict],
+                             blocked: bool = False):
     """
     사용자 Pod용 NodePort Service 생성 (여러 포트 지원)
 
@@ -526,6 +538,7 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
         username: 사용자명
         namespace: k8s 네임스페이스
         extra_ports: [{"internal_port": 8888, "external_port": 10001, "usage_purpose": "jupyter"}, ...]
+        blocked: 접속이 차단된 계정이면 True — 대상이 없는 선택자로 만든다
     """
     app.logger.info(
         f"[SERVICE CREATE] username={username} pod={pod_name} ports={extra_ports}"
@@ -535,7 +548,7 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
     v1 = client.CoreV1Api()
 
     for port_info in extra_ports:
-        service_body = nodeport_service_body(username, namespace, pod_name, port_info)
+        service_body = nodeport_service_body(username, namespace, pod_name, port_info, blocked)
         service_name = service_body.metadata.name
         try:
             v1.create_namespaced_service(namespace, service_body)

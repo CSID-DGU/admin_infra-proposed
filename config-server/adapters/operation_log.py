@@ -100,6 +100,8 @@ class Action(str, Enum):
     PURGE_HOME = "PURGE_HOME"
     # 떠 있는 Pod 의 추가 포트 변경. admin_be 포트 작업 번호에 딸린 작업이라 request_id에 접두어가 붙는다.
     CHANGE_PORT = "CHANGE_PORT"
+    # 계정의 접속 차단·해제. admin_be 접속 작업 번호에 딸린 작업이라 request_id에 접두어가 붙는다.
+    CHANGE_ACCESS = "CHANGE_ACCESS"
     # 컨테이너 준비 대기(WAIT_READY) 안의 세부 단계. Pod 이벤트로 판정하며 다른 단계와 같이 START/SUCCESS/FAIL로 남는다.
     PULL_IMAGE = "PULL_IMAGE"            # 노드에 이미지를 받는 중 (이미 있으면 기록되지 않음)
     START_CONTAINER = "START_CONTAINER"  # 이미지 준비 뒤 컨테이너 생성·시작·준비 확인
