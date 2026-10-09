@@ -6,10 +6,17 @@ Service 를 지우지 않고 선택자만 바꾼다. 지우면 외부 포트 배
 
 이미 맞춰진 Service 는 그대로 두므로 중간에 끊긴 작업은 처음부터 다시 실행하면 이어서 끝난다. 차단 중에 새로
 만들어지는 Service 는 이 작업이 아니라 만드는 쪽(create_nodeport_services 의 blocked)이 막힌 채로 만든다.
+
+늦게 다시 실행된 옛 작업이 그 뒤의 결정을 덮지 못하게, 작업이 등록된 시각(decided_at)을 Service 에 적어 둔다.
+계정의 Service 중 하나라도 더 나중 시각이 적혀 있으면 이 작업은 아무것도 바꾸지 않는다. 바꿀 것이 없는 Service 에도
+시각은 적는다 — 적지 않으면 바꿀 것이 없던 차단을 옛 해제가 지나친다. 읽은 뒤 다른 작업이 바꾼 Service 는
+resourceVersion 이 달라 apiserver 가 409 로 거절하고, 단계가 처음부터 다시 실행되어 새로 읽는다.
+Service 를 만드는 작업(컨테이너 이동·포트 변경)도 자기 등록 시각을 적는다 — 계정의 Service 가 전부 새로 만들어져도
+그 앞의 접속 작업은 물러난다.
 """
 from kubernetes import client
 
-from utils import ACCESS_BLOCK_LABEL
+from utils import ACCESS_BLOCK_LABEL, ACCESS_DECIDED_AT_ANNOTATION as DECIDED_AT_ANNOTATION
 
 
 class _MainProxy:
@@ -27,30 +34,45 @@ def _is_blocked(service):
     return ACCESS_BLOCK_LABEL in (service.spec.selector or {})
 
 
+def _decided_at(service):
+    try:
+        return int((service.metadata.annotations or {}).get(DECIDED_AT_ANNOTATION) or 0)
+    except ValueError:
+        return 0
+
+
 def step_set_account_access(ctx):
-    username, blocked = ctx["username"], ctx["blocked"]
+    username, blocked, decided_at = ctx["username"], ctx["blocked"], ctx["decided_at"]
     namespace = _main.app.config["NAMESPACE"]
-    # 병합 패치에서 None 은 그 키를 지운다 — 나머지 선택자(pod_name)는 건드리지 않는다.
-    patch = {"spec": {"selector": {ACCESS_BLOCK_LABEL: "true" if blocked else None}}}
 
     try:
         _main.load_k8s()
         v1 = client.CoreV1Api()
         services = v1.list_namespaced_service(
             namespace=namespace, label_selector=SERVICE_SELECTOR.format(username=username)).items
-        changed = 0
-        for service in services:
-            if _is_blocked(service) == blocked:
-                continue
+        latest = max((_decided_at(service) for service in services), default=0)
+        superseded = latest > decided_at
+        stale = [] if superseded else [
+            service for service in services
+            if _is_blocked(service) != blocked or _decided_at(service) != decided_at]
+        for service in stale:
+            # 병합 패치에서 None 은 그 키를 지운다 — 나머지 선택자(pod_name)는 건드리지 않는다.
+            patch = {
+                "metadata": {"resourceVersion": service.metadata.resource_version,
+                             "annotations": {DECIDED_AT_ANNOTATION: str(decided_at)}},
+                "spec": {"selector": {ACCESS_BLOCK_LABEL: "true" if blocked else None}},
+            }
             v1.patch_namespaced_service(service.metadata.name, namespace, patch)
-            changed += 1
     except Exception as e:
         _main.app.logger.exception("[ACCESS] 접속 %s 실패: user=%s", "차단" if blocked else "해제", username)
         raise _main.StepFailed(
             _main.infra_error("CHANGE_ACCESS", "ACCESS_CHANGE_FAILED", str(e)), 500, cause=e)
 
+    if superseded:
+        _main.app.logger.info("[ACCESS] 더 나중 결정이 이미 적용돼 건너뜀: user=%s blocked=%s decided_at=%d latest=%d",
+                              username, blocked, decided_at, latest)
     _main.app.logger.info("[ACCESS] user=%s blocked=%s services=%d changed=%d",
-                          username, blocked, len(services), changed)
+                          username, blocked, len(services), len(stale))
     ctx["access_services"] = len(services)
 
 

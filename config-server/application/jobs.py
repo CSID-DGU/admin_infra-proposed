@@ -349,9 +349,11 @@ def _job_ctx(kind, request_id, job):
         ctx.update(pod_name=job["pod_name"], wanted_ports=job["ports"])
     if kind == "access":
         ctx["blocked"] = bool(job["blocked"])
+        ctx["decided_at"] = int(job.get("decided_at") or 0)
     if kind in ("migrate", "port"):
         # 접속이 차단된 계정의 작업이다 — 이 작업이 만드는 Service 도 막힌 채로 만든다.
         ctx["access_blocked"] = bool(job.get("access_blocked"))
+        ctx["access_decided_at"] = int(job.get("decided_at") or 0)
     if kind == "group":
         ctx.update(group_name=job.get("name"), group_requested_gid=job.get("gid"),
                    group_members=job.get("members") or [], group_names=job.get("groups") or [])

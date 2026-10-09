@@ -118,7 +118,8 @@ def step_change_ports(ctx):
                    if p["internal_port"] in wanted and p["internal_port"] not in services]
         if missing:
             _main.create_nodeport_services(username, namespace, pod_name, missing,
-                                           blocked=bool(ctx.get("access_blocked")))
+                                           blocked=bool(ctx.get("access_blocked")),
+                                           decided_at=ctx.get("access_decided_at") or 0)
     except _main.StepFailed:
         raise
     except Exception as e:

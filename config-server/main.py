@@ -1168,6 +1168,12 @@ from application.jobs import (  # noqa: E402
 )
 
 
+def _now_ms():
+    """작업 등록 시각. 접속 차단 여부를 정하는 작업(access·migrate·port)이 입력에 남겨, 다시 실행돼도 같은 값으로
+    결정의 순서를 견준다(lifecycle_steps/access.py)."""
+    return int(time.time() * 1000)
+
+
 def _register_job(kind, request_id, username, job):
     action = JOB_ACTIONS[kind]
     key = job_key(kind, request_id)
@@ -1351,6 +1357,7 @@ def register_migrate(body: MigrateRequest):
         job["min_improvement_ratio"] = body.min_improvement_ratio
     if body.access_blocked:
         job["access_blocked"] = True
+    job["decided_at"] = _now_ms()
     return _register_job("migrate", body.request_id, body.username, job)
 
 
@@ -1439,6 +1446,7 @@ def register_port_change(body: PortChangeRequest):
            "ports": [p.model_dump() for p in body.ports]}
     if body.access_blocked:
         job["access_blocked"] = True
+    job["decided_at"] = _now_ms()
     return _register_job("port", body.request_id, body.username, job)
 
 
@@ -1467,7 +1475,7 @@ def register_access_change(body: AccessChangeRequest):
       400: {description: 입력 오류}
       409: {description: 같은 번호의 접속 작업이 아직 끝나지 않음}
     """
-    job = {"username": body.username, "blocked": body.blocked}
+    job = {"username": body.username, "blocked": body.blocked, "decided_at": _now_ms()}
     return _register_job("access", body.request_id, body.username, job)
 
 

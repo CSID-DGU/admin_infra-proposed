@@ -38,20 +38,30 @@ def cluster(monkeypatch):
     state = types.SimpleNamespace(
         selectors={"svc-a-ssh": {"pod_name": "ailab-alice-1"}, "svc-a-jupyter": {"pod_name": "ailab-alice-1"},
                    "svc-b-ssh": {"pod_name": "ailab-alice-2"}},
-        patched=[], patch_error=None)
+        annotations={}, versions={}, patched=[], patch_error=None, before_patch=None)
 
     class FakeV1:
         def list_namespaced_service(self, namespace, label_selector):
             assert label_selector == "username=alice,app=ailab-nodeport"
             return types.SimpleNamespace(items=[
-                types.SimpleNamespace(metadata=types.SimpleNamespace(name=name),
-                                      spec=types.SimpleNamespace(selector=dict(selector)))
+                types.SimpleNamespace(
+                    metadata=types.SimpleNamespace(
+                        name=name, annotations=dict(state.annotations.get(name) or {}) or None,
+                        resource_version=str(state.versions.get(name, 1))),
+                    spec=types.SimpleNamespace(selector=dict(selector)))
                 for name, selector in state.selectors.items()])
 
         def patch_namespaced_service(self, name, namespace, body):
             if state.patch_error and name == state.patch_error:
                 raise RuntimeError("apiserver hiccup")
+            if state.before_patch:
+                hook, state.before_patch = state.before_patch, None
+                hook(name)
+            if body["metadata"]["resourceVersion"] != str(state.versions.get(name, 1)):
+                raise RuntimeError("409 Conflict: the object has been modified")
             state.patched.append(name)
+            state.versions[name] = state.versions.get(name, 1) + 1
+            state.annotations.setdefault(name, {}).update(body["metadata"]["annotations"])
             for key, value in body["spec"]["selector"].items():
                 if value is None:
                     state.selectors[name].pop(key, None)
@@ -71,9 +81,10 @@ def saved(monkeypatch):
     return results
 
 
-def _run(store, blocked):
+def _run(store, blocked, decided_at=1000):
     """등록된 것으로 두고 제어기가 하듯 작업을 끝까지 실행한다."""
-    store[("CHANGE_ACCESS", KEY)] = {"state": "queued", "job": {"username": "alice", "blocked": blocked}}
+    store[("CHANGE_ACCESS", KEY)] = {
+        "state": "queued", "job": {"username": "alice", "blocked": blocked, "decided_at": decided_at}}
     with main.app.app_context():
         main.run_job("access", KEY, "alice")
 
@@ -84,12 +95,13 @@ def _end(logs):
 
 # ---------- 작업 등록 ----------
 
-def test_registration_returns_202_with_prefixed_key(api, logs, store):
+def test_registration_returns_202_with_prefixed_key(api, logs, store, monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1760000000.123)
     r = api.post("/operations/access", json={"request_id": 7, "username": "alice", "blocked": True})
 
     assert r.status_code == 202
     assert r.get_json()["request_id"] == "7" and r.get_json()["status"] == "accepted"
-    job = {"username": "alice", "blocked": True}
+    job = {"username": "alice", "blocked": True, "decided_at": 1760000000123}
     assert store[("CHANGE_ACCESS", KEY)]["job"] == job
     assert len(logs) == 1 and logs[0]["request_id"] == KEY
     assert logs[0]["action"] == Action.CHANGE_ACCESS and logs[0]["phase"] == Phase.START
@@ -139,12 +151,91 @@ def test_unblock_restores_the_original_selector(logs, store, cluster, saved):
     assert saved[("CHANGE_ACCESS", KEY)] == {"blocked": False, "services": 3}
 
 
-def test_services_already_in_the_wanted_state_are_left_alone(logs, store, cluster, saved):
+def test_service_already_in_the_wanted_state_keeps_its_selector_and_gets_the_decision_time(
+        logs, store, cluster, saved):
     cluster.selectors["svc-a-ssh"][BLOCK] = "true"
+
+    _run(store, blocked=True, decided_at=2000)
+
+    assert cluster.selectors["svc-a-ssh"] == {"pod_name": "ailab-alice-1", BLOCK: "true"}
+    assert {a[access.DECIDED_AT_ANNOTATION] for a in cluster.annotations.values()} == {"2000"}
+    assert len(cluster.annotations) == 3
+
+
+def test_rerun_of_the_same_job_changes_nothing(logs, store, cluster, saved):
+    _run(store, blocked=True)
+    cluster.patched.clear()
 
     _run(store, blocked=True)
 
-    assert sorted(cluster.patched) == ["svc-a-jupyter", "svc-b-ssh"]
+    assert cluster.patched == []
+    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
+
+
+# ---------- 결정 순서 ----------
+
+def test_older_unblock_rerun_after_a_newer_block_leaves_services_blocked(logs, store, cluster, saved):
+    _run(store, blocked=True, decided_at=2000)
+    cluster.patched.clear()
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
+    assert cluster.patched == []
+    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+
+
+def test_older_unblock_cannot_pass_a_newer_block_that_had_nothing_to_change(logs, store, cluster, saved):
+    for selector in cluster.selectors.values():
+        selector[BLOCK] = "true"
+    _run(store, blocked=True, decided_at=2000)
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+
+
+def test_older_unblock_leaves_a_service_created_after_the_newer_block(logs, store, cluster, saved):
+    _run(store, blocked=True, decided_at=2000)
+    cluster.selectors["svc-c-extra"] = {"pod_name": "ailab-alice-2", BLOCK: "true"}
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert cluster.selectors["svc-c-extra"][BLOCK] == "true"
+
+
+def test_newer_unblock_after_an_older_block_opens_the_services(logs, store, cluster, saved):
+    _run(store, blocked=True, decided_at=1000)
+
+    _run(store, blocked=False, decided_at=2000)
+
+    assert all(BLOCK not in selector for selector in cluster.selectors.values())
+
+
+def test_service_changed_between_read_and_write_is_read_again(logs, store, cluster, saved):
+    """읽고 쓰는 사이 더 나중 차단이 끼어들면 쓰기가 거절되고, 다시 읽은 옛 해제는 물러난다."""
+    def newer_block_lands(_name):
+        for name in cluster.selectors:
+            cluster.selectors[name][BLOCK] = "true"
+            cluster.annotations[name] = {access.DECIDED_AT_ANNOTATION: "2000"}
+            cluster.versions[name] = cluster.versions.get(name, 1) + 1
+    for selector in cluster.selectors.values():
+        selector[BLOCK] = "true"
+    cluster.before_patch = newer_block_lands
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
+    assert cluster.patched == []
+    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+
+
+def test_job_registered_before_this_field_existed_still_applies(logs, store, cluster, saved):
+    store[("CHANGE_ACCESS", KEY)] = {"state": "queued", "job": {"username": "alice", "blocked": True}}
+    with main.app.app_context():
+        main.run_job("access", KEY, "alice")
+
+    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
 
 
 def test_account_without_containers_succeeds(logs, store, cluster, saved):
@@ -196,6 +287,22 @@ def test_service_of_a_blocked_account_selects_no_pod():
     assert body.spec.ports[0].node_port == 30001
 
 
+def test_created_service_carries_the_registration_time_of_its_job():
+    body = utils.nodeport_service_body("alice", "ns", "ailab-alice-1", _port(), blocked=True, decided_at=3000)
+
+    assert body.metadata.annotations[access.DECIDED_AT_ANNOTATION] == "3000"
+
+
+def test_older_unblock_leaves_services_all_recreated_after_it(logs, store, cluster, saved):
+    """컨테이너 이동으로 Service 가 전부 새로 만들어져도, 그 작업보다 먼저 등록된 해제는 물러난다."""
+    cluster.selectors = {"svc-new": {"pod_name": "ailab-alice-1", BLOCK: "true"}}
+    cluster.annotations = {"svc-new": {access.DECIDED_AT_ANNOTATION: "3000"}}
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert cluster.patched == [] and cluster.selectors["svc-new"][BLOCK] == "true"
+
+
 def test_service_is_open_by_default():
     assert utils.nodeport_service_body("alice", "ns", "ailab-alice-1", _port()).spec.selector \
         == {"pod_name": "ailab-alice-1"}
@@ -213,7 +320,9 @@ def test_block_flag_reaches_the_job_that_creates_services(api, logs, store, path
     (key, entry), = store.items()
     assert key[0] == action and entry["job"]["access_blocked"] is True
     kind = main._JOB_KIND[action]
-    assert main._job_ctx(kind, key[1], {"nodes": [], **entry["job"]})["access_blocked"] is True
+    ctx = main._job_ctx(kind, key[1], {"nodes": [], **entry["job"]})
+    assert ctx["access_blocked"] is True
+    assert ctx["access_decided_at"] == entry["job"]["decided_at"] > 0
 
 
 def test_job_without_the_flag_creates_open_services():
