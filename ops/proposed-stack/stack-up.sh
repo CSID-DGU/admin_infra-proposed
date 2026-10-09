@@ -370,6 +370,11 @@ SLACK_OVERRIDE=",\"slack-webhook-url\":{$SINKS},\"slack\":{\"bot-token\":\"disab
 # 켜는 쪽을 여기 둔다 — 이 줄이 빠지거나 스택 이름이 늘어도 실험 스택이 운영 문서를 고치는 쪽으로는 넘어지지 않는다.
 ISSUANCE_SHEET_OVERRIDE=',"issuance-sheet":{"enabled":false}'
 [ "$STACK" = "operation" ] && ISSUANCE_SHEET_OVERRIDE=',"issuance-sheet":{"enabled":true}'
+# 신청자가 Slack 워크스페이스 회원인지 보는 확인(admin_be SlackMembershipGate)도 operation만 켠다. 실험 스택은 Slack을
+# 막아 두었고 테스트 계정은 Slack 회원이 아니다. admin_be 기본값이 false라 여기서는 켜는 쪽만 둔다. 위 SLACK_OVERRIDE의
+# "slack" 묶음과 키가 겹치지 않게 점으로 이은 이름으로 넣는다.
+SLACK_MEMBERSHIP_OVERRIDE=''
+[ "$STACK" = "operation" ] && SLACK_MEMBERSHIP_OVERRIDE=',"slack.membership-check.enabled":true'
 # 모니터링 지표는 클러스터 공용 Prometheus를 읽기만 하므로 모든 스택이 같은 곳을 본다. 예전엔 닿지 않는
 # 주소로 돌려 두어 리소스 모니터링 화면이 늘 비어 있었다(admin_fe#169). 연결은 admin-be.yaml 정책이 연다.
 PROMETHEUS_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
@@ -379,7 +384,7 @@ PROMETHEUS_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc.clust
 # 이 값으로 기동하면 스키마를 바꾸지 않으므로, 이 변경은 Flyway를 넣은 admin_be(be#603)와 함께 배포한다.
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"validate"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"validate"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE$SLACK_MEMBERSHIP_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
