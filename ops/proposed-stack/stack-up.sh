@@ -105,6 +105,7 @@ getpw() { kubectl -n "$NS" get secret stack-db -o jsonpath="{.data.$1}" | base64
 # 배포가 돌도록, 스택 네임스페이스에 그 경로만 붙인 임시 도우미 Pod를 띄워 읽고 끝나면 지운다.
 LEDGER_POD=ledger-helper
 ledger_cleanup() { kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
+# 뜨는 데 몇 초 걸리므로 띄우기(start)와 기다리기(wait)를 나눠, 그 사이에 대장이 필요 없는 단계를 먼저 진행한다.
 start_ledger_helper() {  # $1: NFS 서버, $2: 계정 대장 경로
   kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
   # kube_share NFS 마운트를 NAS가 허용하는 노드는 csid-dgu-desktop 하나뿐이다 — config-server
@@ -131,8 +132,8 @@ $pin
     - name: kube-share
       nfs: {server: "$1", path: "$2"}
 YAML
-  kubectl -n "$NS" wait --for=condition=Ready pod/"$LEDGER_POD" --timeout=5m >/dev/null
 }
+wait_ledger_helper() { kubectl -n "$NS" wait --for=condition=Ready pod/"$LEDGER_POD" --timeout=5m >/dev/null; }
 ledger() { kubectl -n "$NS" exec "$LEDGER_POD" -- "$@"; }
 BASE=$(mktemp); trap 'rm -f "$BASE"; ledger_cleanup' EXIT
 
@@ -156,6 +157,8 @@ echo "config-server nodePort $CONFIG_NODEPORT 사용 가능, 화면 호스트 $F
 step "네임스페이스 $NS"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace "$NS" ailab.dgu/proposed-stack="$STACK" --overwrite >/dev/null
+# 계정 대장 확인(아래 MySQL 앞 단계)에 쓸 도우미 Pod를 지금 띄워 두고, 뜨는 동안 Secret 준비 단계를 진행한다.
+start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
 
 step "사용자 컨테이너 우선순위 등급"
 # 노드 디스크가 쪼들리면 kubelet이 Pod를 쫓아낸다. 그 순서는 자원 요청 초과 여부와 우선순위로
@@ -193,19 +196,6 @@ preemptionPolicy: Never
 description: "스택 구성요소 — 사용자 컨테이너보다도 늦게 축출된다"
 YAML
 echo "ailab-stack-component 적용"
-
-step "계정 대장 확인 (임시 도우미 Pod)"
-start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
-USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
-[ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
-# config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
-# 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
-# config-server가 처음 계정을 만들 때 기본 파일로 채운다.
-# (실운영도 같은 방식이다 — 원본 경로는 NAS가 마운트를 거부해 격리 방식으로 되돌렸다. 위 UID_MAX가
-# 이제 겹치지 않으므로 세 스택과 다를 게 없다.)
-STACK_KUBE_SHARE="$KUBE_SHARE/exp-$STACK"
-ledger mkdir -p "/kube_share/exp-$STACK"
-echo "UID $UID_MIN~$UID_MAX 비어 있음, 스택 계정 대장 /kube_share/exp-$STACK"
 
 step "SSH 키 복사 ($PROD_NS → $NS)"
 for s in nas-ssh-key farm-ssh-key farm-ad-ssh-key; do
@@ -277,6 +267,20 @@ kubectl -n "$NS" create secret generic config-server-api-token --from-literal=to
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 echo "$([ "$TOKEN_NEW" = 1 ] && echo 새로 생성 || echo 기존 값 유지)"
 
+step "계정 대장 확인 (임시 도우미 Pod)"
+# 스택 구성요소를 하나라도 올리기 전에 확인한다(이 앞 단계는 Secret 준비뿐이다).
+wait_ledger_helper
+USED=$(ledger awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" '$3>=lo && $3<=hi {n++} END {print n+0}' /kube_share/passwd)
+[ "$USED" = 0 ] || { echo "운영 계정 대장에 UID $UID_MIN~$UID_MAX 계정이 ${USED}개 있음. 대역을 옮겨야 함"; exit 1; }
+# config-server는 nfs.kubeSharePath를 /kube_share로 마운트해 passwd/group/shadow를 둔다. 운영 경로의
+# 하위 디렉터리를 스택 전용으로 쓰므로 테스트 계정이 운영 대장에 섞이지 않는다. 비어 있으면
+# config-server가 처음 계정을 만들 때 기본 파일로 채운다.
+# (실운영도 같은 방식이다 — 원본 경로는 NAS가 마운트를 거부해 격리 방식으로 되돌렸다. 위 UID_MAX가
+# 이제 겹치지 않으므로 세 스택과 다를 게 없다.)
+STACK_KUBE_SHARE="$KUBE_SHARE/exp-$STACK"
+ledger mkdir -p "/kube_share/exp-$STACK"
+echo "UID $UID_MIN~$UID_MAX 비어 있음, 스택 계정 대장 /kube_share/exp-$STACK"
+
 step "MySQL"
 render "$HERE/mysql.yaml" | kubectl apply -f -
 kubectl -n "$NS" rollout status statefulset/mysql --timeout=10m
@@ -325,36 +329,9 @@ else
   echo "임시 디스크 사용"
 fi
 
-step "config-server ($RELEASE, $IMAGE)"
-# 운영 릴리스 값($BASE, 사전 확인에서 읽음)에 스택마다 달라야 하는 값만 덮어쓴다.
-# 첫 설치가 실패한 릴리스는 upgrade가 받지 않을 수 있으므로 지우고 다시 설치한다.
-if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
-  helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
-fi
-helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" \
-  --set namespace="$NS" --set config.namespace="$NS" \
-  --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
-  --set service.nodePort="$CONFIG_NODEPORT" \
-  --set nfs.kubeSharePath="$STACK_KUBE_SHARE" \
-  --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
-  --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
-  --set accounts.sharedGidMin="$SHARED_GID_MIN" --set accounts.sharedGidMax="$SHARED_GID_MAX" \
-  --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
-  --set verifyMode="$VERIFY_MODE" --set faultInjection="$FAULT_INJECTION" \
-  --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
-  --set db.host=infra-mysql --set logDb.host=log-mysql \
-  --set imageStore.claimName= \
-  --set controller.enabled=true \
-  --set priorityClassName=ailab-stack-component \
-  --wait --timeout 10m
-if [ "$TOKEN_NEW" = 1 ] || [ "$KH_CHANGED" = 1 ]; then
-  # 토큰·호스트 키 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.
-  kubectl -n "$NS" rollout restart deployment/"$RELEASE" deployment/"$RELEASE-controller" >/dev/null
-  kubectl -n "$NS" rollout status deployment/"$RELEASE" --timeout=10m
-  kubectl -n "$NS" rollout status deployment/"$RELEASE-controller" --timeout=10m
-fi
-
 step "admin_be"
+# admin_be·프론트엔드는 적용만 하고, 준비 확인은 config-server를 올린 뒤 "롤아웃 대기"에서 한꺼번에 한다 —
+# 하나씩 기다리면 각자 뜨는 시간이 그대로 더해진다. admin_be는 기동할 때 config-server를 부르지 않는다.
 ADMIN_IMAGE=$BE_IMAGE
 # 운영 admin_be는 설정 파일을 이미지가 아니라 admin-prod-config Secret으로 받는다. 같은 파일을 복사해
 # 같은 위치에 넣고, 운영 자원을 가리키는 값만 아래 SPRING_APPLICATION_JSON으로 덮어쓴다.
@@ -443,10 +420,57 @@ fi
 render "$HERE/admin-be.yaml" | sed -e "s|__ADMIN_IMAGE__|$ADMIN_IMAGE|" -e "s|__CONFIG_HASH__|$CONFIG_HASH|" \
   | API_EGRESS="$API_EGRESS" awk '{ if (index($0, "__API_EGRESS__")) print ENVIRON["API_EGRESS"]; else print }' \
   | kubectl apply -f -
+echo "admin_be 이미지: ${ADMIN_IMAGE##*[@:]}"
+
+step "프론트엔드"
+if [ -n "$FE_IMAGE" ]; then
+  render "$HERE/admin-fe.yaml" | sed -e "s|__FE_IMAGE__|$FE_IMAGE|" -e "s|__FE_HOST__|$FE_HOST|" | kubectl apply -f -
+  if [ "$STACK" = "operation" ]; then
+    kubectl apply -f "$HERE/main-entry.yaml"
+  fi
+else
+  echo "프론트엔드 이미지가 없어 건너뜀"
+fi
+
+step "config-server ($RELEASE, $IMAGE)"
+# 위에서 적용만 해 둔 admin_be·프론트엔드가 뜨는 동안 config-server를 올린다. helm은 전처럼 준비될 때까지
+# 기다린다(--wait) — 제때 못 뜨면 릴리스가 failed로 남아 다음 배포가 지우고 다시 설치한다.
+# 운영 릴리스 값($BASE, 사전 확인에서 읽음)에 스택마다 달라야 하는 값만 덮어쓴다.
+# 첫 설치가 실패한 릴리스는 upgrade가 받지 않을 수 있으므로 지우고 다시 설치한다.
+if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
+  helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
+fi
+helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" \
+  --set namespace="$NS" --set config.namespace="$NS" \
+  --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
+  --set service.nodePort="$CONFIG_NODEPORT" \
+  --set nfs.kubeSharePath="$STACK_KUBE_SHARE" \
+  --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
+  --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
+  --set accounts.sharedGidMin="$SHARED_GID_MIN" --set accounts.sharedGidMax="$SHARED_GID_MAX" \
+  --set nodeport.min="$NP_MIN" --set nodeport.max="$NP_MAX" \
+  --set verifyMode="$VERIFY_MODE" --set faultInjection="$FAULT_INJECTION" \
+  --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
+  --set db.host=infra-mysql --set logDb.host=log-mysql \
+  --set imageStore.claimName= \
+  --set controller.enabled=true \
+  --set priorityClassName=ailab-stack-component \
+  --wait --timeout 10m
+if [ "$TOKEN_NEW" = 1 ] || [ "$KH_CHANGED" = 1 ]; then
+  # 토큰·호스트 키 Secret은 Pod 템플릿에 드러나지 않아 helm 업그레이드만으로는 새 값을 읽지 않는다.
+  kubectl -n "$NS" rollout restart deployment/"$RELEASE" deployment/"$RELEASE-controller" >/dev/null
+  kubectl -n "$NS" rollout status deployment/"$RELEASE" --timeout=10m
+  kubectl -n "$NS" rollout status deployment/"$RELEASE-controller" --timeout=10m
+fi
+
+step "롤아웃 대기 (admin_be·Redis·프론트엔드)"
+# config-server와 같이 뜨던 것들이라, 차례로 확인해도 걸리는 시간은 가장 느린 것 하나만큼이다.
 kubectl -n "$NS" rollout status deployment/admin-prod --timeout=10m
 kubectl -n "$NS" rollout status deployment/redis-bg-master --timeout=5m
 kubectl -n "$NS" rollout status deployment/admin-redis --timeout=5m
-echo "admin_be 이미지: ${ADMIN_IMAGE##*[@:]}"
+if [ -n "$FE_IMAGE" ]; then
+  kubectl -n "$NS" rollout status deployment/ailab-frontend --timeout=5m
+fi
 
 step "기준 데이터 확인 (스택 admin DB)"
 # 신청 화면에 필요한 서버·자원 그룹·노드·GPU·이미지와 메일 문구는 최초 1회 스택에 심어 두면 된다.
@@ -472,17 +496,6 @@ smy -e "UPDATE web_admin.container_image SET image_version = REGEXP_REPLACE(imag
   WHERE image_name LIKE '%dguailab/decs' AND image_version REGEXP '^${DECS_VARIANTS}\$'"
 smy -e "SELECT CONCAT(image_version, ' (', COUNT(*), ')') FROM web_admin.container_image
   WHERE image_name LIKE '%dguailab/decs' GROUP BY image_version ORDER BY image_version" | sed 's/^/  /'
-
-step "프론트엔드"
-if [ -n "$FE_IMAGE" ]; then
-  render "$HERE/admin-fe.yaml" | sed -e "s|__FE_IMAGE__|$FE_IMAGE|" -e "s|__FE_HOST__|$FE_HOST|" | kubectl apply -f -
-  kubectl -n "$NS" rollout status deployment/ailab-frontend --timeout=5m
-  if [ "$STACK" = "operation" ]; then
-    kubectl apply -f "$HERE/main-entry.yaml"
-  fi
-else
-  echo "프론트엔드 이미지가 없어 건너뜀"
-fi
 
 step "검증 (admin_be·프론트엔드 연결, 접두어 제한)"
 CS_POD=$(running_pod "$NS" app=containerssh-config-server)
