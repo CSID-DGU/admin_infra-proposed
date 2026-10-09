@@ -46,10 +46,16 @@ spec:
             - name: app-config
               mountPath: /app/config
               readOnly: true
+          # 뜨는 동안에는 2초마다 확인해 포트가 열리는 즉시 넘어간다(최대 320초 — 예전 준비 확인이 기다리던 만큼).
+          # 고정 지연(20초)을 두면 7초 만에 떠도 20초를 기다린다.
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 160
           readinessProbe:
             tcpSocket:
               port: 8080
-            initialDelaySeconds: 20
             periodSeconds: 5
             failureThreshold: 60
           # readiness보다 한참 느긋하게 잡는다 — 뜨는 중에 liveness가 먼저 죽이면 안 된다.
