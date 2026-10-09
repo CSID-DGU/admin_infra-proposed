@@ -158,7 +158,7 @@ cases:
       - approve: r1
       - wait: {r1: FULFILLED}
       - reset_password: a
-      - wait_password: {a: APPLIED}
+      - wait_password: {a: FULFILLED}
       - expect_password: {r1: changed}
 
   - id: C10
@@ -166,7 +166,7 @@ cases:
     steps:
       - user: a
       - reset_password: a
-      - wait_password: {a: APPLIED}
+      - wait_password: {a: FULFILLED}
       - expect_user: {a: {account: NONE, uid: none}}
 
   - id: C11

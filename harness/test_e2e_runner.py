@@ -148,14 +148,14 @@ def _fulfilled_cluster():
 
 
 PASSWORD_STEPS = [{"user": "a"}, {"apply": {"user": "a", "as": "r1"}}, {"reset_password": "a"},
-                  {"wait_password": {"a": "APPLIED"}}]
+                  {"wait_password": {"a": "FULFILLED"}}]
 
 
 def test_password_reset_passes_when_pod_and_record_agree_on_a_new_hash():
     cluster, api = _fulfilled_cluster(), FakeApi()
     recorded = iter(["OLD", "NEW"])
     cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", lambda _: [(next(recorded),)])
-    cluster.on(r"FROM password_reset_requests", [("APPLIED",)])
+    cluster.on(r"FROM password_reset_requests", [("FULFILLED",)])
     cluster.on(r"getent shadow", "NEW\n")
     run = make_run(cluster, api)
 
@@ -174,7 +174,7 @@ def test_password_reset_fails_when_the_pod_kept_the_old_hash():
     cluster = _fulfilled_cluster()
     recorded = iter(["OLD", "NEW"])
     cluster.on(r"SELECT IFNULL\(ubuntu_password_hash", lambda _: [(next(recorded),)])
-    cluster.on(r"FROM password_reset_requests", [("APPLIED",)])
+    cluster.on(r"FROM password_reset_requests", [("FULFILLED",)])
     cluster.on(r"getent shadow", "OLD\n")
 
     result = make_run(cluster, FakeApi()).run_case(
@@ -192,7 +192,7 @@ def test_password_reset_that_never_applies_is_a_failure():
     result = make_run(cluster, FakeApi()).run_case({"id": "C09", "steps": PASSWORD_STEPS}, allow_faults=False)
 
     assert result["result"] == "FAIL" and result["step"] == 4
-    assert "APPLIED" in result["error"] and "PENDING" in result["error"]
+    assert "FULFILLED" in result["error"] and "PENDING" in result["error"]
 
 
 def test_rejected_password_reset_must_leave_the_password_alone():
@@ -352,6 +352,9 @@ def test_resetter_deletes_password_reset_rows_before_users_only_where_the_table_
         deletes = next(c for c in cluster.calls if "START TRANSACTION" in c)
         if table_exists:
             assert deletes.index("DELETE FROM password_reset_requests") < deletes.index("DELETE FROM users")
-            assert "reviewed_by IN" in deletes
+            # 상태·검토자는 변경 요청(종류 PASSWORD, 대상 신청 없음)에 있다. 재설정 행이 그 요청을 가리키므로 뒤에 지운다.
+            password_changes = "DELETE FROM change_request WHERE request_id IS NULL"
+            assert deletes.index("DELETE FROM password_reset_requests") < deletes.index(password_changes)
+            assert deletes.index(password_changes) < deletes.index("DELETE FROM users")
         else:
             assert "password_reset_requests" not in deletes
