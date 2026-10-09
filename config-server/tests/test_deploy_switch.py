@@ -64,4 +64,14 @@ def test_only_operation_stack_writes_issuance_sheet():
     assert re.search(
         r'''\[ "\$STACK" = "operation" \] && ISSUANCE_SHEET_OVERRIDE=',"issuance-sheet":\{"enabled":true\}'$''',
         text, re.M)
-    assert '$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE,"prometheus"' in text
+    assert '$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE$SLACK_MEMBERSHIP_OVERRIDE,"prometheus"' in text
+
+
+def test_only_operation_stack_checks_slack_membership():
+    # admin_be 기본값이 꺼짐이라 켜는 쪽만 둔다. "slack" 묶음(SLACK_OVERRIDE)과 같은 키를 두 번 쓰지 않는다.
+    text = STACK_UP.read_text()
+    assert re.search(r"^SLACK_MEMBERSHIP_OVERRIDE=''$", text, re.M)
+    assert re.search(
+        r'''^\[ "\$STACK" = "operation" \] && SLACK_MEMBERSHIP_OVERRIDE=',"slack\.membership-check\.enabled":true'$''',
+        text, re.M)
+    assert len(re.findall(r"SLACK_MEMBERSHIP_OVERRIDE=", text)) == 2
