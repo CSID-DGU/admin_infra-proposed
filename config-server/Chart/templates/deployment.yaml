@@ -43,11 +43,18 @@ spec:
             - containerPort: 8000
           env:
             {{- include "containerssh-config-server.env" . | nindent 12 }}
+          # 뜨는 동안에는 2초마다 확인해 준비되는 즉시 넘어간다(최대 2분). 뜬 뒤의 확인 주기는 그대로다.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
