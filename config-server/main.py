@@ -24,7 +24,8 @@ from datetime import datetime
 from error import infra_error, k8s_error_fields
 from request_models import (validate_body, check_values, swagger_definitions, ProvisionRequest, RevokeRequest,
                             DeletePodRequest, MigrateRequest, GroupJobRequest,
-                            PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest, SHA512_CRYPT_RE)
+                            PasswordChangeRequest, HomeDeleteRequest, PortChangeRequest, AccessChangeRequest,
+                            SHA512_CRYPT_RE)
 from adapters.pod_status import (
     set_pod_creation_status, get_pod_creation_status,
     save_job_input, load_job_input, mark_job_running, mark_job_done, delete_job_input,
@@ -168,7 +169,8 @@ def _enforce_account_prefix():
     body = request.get_json(silent=True)
     if isinstance(body, dict):
         if request.path in ("/operations/migrate", "/operations/provision", "/operations/revoke",
-                            "/operations/password", "/operations/home", "/operations/port"):
+                            "/operations/password", "/operations/home", "/operations/port",
+                            "/operations/access"):
             names.append(body.get("username"))
         if request.path == "/operations/group":
             names.append(body.get("username"))
@@ -1148,6 +1150,7 @@ from lifecycle_steps.password import step_change_login_password, PASSWORD_CHANGE
 from lifecycle_steps.home import (  # noqa: E402
     step_delete_expired_home, step_restore_missing_home, HOME_DELETE_STEPS)
 from lifecycle_steps.port import step_change_ports, PORT_CHANGE_STEPS  # noqa: E402
+from lifecycle_steps.access import step_set_account_access, ACCESS_CHANGE_STEPS  # noqa: E402
 from lifecycle_steps.group import (  # noqa: E402
     step_group_create, step_group_add_member, step_group_remove_member, GROUP_STEPS, step_resolve_new_groups,
     check_create as check_group_create, check_add as check_group_add, check_remove as check_group_remove,
@@ -1163,6 +1166,12 @@ from application.jobs import (  # noqa: E402
     _observe_account_created, _observe_krb5_principal, _observe_pod_created,
     RESUME_JUDGES, _judge_interrupted_account, _account_missing_parts,
 )
+
+
+def _now_ms():
+    """작업 등록 시각. 접속 차단 여부를 정하는 작업(access·migrate·port)이 입력에 남겨, 다시 실행돼도 같은 값으로
+    결정의 순서를 견준다(lifecycle_steps/access.py)."""
+    return int(time.time() * 1000)
 
 
 def _register_job(kind, request_id, username, job):
@@ -1346,6 +1355,9 @@ def register_migrate(body: MigrateRequest):
            "recreate": bool(body.recreate), "keep_changes": body.keep_changes is not False}
     if body.min_improvement_ratio is not None:
         job["min_improvement_ratio"] = body.min_improvement_ratio
+    if body.access_blocked:
+        job["access_blocked"] = True
+    job["decided_at"] = _now_ms()
     return _register_job("migrate", body.request_id, body.username, job)
 
 
@@ -1432,7 +1444,40 @@ def register_port_change(body: PortChangeRequest):
     """
     job = {"username": body.username, "pod_name": body.pod_name,
            "ports": [p.model_dump() for p in body.ports]}
+    if body.access_blocked:
+        job["access_blocked"] = True
+    job["decided_at"] = _now_ms()
     return _register_job("port", body.request_id, body.username, job)
+
+
+@app.route("/operations/access", methods=["POST"])
+@validate_body(AccessChangeRequest)
+def register_access_change(body: AccessChangeRequest):
+    """
+    계정 접속 차단·해제 작업 등록
+
+    계정의 모든 Pod 의 모든 접속 포트(ssh·jupyter·추가 포트)를 막거나 푸는 작업을 등록하고 바로 202를 돌려준다.
+    Pod 와 외부 포트 배정은 건드리지 않는다 — Service 가 Pod 를 가리키지 않게만 바꾸므로, 풀면 같은 포트로
+    다시 접속된다. 계정에 Pod 가 없으면 할 일 없이 성공으로 끝난다. 이미 맞춰진 Service 는 그대로 두므로
+    실패한 작업은 다시 등록하면 이어서 끝난다. 더 나중에 등록된 작업이 이미 반대 상태로 맞춰 놓았으면 아무것도
+    바꾸지 않고 ACCESS_SUPERSEDED 실패로 끝난다.
+    결과는 GET /operations/access/<request_id>로 조회한다(result.services 는 대상 Service 수).
+    ---
+    tags:
+    - Operations
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/AccessChangeRequest'
+    responses:
+      202: {description: 등록됨}
+      400: {description: 입력 오류}
+      409: {description: 같은 번호의 접속 작업이 아직 끝나지 않음}
+    """
+    job = {"username": body.username, "blocked": body.blocked, "decided_at": _now_ms()}
+    return _register_job("access", body.request_id, body.username, job)
 
 
 @app.route("/operations/group", methods=["POST"])
@@ -1490,7 +1535,7 @@ def get_job_result(kind, request_id):
     tags:
     - Operations
     parameters:
-      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group, home, port]}
+      - {in: path, name: kind, required: true, type: string, enum: [provision, revoke, migrate, password, group, home, port, access]}
       - {in: path, name: request_id, required: true, type: string}
     responses:
       200: {description: 조회 성공}

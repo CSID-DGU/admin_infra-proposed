@@ -64,7 +64,7 @@ def cluster(monkeypatch):
             state.rows[p["internal_port"]] = (state.next_port, p["usage_purpose"], username)
             state.next_port += 1
 
-    def create(username, namespace, pod_name, ports):
+    def create(username, namespace, pod_name, ports, blocked=False, decided_at=0):
         if state.create_error:
             raise state.create_error
         for p in ports:
@@ -111,12 +111,14 @@ def _end(logs):
 
 # ---------- 작업 등록 ----------
 
-def test_registration_returns_202_with_prefixed_key(api, logs, store):
+def test_registration_returns_202_with_prefixed_key(api, logs, store, monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1760000000.123)
     r = api.post("/operations/port", json=_body([{"internal_port": 3000, "usage_purpose": "웹 서버"}]))
 
     assert r.status_code == 202
     assert r.get_json()["request_id"] == "7" and r.get_json()["status"] == "accepted"
-    job = {"username": "alice", "pod_name": POD, "ports": [{"internal_port": 3000, "usage_purpose": "웹 서버"}]}
+    job = {"username": "alice", "pod_name": POD, "ports": [{"internal_port": 3000, "usage_purpose": "웹 서버"}],
+           "decided_at": 1760000000123}
     assert store[("CHANGE_PORT", KEY)]["job"] == job
     assert len(logs) == 1 and logs[0]["request_id"] == KEY
     assert logs[0]["action"] == Action.CHANGE_PORT and logs[0]["phase"] == Phase.START

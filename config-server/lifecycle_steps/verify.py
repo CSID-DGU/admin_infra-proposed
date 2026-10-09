@@ -226,6 +226,9 @@ def step_verify_endpoint(ctx):
     """⑤ 외부 접속 경로 — 노드 내부 IP의 SSH NodePort에 TCP 접속해 SSH 배너를 확인한다.
     (실행 위치는 제어기. 배포 서버 발신 경로와의 동등성은 하네스의 독립 검증이 재확인한다)"""
     def check(ctx):
+        if ctx.get("access_blocked"):
+            # 접속이 차단된 계정의 Pod 는 포트를 막힌 채로 만든다 — 열려 있는지 볼 대상이 아니다.
+            return None, {"scope": "skip", "reason": "접속 차단 중"}
         node = _main._get_farm_node_info(ctx["node"])
         ssh_ports = [p["external_port"] for p in ctx.get("allocated_ports") or []
                      if p.get("usage_purpose") == "ssh"]
