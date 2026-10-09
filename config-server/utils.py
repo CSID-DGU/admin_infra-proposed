@@ -479,7 +479,7 @@ PURPOSE_ANNOTATION = "ailab.dgu/usage-purpose"
 # 접속이 차단된 계정의 Service 선택자에 붙이는 조건. 이 라벨은 어떤 Pod 에도 달지 않으므로 조건이 붙은 Service 는
 # 넘길 대상이 없어 외부 포트로 온 연결이 거절된다. Service 는 남으므로 외부 포트 배정은 그대로다.
 ACCESS_BLOCK_LABEL = "ailab.dgu/access-blocked"
-# 이 Service 의 차단 여부를 정한 작업이 등록된 시각(ms). 늦게 다시 실행된 옛 접속 작업이 그 뒤의 결정을 덮지 못하게
+# 이 Service 의 차단·해제를 정한 작업이 등록된 시각(ms). 늦게 다시 실행된 옛 접속 작업이 그 뒤의 결정을 덮지 못하게
 # 견주는 값이다(lifecycle_steps/access.py).
 ACCESS_DECIDED_AT_ANNOTATION = "ailab.dgu/access-decided-at"
 
@@ -502,7 +502,8 @@ def nodeport_service_body(username: str, namespace: str, pod_name: str, port_inf
 
     용도 원문은 주석(annotation)에 남기고, 라벨 값 규칙에 맞는 용도(ssh·jupyter 등)만 purpose 라벨로도 단다.
     포트 이름은 서비스마다 포트가 하나라 붙이지 않는다. blocked 면 접속이 차단된 계정의 Service 로 만든다.
-    decided_at 은 blocked 를 정한 작업의 등록 시각이다 — 있으면 주석으로 남긴다."""
+    decided_at 은 blocked 를 정한 작업의 등록 시각이다 — 막힌 채로 만들 때만 주석으로 남긴다(열린 Service 에 적힌
+    시각은 뒤따르는 차단을 물러나게 한다)."""
     internal_port = port_info["internal_port"]  # Pod 내부 포트
     external_port = port_info["external_port"]  # NodePort
     purpose = str(port_info.get("usage_purpose") or "custom")
@@ -512,7 +513,7 @@ def nodeport_service_body(username: str, namespace: str, pod_name: str, port_inf
         labels["purpose"] = purpose
 
     annotations = {PURPOSE_ANNOTATION: purpose}
-    if decided_at:
+    if blocked and decided_at:
         annotations[ACCESS_DECIDED_AT_ANNOTATION] = str(decided_at)
 
     return client.V1Service(

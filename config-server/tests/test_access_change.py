@@ -174,15 +174,36 @@ def test_rerun_of_the_same_job_changes_nothing(logs, store, cluster, saved):
 
 # ---------- 결정 순서 ----------
 
+def _superseded(logs, saved):
+    return ("ACCESS_SUPERSEDED" in {entry.get("error_code") for entry in logs}
+            and logs[-1]["phase"] != Phase.SUCCESS and ("CHANGE_ACCESS", KEY) not in saved)
+
+
+def _all_blocked(cluster):
+    return all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+
+
+def _all_open(cluster):
+    return all(BLOCK not in selector for selector in cluster.selectors.values())
+
+
 def test_older_unblock_rerun_after_a_newer_block_leaves_services_blocked(logs, store, cluster, saved):
     _run(store, blocked=True, decided_at=2000)
-    cluster.patched.clear()
+    cluster.patched.clear(), saved.clear()
 
     _run(store, blocked=False, decided_at=1000)
 
-    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
-    assert cluster.patched == []
-    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+    assert cluster.patched == [] and _all_blocked(cluster)
+    assert _superseded(logs, saved)
+
+
+def test_superseded_job_is_not_retried(logs, store, cluster, saved):
+    _run(store, blocked=True, decided_at=2000)
+    saved.clear()
+
+    _run(store, blocked=False, decided_at=1000)
+
+    assert Phase.RETRY not in {entry["phase"] for entry in logs}
 
 
 def test_older_unblock_cannot_pass_a_newer_block_that_had_nothing_to_change(logs, store, cluster, saved):
@@ -192,7 +213,7 @@ def test_older_unblock_cannot_pass_a_newer_block_that_had_nothing_to_change(logs
 
     _run(store, blocked=False, decided_at=1000)
 
-    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+    assert _all_blocked(cluster)
 
 
 def test_older_unblock_leaves_a_service_created_after_the_newer_block(logs, store, cluster, saved):
@@ -209,7 +230,48 @@ def test_newer_unblock_after_an_older_block_opens_the_services(logs, store, clus
 
     _run(store, blocked=False, decided_at=2000)
 
-    assert all(BLOCK not in selector for selector in cluster.selectors.values())
+    assert _all_open(cluster) and _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
+
+
+def test_older_block_rerun_after_a_newer_unblock_leaves_services_open(logs, store, cluster, saved):
+    _run(store, blocked=False, decided_at=2000)
+    saved.clear()
+
+    _run(store, blocked=True, decided_at=1000)
+
+    assert _all_open(cluster) and _superseded(logs, saved)
+
+
+def test_block_and_unblock_registered_at_the_same_instant_end_blocked(logs, store, cluster, saved):
+    _run(store, blocked=True, decided_at=1000)
+    _run(store, blocked=False, decided_at=1000)
+    assert _all_blocked(cluster)
+
+    for name in cluster.selectors:
+        cluster.selectors[name].pop(BLOCK)
+    _run(store, blocked=True, decided_at=1000)
+    assert _all_blocked(cluster)
+
+
+def test_block_is_not_held_back_by_a_service_created_blocked_after_it(logs, store, cluster, saved):
+    """차단이 등록된 뒤 포트 변경이 막힌 Service 를 만들어 더 나중 시각을 적어도, 나머지 Service 는 막는다."""
+    cluster.selectors["svc-new"] = {"pod_name": "ailab-alice-1", BLOCK: "true"}
+    cluster.annotations["svc-new"] = {access.DECIDED_AT_ANNOTATION: "3000"}
+
+    _run(store, blocked=True, decided_at=2000)
+
+    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
+    assert _all_blocked(cluster)
+    assert cluster.annotations["svc-new"][access.DECIDED_AT_ANNOTATION] == "3000"
+
+
+def test_block_is_not_held_back_by_an_open_service_without_a_decision_time(logs, store, cluster, saved):
+    _run(store, blocked=False, decided_at=1000)
+    cluster.selectors["svc-new"] = {"pod_name": "ailab-alice-1"}
+
+    _run(store, blocked=True, decided_at=2000)
+
+    assert _all_blocked(cluster)
 
 
 def test_service_changed_between_read_and_write_is_read_again(logs, store, cluster, saved):
@@ -225,9 +287,8 @@ def test_service_changed_between_read_and_write_is_read_again(logs, store, clust
 
     _run(store, blocked=False, decided_at=1000)
 
-    assert _end(logs) == (Action.CHANGE_ACCESS, Phase.SUCCESS, None)
-    assert cluster.patched == []
-    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+    assert cluster.patched == [] and _all_blocked(cluster)
+    assert _superseded(logs, saved)
 
 
 def test_job_registered_before_this_field_existed_still_applies(logs, store, cluster, saved):
@@ -235,7 +296,7 @@ def test_job_registered_before_this_field_existed_still_applies(logs, store, clu
     with main.app.app_context():
         main.run_job("access", KEY, "alice")
 
-    assert all(selector.get(BLOCK) == "true" for selector in cluster.selectors.values())
+    assert _all_blocked(cluster)
 
 
 def test_account_without_containers_succeeds(logs, store, cluster, saved):
@@ -301,6 +362,12 @@ def test_older_unblock_leaves_services_all_recreated_after_it(logs, store, clust
     _run(store, blocked=False, decided_at=1000)
 
     assert cluster.patched == [] and cluster.selectors["svc-new"][BLOCK] == "true"
+
+
+def test_service_created_open_carries_no_decision_time():
+    body = utils.nodeport_service_body("alice", "ns", "ailab-alice-1", _port(), decided_at=3000)
+
+    assert access.DECIDED_AT_ANNOTATION not in body.metadata.annotations
 
 
 def test_service_is_open_by_default():

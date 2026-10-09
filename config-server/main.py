@@ -1459,7 +1459,8 @@ def register_access_change(body: AccessChangeRequest):
     계정의 모든 Pod 의 모든 접속 포트(ssh·jupyter·추가 포트)를 막거나 푸는 작업을 등록하고 바로 202를 돌려준다.
     Pod 와 외부 포트 배정은 건드리지 않는다 — Service 가 Pod 를 가리키지 않게만 바꾸므로, 풀면 같은 포트로
     다시 접속된다. 계정에 Pod 가 없으면 할 일 없이 성공으로 끝난다. 이미 맞춰진 Service 는 그대로 두므로
-    실패한 작업은 다시 등록하면 이어서 끝난다.
+    실패한 작업은 다시 등록하면 이어서 끝난다. 더 나중에 등록된 작업이 이미 반대 상태로 맞춰 놓았으면 아무것도
+    바꾸지 않고 ACCESS_SUPERSEDED 실패로 끝난다.
     결과는 GET /operations/access/<request_id>로 조회한다(result.services 는 대상 Service 수).
     ---
     tags:
