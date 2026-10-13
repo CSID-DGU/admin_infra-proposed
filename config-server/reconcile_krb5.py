@@ -332,7 +332,7 @@ def sync_idmap_groups(names) -> None:
 
     이름 형식이 틀린 그룹은 보내지 않는다. 노드는 그런 이름이 하나라도 있으면 종료 코드 1을 내고,
     _farm_ssh 는 그때 표준출력을 버려서 같은 묶음의 다른 그룹 결과까지 볼 수 없게 된다."""
-    valid = sorted({n for n in names if _VALID_USERNAME_RE.match(n)})
+    valid = sorted({n for n in names if _VALID_USERNAME_RE.fullmatch(n)})
     invalid = sorted(set(names) - set(valid))
     if invalid:
         app.logger.warning(f"[IDMAP] 이름 형식이 맞지 않아 노드에 보내지 않음: {invalid}")

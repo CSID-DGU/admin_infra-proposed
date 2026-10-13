@@ -100,6 +100,13 @@ def test_revoke_needs_pod_or_account_target():
 _BAD_NAMES = ("Bob", "1abc", "a b", "a;id", "a:b", "a\nb", "../x", "$(id)", "a" * 33, "")
 
 
+def test_path_names_reject_a_trailing_newline():
+    """본문 이름은 검증 전에 앞뒤 공백을 잘라 내지만 경로로 받은 이름은 받은 그대로 쓰인다.
+    `$` 는 끝의 줄바꿈 앞에서도 맞으므로 전체가 규칙에 맞는지를 본다."""
+    assert rm.is_valid_unix_name("ab")
+    assert not rm.is_valid_unix_name("ab\n")
+
+
 @pytest.mark.parametrize("bad", _BAD_NAMES)
 @pytest.mark.parametrize("build", [
     lambda n: rm.ProvisionRequest(request_id="1", username=n),

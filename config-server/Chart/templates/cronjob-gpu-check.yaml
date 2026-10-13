@@ -24,7 +24,7 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: gpu-check
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: {{ include "containerssh-config-server.image" . | quote }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command: ["python", "check_gpu_pods.py"]
               env:

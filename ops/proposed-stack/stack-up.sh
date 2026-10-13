@@ -228,7 +228,8 @@ kubectl -n "$NS" create secret generic log-mysql-secret \
 
 step "SSH 호스트 키"
 # config-server가 farm·AD·NAS에 접속할 때 상대 서버를 확인하도록, 배포 서버에서 호스트 키를 모아 Secret으로 넣는다.
-# 주소가 공개 로그에 남지 않게 개수만 출력한다. 하나라도 받지 못하면 넣지 않는다(확인을 켜면 그 호스트 접속이 막힌다).
+# 주소가 공개 로그에 남지 않게 개수만 출력한다. 하나라도 받지 못하면 Secret을 바꾸지 않는다(빠진 호스트의 접속이 막힌다).
+# config-server는 호스트 키가 없으면 SSH 접속을 거절하므로, Secret이 아직 없는 첫 배포에서 수집에 실패하면 배포를 멈춘다.
 KH_CHANGED=0
 # 배포 서버에 PyYAML이 없어도 되도록 helm 값을 JSON으로 받아 표준 라이브러리로만 읽는다.
 # 목록을 못 만들면 배포를 멈추지 않고 이번에는 호스트 키 확인을 바꾸지 않는다.
@@ -252,8 +253,12 @@ if [ "$KH_ALL" -gt 0 ] && [ "$KH_OK" = "$KH_ALL" ]; then
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   [ "$OLD" = "$NEW" ] || KH_CHANGED=1
   echo "호스트 ${KH_ALL}개 키 수집, 호스트 키 확인 켬$([ "$KH_CHANGED" = 1 ] && echo " (변경됨)")"
+elif [ "$KH_ALL" = 0 ] || kubectl -n "$NS" get secret config-server-ssh-known-hosts >/dev/null 2>&1; then
+  echo "호스트 키를 ${KH_OK}/${KH_ALL}개만 받음 — 이번 배포에서는 이미 있는 호스트 키를 그대로 씀"
 else
-  echo "호스트 키를 ${KH_OK}/${KH_ALL}개만 받음 — 이번 배포에서는 호스트 키 확인을 바꾸지 않음"
+  rm -f "$KH_FILE"
+  echo "호스트 키를 ${KH_OK}/${KH_ALL}개만 받았고 이미 넣어 둔 호스트 키도 없음 — config-server가 farm·AD·NAS에 접속하지 못하므로 멈춤" >&2
+  exit 1
 fi
 rm -f "$KH_FILE"
 
@@ -569,7 +574,7 @@ if fe:
     settled("프론트엔드 응답", lambda: requests.get(f"{fe}/", timeout=10), lambda c: c == 200)
     # /api/는 nginx가 이 스택의 admin_be로 넘긴다. 502·504면 대상이 틀렸거나 닿지 않는 것이다.
     settled("프론트엔드 /api/ → 스택 admin_be",
-            # 내부 토큰이 필요한 설정 조회 대신 공개로 둔 이름 중복 확인으로 경로만 확인한다.
+            # admin_be까지 닿는지만 본다. 이름 중복 확인은 로그인이 필요해 401이 오지만, 502·503·504가 아니면 닿은 것이다.
             lambda: requests.get(f"{fe}/api/requests/config/check-username",
                                  params={"username": name}, timeout=10),
             lambda c: c not in (502, 503, 504))

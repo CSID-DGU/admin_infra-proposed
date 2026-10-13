@@ -37,7 +37,7 @@ spec:
       {{- end }}
       containers:
         - name: controller
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "containerssh-config-server.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python", "controller.py"]
           env:

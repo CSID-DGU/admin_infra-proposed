@@ -35,7 +35,7 @@ spec:
           {{- end }}
           containers:
             - name: krb5-reconcile
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: {{ include "containerssh-config-server.image" . | quote }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command: ["python", "reconcile_krb5.py"]
               # 배포본과 같은 환경변수·볼륨을 쓴다. NAS SSH 키와 /kube_share(계정 대장)가

@@ -48,11 +48,11 @@ _VALID_UNIX_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 def is_valid_unix_name(value: str) -> bool:
     """본문이 아닌 경로로 받은 사용자·그룹 이름을 같은 규칙으로 거를 때 쓴다."""
-    return bool(_VALID_UNIX_NAME_RE.match(value))
+    return bool(_VALID_UNIX_NAME_RE.fullmatch(value))
 
 
 def _unix_name(value: str) -> str:
-    if not _VALID_UNIX_NAME_RE.match(value):
+    if not _VALID_UNIX_NAME_RE.fullmatch(value):
         raise ValueError("이름은 [a-z_]로 시작하는 32자 이하의 소문자·숫자·_·- 여야 합니다")
     return value
 

@@ -40,7 +40,7 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
 - name: NODEPORT_MAX
   value: "{{ .Values.nodeport.max }}"
 - name: IMAGE_HELPER_IMAGE
-  value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  value: {{ include "containerssh-config-server.image" . | quote }}
 - name: VERIFY_MODE
   value: "{{ .Values.verifyMode }}"
 {{- if .Values.faultInjection }}
@@ -131,7 +131,7 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
   secret:
     secretName: farm-ad-ssh-key
     defaultMode: 0400
-# farm·AD·NAS 호스트 키(key: known_hosts). 없으면 호스트 키 확인이 꺼진다.
+# farm·AD·NAS 호스트 키(key: known_hosts). 없어도 Pod 는 뜨지만 config-server 가 SSH 접속을 거절한다.
 - name: ssh-known-hosts
   secret:
     secretName: "{{ .Values.sshKnownHosts.secretName }}"
@@ -150,4 +150,11 @@ API 서버(deployment.yaml)와 제어기(controller.yaml)가 공유하는 환경
 - name: krb5-conf
   configMap:
     name: krb5-conf
+{{- end -}}
+
+{{/*
+이미지 이름. 태그는 기본값을 두지 않는다 — latest 로 띄우면 Pod 가 다시 뜰 때마다 다른 이미지가 올 수 있다.
+*/}}
+{{- define "containerssh-config-server.image" -}}
+{{ .Values.image.repository }}:{{ required "image.tag 를 지정해야 합니다(예: --set image.tag=v3.3.69)" .Values.image.tag }}
 {{- end -}}

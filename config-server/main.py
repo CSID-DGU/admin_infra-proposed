@@ -45,6 +45,7 @@ from utils import (
     LockedFile, ledger_lock, get_node_gpu_score,
     read_issued_id_max, record_issued_id,
     ensure_etc_layout, ensure_sudoers_file, replace_file_atomically,
+    ssh_host_key_check_disabled,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -126,14 +127,15 @@ ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "")
 
 
 # 내부 API 토큰. config-server에는 사용자 인증이 없으므로 admin_be만 부르도록 공유 토큰을 요구한다.
-# 상태 확인과 진행 상황 조회(화면이 nginx를 거쳐 GET으로 부름), API 문서만 토큰 없이 연다.
+# 상태 확인(kubelet probe)만 토큰 없이 연다. 진행 상황 조회는 admin_be가 토큰을 붙여 부르고, API 문서는
+# 경로와 요청 형식이 그대로 드러나므로 토큰을 가진 쪽에만 보여 준다(Service가 NodePort라 노드 밖에서도 닿는다).
 # 토큰이 비어 있으면 나머지 요청을 모두 거절한다. Secret이 빠진 채 배포되면 계정·Pod API가 통째로
 # 열리던 것을 막기 위해서다. 로컬 개발에서만 CONFIG_API_AUTH_DISABLED=true로 검사를 끈다.
 API_TOKEN = os.getenv("CONFIG_API_TOKEN", "")
 API_AUTH_DISABLED = os.getenv("CONFIG_API_AUTH_DISABLED", "").lower() == "true"
 if not API_TOKEN and not API_AUTH_DISABLED:
     app.logger.error("[AUTH] CONFIG_API_TOKEN이 비어 있어 공개 경로 외 요청을 모두 거절합니다")
-_TOKEN_FREE_GET = re.compile(r"^/(health|requests/[^/]+/status|apispec_1\.json|apidocs/.*|flasgger_static/.*)$")
+_TOKEN_FREE_GET = re.compile(r"^/health$")
 
 
 def admin_be_headers():
@@ -595,8 +597,8 @@ def _pod_username(pod_name: str) -> str:
 
 # ---- SSH 호스트 키 ----
 # farm·AD·NAS 접속은 배포 때 수집한 호스트 키(known_hosts, Secret)로 상대 서버를 확인한다. 확인하지 않으면
-# 중간에 끼어든 서버가 keytab(deploy 입력)이나 계정 명령을 받아 갈 수 있다. 파일이 없는 환경(수집 전)은
-# 예전처럼 확인하지 않고 경고만 남긴다.
+# 중간에 끼어든 서버가 keytab(deploy 입력)이나 계정 명령을 받아 갈 수 있다. 파일이 없으면 접속을 거절한다 —
+# 수집 전 환경에서만 SSH_HOST_KEY_CHECK_DISABLED=true로 확인을 끈다.
 SSH_KNOWN_HOSTS_FILE = os.getenv("SSH_KNOWN_HOSTS_FILE", "/etc/ssh-known-hosts/known_hosts")
 
 
@@ -605,10 +607,13 @@ def _known_hosts_available() -> bool:
 
 
 def _ssh_host_key_options() -> list:
-    if _known_hosts_available():
-        return ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE}"]
-    app.logger.warning(f"[SSH] 호스트 키 파일이 없어 상대 서버를 확인하지 않음: {SSH_KNOWN_HOSTS_FILE}")
-    return ["-o", "StrictHostKeyChecking=no"]
+    if not _known_hosts_available():
+        if ssh_host_key_check_disabled():
+            app.logger.warning(f"[SSH] 호스트 키 확인이 꺼져 있어 상대 서버를 확인하지 않음: {SSH_KNOWN_HOSTS_FILE}")
+            return ["-o", "StrictHostKeyChecking=no"]
+        # 파일이 없는 채로 확인을 켜 두면 ssh가 모르는 호스트로 보고 접속을 거절한다.
+        app.logger.error(f"[SSH] 호스트 키 파일이 없어 접속을 거절함: {SSH_KNOWN_HOSTS_FILE}")
+    return ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS_FILE}"]
 
 
 # ---- Kerberos AD helpers ----

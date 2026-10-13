@@ -1075,40 +1075,78 @@ def ensure_sudoers_dir():
 
 
 def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
-    if not _VALID_USERNAME_RE.match(username):
+    if not _VALID_USERNAME_RE.fullmatch(username):
         raise ValueError(f"invalid username for sudoers: {username!r}")
 
     os.makedirs(sudoers_dir, exist_ok=True)
     target = os.path.join(sudoers_dir, username)
     lockfile = target + ".lock"
 
-    tmp = target + f".tmp.{os.getpid()}"
+    wanted = policy if policy.endswith("\n") else policy + "\n"
     with LockedFile(lockfile, "a+") as _:
-        if os.path.exists(target) and os.path.getsize(target) > 0:
+        # 내용이 같을 때만 그대로 둔다. 파일이 있다는 것만으로 건너뛰면 정책 문구를 바꿔 배포해도
+        # 이미 계정이 있는 사용자에게는 옛 정책이 계속 남는다.
+        if _read_text_or_none(target) == wanted:
             return target
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o440)
-        with os.fdopen(fd, "w") as tf:
-            tf.write(policy if policy.endswith("\n") else policy + "\n")
-        os.replace(tmp, target)
+        # 임시 파일 이름은 호출마다 다르게 한다. 이 잠금은 Pod 안에서만 통하고 pid 는 Pod 끼리 겹칠 수 있어,
+        # 이름을 pid 로 고정하면 다른 Pod 의 쓰기와 같은 임시 파일을 덮어쓴다.
+        fd, tmp = tempfile.mkstemp(dir=sudoers_dir, prefix=f".{username}.tmp.")
+        try:
+            with os.fdopen(fd, "w") as tf:
+                tf.write(wanted)
+                os.fchmod(tf.fileno(), 0o440)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
     return target
 
 
+def _read_text_or_none(path: str) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (FileNotFoundError, UnicodeDecodeError):
+        return None
+
+
 # TCP 연결에만 거는 한도다. 연결된 뒤의 명령 실행(홈 생성·조회)에는 걸리지 않는다 — paramiko 는 이 값을
-# connect() 에만 쓰고, 연결 뒤에는 소켓 시간 제한을 자기 값으로 바꾼다. 한도가 없으면 NAS 가 응답하지 않을 때
+# connect() 에만 쓰고, 연결 뒤에는 소켓 시간 제한을 자기 값으로 바꾼다(명령 실행 한도는 아래에 따로 둔다). 한도가 없으면 NAS 가 응답하지 않을 때
 # OS 기본값(약 130초)까지 기다려, 재시도 4번에 9분이 걸렸다(E2E F03 실측). farm·AD SSH 의 ConnectTimeout 과 같다.
 NAS_SSH_CONNECT_TIMEOUT_SEC = float(os.getenv("NAS_SSH_CONNECT_TIMEOUT_SEC", "10"))
+
+
+# 명령 하나가 끝나기를 기다리는 한도다. 한도가 없으면 NAS 가 연결만 받아 두고 응답하지 않을 때 끝없이 기다려
+# 작업을 맡은 제어기가 그 작업을 쥔 채 멈춘다. 홈 삭제는 홈 크기만큼 걸리므로 한도를 따로 길게 둔다.
+NAS_SSH_COMMAND_TIMEOUT_SEC = float(os.getenv("NAS_SSH_COMMAND_TIMEOUT_SEC", "120"))
+NAS_SSH_DELETE_TIMEOUT_SEC = float(os.getenv("NAS_SSH_DELETE_TIMEOUT_SEC", "3600"))
+
+
+class NasCommandTimeout(RuntimeError):
+    """NAS 명령이 한도 안에 끝나지 않은 경우. 명령이 NAS 에서 끝났는지는 알 수 없다."""
+
+
+def ssh_host_key_check_disabled() -> bool:
+    """호스트 키를 아직 수집하지 못한 환경에서만 켠다. 켜면 상대 서버를 확인하지 않고 접속한다."""
+    return os.getenv("SSH_HOST_KEY_CHECK_DISABLED", "").lower() == "true"
 
 
 def _nas_ssh_client():
     import paramiko
     ssh = paramiko.SSHClient()
-    # 배포 때 수집한 호스트 키가 있으면 그것만 믿는다(모르는 키면 접속 거절). 없으면 예전처럼 받아들인다.
+    # 배포 때 수집한 호스트 키만 믿는다(모르는 키면 접속 거절). 파일이 없어도 받아들이지 않는다 —
+    # 확인 없이 붙으면 중간에 끼어든 서버가 홈 생성·삭제 명령을 받아 간다.
     known_hosts = os.environ.get("SSH_KNOWN_HOSTS_FILE", "/etc/ssh-known-hosts/known_hosts")
     if os.path.isfile(known_hosts) and os.path.getsize(known_hosts) > 0:
         ssh.load_host_keys(known_hosts)
         ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
-    else:
+    elif ssh_host_key_check_disabled():
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
     ssh.connect(
         hostname=os.environ["NAS_SSH_HOST"],
         port=int(os.environ.get("NAS_SSH_PORT", "22")),
@@ -1119,9 +1157,18 @@ def _nas_ssh_client():
     return ssh
 
 
-def _ssh_run(ssh, cmd: str) -> None:
+def _ssh_exec(ssh, cmd: str, timeout: float):
+    """명령을 실행하고 (종료코드, 표준출력, 표준오류)를 돌려준다. 한도 안에 끝나지 않으면 채널을 닫고 멈춘다."""
     _, stdout, stderr = ssh.exec_command(cmd)
-    exit_code = stdout.channel.recv_exit_status()
+    channel = stdout.channel
+    if not channel.status_event.wait(timeout):
+        channel.close()
+        raise NasCommandTimeout(f"NAS SSH command did not finish in {timeout:g}s: {cmd}")
+    return channel.recv_exit_status(), stdout, stderr
+
+
+def _ssh_run(ssh, cmd: str, timeout: float = NAS_SSH_COMMAND_TIMEOUT_SEC) -> None:
+    exit_code, _, stderr = _ssh_exec(ssh, cmd, timeout)
     if exit_code != 0:
         raise RuntimeError(
             f"NAS SSH command failed (exit {exit_code}): {cmd}\n"
@@ -1132,8 +1179,7 @@ def _ssh_run(ssh, cmd: str) -> None:
 def _ssh_capture(ssh, cmd: str) -> tuple:
     """실패를 예외로 올리지 않고 (종료코드, 표준출력)을 그대로 돌려준다. 대상이 없을 때의
     0이 아닌 종료코드를 정상 흐름으로 다뤄야 하는 조회에 쓴다."""
-    _, stdout, _ = ssh.exec_command(cmd)
-    exit_code = stdout.channel.recv_exit_status()
+    exit_code, stdout, _ = _ssh_exec(ssh, cmd, NAS_SSH_COMMAND_TIMEOUT_SEC)
     return exit_code, stdout.read().decode(errors="replace").strip()
 
 
@@ -1152,7 +1198,7 @@ def _user_home_path(username: str) -> str:
     """홈 경로를 만들기 전에 이름부터 검증한다. 이 경로는 원격 셸 명령에 그대로 들어가고 그중 하나는
     되돌릴 수 없는 삭제다 — 이름에 공백이나 셸 특수문자가 섞이면 의도하지 않은 대상을 지울 수 있다.
     이름은 admin_be가 만들고 내부 토큰으로 보호되지만, 지우는 쪽에 방어를 두는 편이 맞다."""
-    if not _VALID_USERNAME_RE.match(username):
+    if not _VALID_USERNAME_RE.fullmatch(username):
         raise ValueError(f"invalid username for home directory: {username!r}")
     # 예전 팀 디렉터리(/home/_g_<팀>)가 같은 자리에 남아 있다. 이 접두어는 홈으로 쓰지 않는다 — 지우는 경로가 팀 데이터를 지운다.
     if username.startswith(TEAM_DIR_PREFIX):
@@ -1254,7 +1300,7 @@ def nas_shared_gids_for_users(usernames, gid_min: int, gid_max) -> dict:
     이름이 AD 에 없으면(레거시 계정 등) `id` 가 실패한다. 그런 사용자는 결과에서 빠지므로
     호출자가 "모름"과 "그룹 없음"을 구분할 수 있다. 유닉스 이름 규칙에 맞지 않는 이름도
     NAS 에 묻지 않고 같은 식으로 뺀다."""
-    names = sorted(u for u in usernames if _VALID_USERNAME_RE.match(u))
+    names = sorted(u for u in usernames if _VALID_USERNAME_RE.fullmatch(u))
     if not names:
         return {}
     out = {}
@@ -1295,7 +1341,7 @@ def delete_user_home_directory(username: str) -> None:
     path = _user_home_path(username)
     app.logger.info(f"[NAS SSH] deleting home dir {path}")
     with _nas_ssh_client() as ssh:
-        _ssh_run(ssh, f"sudo rm -rf {shlex.quote(path)}")
+        _ssh_run(ssh, f"sudo rm -rf {shlex.quote(path)}", timeout=NAS_SSH_DELETE_TIMEOUT_SEC)
 
 
 def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:

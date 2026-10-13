@@ -1,7 +1,8 @@
+# tag 는 배포할 때 반드시 지정한다(비우면 렌더링이 실패한다). 태그가 고정이므로 노드에 있는 이미지를 그대로 쓴다.
 image:
   repository: dguailab/config-server
-  tag: latest
-  pullPolicy: Always
+  tag: ""
+  pullPolicy: IfNotPresent
 
 service:
   type: NodePort
@@ -137,6 +138,6 @@ controller:
 apiToken:
   secretName: config-server-api-token
 
-# farm·AD·NAS SSH 호스트 키 Secret(key: known_hosts). 없으면 호스트 키를 확인하지 않는다.
+# farm·AD·NAS SSH 호스트 키 Secret(key: known_hosts). 없으면 config-server 가 SSH 접속을 거절한다.
 sshKnownHosts:
   secretName: config-server-ssh-known-hosts
