@@ -50,6 +50,9 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
     동기화 방향: k8s -> MySQL  (k8s가 단일 진실 소스)
         - k8s에 실제 존재하는 NodePort Service의 pod_name 목록 조회.
         - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단해 삭제.
+        - 단, 행은 Service보다 먼저 들어간다(Pod 준비 대기 최대 POD_READY_MAX_WAIT_SEC).
+          그 사이의 행은 "Service 없는 행"이지만 stale이 아니므로, 가장 최근 행이
+          _NODEPORT_STALE_GRACE_SEC 보다 오래된 pod_name만 지운다.
 
     Args:
         namespace: NodePort Service가 존재하는 k8s 네임스페이스
@@ -103,9 +106,15 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT pod_name FROM nodeport_allocations")
+            # 나이는 created_at을 찍은 DB 시계(NOW())로 잰다. 쓰로틀은 프로세스마다 따로 돌아
+            # 다른 워커가 방금 넣은 행을 가려 주지 못한다.
+            cur.execute(
+                "SELECT pod_name FROM nodeport_allocations GROUP BY pod_name "
+                "HAVING MAX(created_at) IS NULL OR MAX(created_at) < NOW() - INTERVAL %s SECOND",
+                (_main._NODEPORT_STALE_GRACE_SEC,)
+            )
             db_pod_names = {row[0] for row in cur.fetchall()}
-            _main.app.logger.debug(f"[RECONCILE] pods in MySQL: {db_pod_names}")
+            _main.app.logger.debug(f"[RECONCILE] pods in MySQL past grace: {db_pod_names}")
 
             # k8s에는 없지만 MySQL에는 남아있는 stale pod_name 계산
             stale_pod_names = db_pod_names - live_pod_names
@@ -169,7 +178,7 @@ def allocate_nodeports(username, pod_name, node_name, ports):
 
     # 포트 할당 전에 MySQL과 k8s 실제 상태를 동기화한다.
     # stale 행이 정리되어야 available 포트 계산이 정확해짐/
-    # 5분 쓰로틀 적용 — in-flight pod 오탐 방지 및 k8s/DB 부하 줄어듬
+    # 5분 쓰로틀 적용 — k8s/DB 부하 줄어듬. in-flight pod 보호는 행 나이 조건이 맡는다.
     _main.reconcile_nodeport_allocations(namespace=_main.app.config["NAMESPACE"])
 
     conn = _main.get_db_connection() #DB 연결
