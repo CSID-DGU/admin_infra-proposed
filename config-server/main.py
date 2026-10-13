@@ -405,9 +405,12 @@ def _fail_phase(e):
 
 # reconcile 쓰로틀: 마지막 실행 시각(Unix timestamp). 앱 시작 시 0으로 초기화.
 _last_reconcile_ts: float = 0.0
-# 최소 실행 간격(초). allocate_nodeports() 호출 시 in-flight pod 오탐을 방지하기 위해
-# 5분 간격으로 제한한다. (allocate -> Service 생성까지 통상 30초 이내이므로 충분한 여유)
+# 최소 실행 간격(초). k8s·DB 조회 부하를 줄이는 용도다. 프로세스마다 따로 세므로
+# in-flight pod 보호 수단이 아니다(그건 아래 _NODEPORT_STALE_GRACE_SEC).
 _RECONCILE_INTERVAL_SEC: int = 300
+# 배정 행을 stale로 볼 최소 나이(초). 행 삽입 → Service 생성 사이에 Pod 준비 대기
+# (POD_READY_MAX_WAIT_SEC=500)가 끼므로 그보다 넉넉히 길어야 한다.
+_NODEPORT_STALE_GRACE_SEC: int = 900
 
 
 
