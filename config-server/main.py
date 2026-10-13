@@ -44,7 +44,7 @@ from utils import (
     get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, ledger_lock, get_node_gpu_score,
     read_issued_id_max, record_issued_id,
-    ensure_etc_layout, ensure_sudoers_file,
+    ensure_etc_layout, ensure_sudoers_file, replace_file_atomically,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -1026,9 +1026,7 @@ def set_ledger_password(username: str, passwd_hash: str):
                 old_hash = rec["passwd"]
                 rec["passwd"], rec["lastchg"] = passwd_hash, int(time.time() // 86400)
                 sh_lines[i] = format_shadow_entry(rec)
-                f.seek(0)
-                f.write("\n".join(sh_lines) + "\n")
-                f.truncate()
+                replace_file_atomically(app.config["SHADOW_PATH"], "\n".join(sh_lines) + "\n")
                 return old_hash
     return None
 
