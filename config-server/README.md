@@ -109,7 +109,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 사용자 Pod 내부 포트와 외부 NodePort를 연결하기 위해 MySQL `nodeport_allocations` table에 포트 점유 정보를 저장한다. 입력은 username, pod name, node name, 내부 포트 목록이다.
 
-처음에는 `reconcile_nodeport_allocations()`를 호출해 MySQL에는 남아 있지만 Kubernetes에는 Service가 없는 stale allocation을 정리한다. 이 reconcile은 5분 throttle이 걸려 있어 매 요청마다 Kubernetes와 DB를 과하게 스캔하지 않는다.
+처음에는 `reconcile_nodeport_allocations()`를 호출해 MySQL에는 남아 있지만 Kubernetes에는 Service가 없는 stale allocation을 정리한다. 이 reconcile은 5분 throttle이 걸려 있어 매 요청마다 Kubernetes와 DB를 과하게 스캔하지 않는다. Service보다 행이 먼저 들어가므로, 생성 중인 Pod의 행을 지우지 않도록 가장 최근 행이 15분(`_NODEPORT_STALE_GRACE_SEC`)보다 오래된 Pod만 정리한다.
 
 그 다음 MySQL transaction에서 `SELECT node_port FROM nodeport_allocations FOR UPDATE`를 실행해 현재 사용 중인 포트를 row lock으로 잡는다. 사용 가능한 범위는 30000부터 32767까지이고, 요청 포트 수만큼 비어 있는 포트를 골라 insert한다. 모든 insert가 끝나면 commit하고, 실패하면 rollback한다.
 

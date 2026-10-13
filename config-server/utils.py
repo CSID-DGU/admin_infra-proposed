@@ -1,5 +1,6 @@
 import os
 import posixpath
+import stat
 import tempfile
 import json
 import subprocess
@@ -825,6 +826,36 @@ def ensure_file(path: str) -> None:
             pass
 
 
+def replace_file_atomically(path: str, content: str) -> None:
+    """path 의 내용을 content 로 통째로 바꾼다. 같은 디렉터리의 임시 파일에 다 쓰고 디스크에 내린 뒤
+    os.replace 로 바꿔 끼우므로, 쓰는 도중 프로세스가 죽거나 NFS 가 끊겨도 path 에는 옛 내용이나 새 내용
+    하나만 온전히 남는다. 제자리에서 덮어쓰면(seek·write·truncate) 그 사이에 죽을 때 줄이 잘린 파일이 남는다.
+
+    권한과 소유자는 기존 파일 것을 잇는다(없던 파일은 0644). 임시 파일 이름은 호출마다 다르다 — 이름을
+    고정하면 겹친 두 쓰기가 같은 임시 파일을 서로 덮어쓴다."""
+    try:
+        before = os.stat(path)
+    except FileNotFoundError:
+        before = None
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=os.path.basename(path) + ".tmp.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fchmod(f.fileno(), stat.S_IMODE(before.st_mode) if before else 0o644)
+            created = os.fstat(f.fileno())
+            if before and (before.st_uid, before.st_gid) != (created.st_uid, created.st_gid):
+                os.fchown(f.fileno(), before.st_uid, before.st_gid)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def ensure_seeded_file(path: str, template_name: str) -> None:
     d = os.path.dirname(path)
     if d:
@@ -850,9 +881,7 @@ def ensure_seeded_file(path: str, template_name: str) -> None:
                     with open(template_path, "r", encoding="utf-8") as tf:
                         content = tf.read()
 
-                    f.seek(0)
-                    f.write(content)
-                    f.truncate()
+                    replace_file_atomically(path, content)
                     app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
             finally:
                 fcntl.lockf(lock_f.fileno(), fcntl.LOCK_UN)
@@ -912,13 +941,7 @@ def record_issued_id(kind: str, value: int) -> None:
         if value <= data.get(kind, 0):
             return
         data[kind] = int(value)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file_atomically(path, json.dumps(data, sort_keys=True) + "\n")
 
 # ---- /etc/passwd & /etc/group parsing ----
 PASSWD_FIELDS = ["name","passwd","uid","gid","gecos","home","shell"]
@@ -938,9 +961,7 @@ def write_passwd_lines(lines: List[str]) -> None:
     ensure_etc_layout()
     with ledger_lock(), LockedFile(app.config["PASSWD_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
-        f.seek(0)
-        f.write(content)
-        f.truncate()
+        replace_file_atomically(app.config["PASSWD_PATH"], content)
 
 
 def read_group_lines() -> List[str]:
@@ -953,9 +974,7 @@ def write_group_lines(lines: List[str]) -> None:
     ensure_etc_layout()
     with ledger_lock(), LockedFile(app.config["GROUP_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
-        f.seek(0)
-        f.write(content)
-        f.truncate()
+        replace_file_atomically(app.config["GROUP_PATH"], content)
 
 
 def parse_passwd_line(line: str) -> Optional[dict]:
@@ -1018,9 +1037,7 @@ def write_shadow_lines(lines: List[str]) -> None:
     ensure_etc_layout()
     with ledger_lock(), LockedFile(app.config["SHADOW_PATH"], "r+") as f:
         content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
-        f.seek(0)
-        f.write(content)
-        f.truncate()
+        replace_file_atomically(app.config["SHADOW_PATH"], content)
 
 
 def parse_shadow_line(line: str) -> Optional[dict]:
