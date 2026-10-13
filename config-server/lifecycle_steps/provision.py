@@ -1211,6 +1211,11 @@ def build_pod_spec(
                                         **({"priorityClassName": _main.app.config["POD_PRIORITY_CLASS"]}
                                            if _main.app.config["POD_PRIORITY_CLASS"] else {}),
                                         "tolerations": NODE_OUTAGE_TOLERATIONS,
+                                        # 사용자 컨테이너는 Kubernetes API를 부를 일이 없다. 서비스 계정 토큰을
+                                        # 넣지 않고, 같은 네임스페이스 Service들의 주소(admin_be·DB·Redis)를
+                                        # 환경 변수로 알려 주지도 않는다.
+                                        "automountServiceAccountToken": False,
+                                        "enableServiceLinks": False,
                                         "containers": [
                                             {
                                                 "name": "shell",

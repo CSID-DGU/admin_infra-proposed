@@ -26,13 +26,17 @@ def test_right_token_reaches_the_route(client):
     assert r.status_code == 400   # 토큰은 통과하고 본문 검증에서 걸린다
 
 
-def test_health_and_api_docs_stay_open(client):
+def test_only_health_stays_open(client):
     assert client.get("/health").status_code == 200
-    assert client.get("/apispec_1.json").status_code == 200
+    assert client.get("/healthz").status_code == 401   # 앞부분만 같은 경로는 열지 않는다
 
 
-def test_status_route_is_open_only_for_get(client):
-    assert client.post("/requests/1/status").status_code == 401
+@pytest.mark.parametrize("path", ["/apispec_1.json", "/apidocs/", "/flasgger_static/swagger-ui.css",
+                                  "/requests/1/status"])
+def test_api_docs_and_status_need_the_token(client, path):
+    """Service가 NodePort라 노드 밖에서도 닿는다. 경로·요청 형식(API 문서)과 신청 진행 상황은 토큰을 가진 쪽에만 준다."""
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={"X-Internal-Token": "s3cret"}).status_code != 401
 
 
 def test_missing_token_config_rejects_instead_of_opening(monkeypatch):

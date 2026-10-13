@@ -18,10 +18,10 @@ admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 �
 
 ## API 문서 및 모니터링
 
-서버가 정상적으로 실행 중일 때, 아래 주소에서 API 명세(Swagger)를 확인할 수 있습니다.
+상태 확인만 토큰 없이 열려 있습니다. API 명세(Swagger)는 내부 API 토큰(`X-Internal-Token`)을 붙여야 받을 수 있습니다.
 
-* **Swagger UI**: `http://{farm_server_ip}:9732/apidocs/`
 * **Health Check**: `http://{farm_server_ip}:9732/health`
+* **API 명세(JSON)**: `curl -H "X-Internal-Token: $TOKEN" http://{farm_server_ip}:9732/apispec_1.json`
 
 > **참고**: NodePort는 `values.yaml` 설정에 따라 **9732**번 포트를 사용합니다.
 

@@ -551,6 +551,18 @@ def test_pod_gets_priority_class(env):
     assert pod.body["spec"]["priorityClassName"] == main.app.config["POD_PRIORITY_CLASS"]
 
 
+def test_user_pod_gets_no_cluster_credentials_or_service_addresses(env):
+    """사용자 컨테이너에는 서비스 계정 토큰도, 같은 네임스페이스 Service 주소(admin_be·DB·Redis)도 넣지 않는다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "116", "username": "exp-np-nosa",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    spec = next(p for p in e.v1.pods.values() if "exp-np-nosa" in p.metadata.name).body["spec"]
+    assert spec["automountServiceAccountToken"] is False
+    assert spec["enableServiceLinks"] is False
+
+
 def test_pod_survives_node_outage(env):
     """노드가 5분 넘게 꺼져 있으면 쿠버네티스가 Pod를 지우고, 멈춘 컨테이너의 변경분도 같이 사라진다.
     노드 응답 없음을 유예 없이 견뎌야 노드가 돌아온 뒤 같은 노드에서 변경분을 살려 다시 만들 수 있다."""

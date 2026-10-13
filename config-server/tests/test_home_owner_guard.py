@@ -3,6 +3,8 @@
 NAS 가 Kerberos 주체를 푸는 값과 계정 대장의 uid 가 어긋날 수 있다. 구 운영에서 넘어온 계정이
 그런 경우이고, 그대로 chown 하면 사용자가 자기 홈을 잃는다(2026-09-19 yoon6yo 사례).
 """
+import threading
+
 import paramiko
 import pytest
 
@@ -11,11 +13,20 @@ import utils
 
 
 class _Chan:
-    def __init__(self, code):
+    """명령이 곧바로 끝난 채널. finished=False 면 끝나지 않는 명령을 흉내 낸다."""
+
+    def __init__(self, code, finished=True):
         self._code = code
+        self.status_event = threading.Event()
+        if finished:
+            self.status_event.set()
+        self.closed = False
 
     def recv_exit_status(self):
         return self._code
+
+    def close(self):
+        self.closed = True
 
 
 class _Out:
@@ -206,3 +217,47 @@ def test_home_path_refuses_the_team_prefix(nas):
     with pytest.raises(ValueError):
         utils.delete_user_home_directory("_g_teamx")
     assert fake.ran == []
+
+
+class _HangingSSH:
+    """명령을 받기만 하고 끝내지 않는 NAS."""
+
+    def __init__(self):
+        self.out = _Out(0)
+        self.out.channel = _Chan(0, finished=False)
+        self.cmds = []
+
+    def exec_command(self, cmd):
+        self.cmds.append(cmd)
+        return None, self.out, _Out(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_command_that_never_finishes_is_cut_off(nas, monkeypatch):
+    """NAS 가 연결만 받고 응답하지 않으면 한도에서 멈춘다. 끝없이 기다리면 제어기가 그 작업을 쥔 채 선다."""
+    fake = _HangingSSH()
+    monkeypatch.setattr(utils, "_nas_ssh_client", lambda: fake)
+    monkeypatch.setattr(utils, "NAS_SSH_COMMAND_TIMEOUT_SEC", 0.01)
+    with main.app.app_context(), pytest.raises(utils.NasCommandTimeout):
+        utils.home_root_is_reachable()
+    assert fake.out.channel.closed
+
+
+def test_home_delete_waits_longer_than_other_commands(nas, monkeypatch):
+    """홈 삭제는 홈 크기만큼 걸리므로 조회·생성과 같은 한도로 끊지 않는다."""
+    seen = {}
+
+    def fake_exec(ssh, cmd, timeout):
+        seen["timeout"] = timeout
+        return 0, _Out(0), _Out(0)
+
+    monkeypatch.setattr(utils, "_nas_ssh_client", lambda: _HangingSSH())
+    monkeypatch.setattr(utils, "_ssh_exec", fake_exec)
+    with main.app.app_context():
+        utils.delete_user_home_directory("someone")
+    assert seen["timeout"] == utils.NAS_SSH_DELETE_TIMEOUT_SEC > utils.NAS_SSH_COMMAND_TIMEOUT_SEC
