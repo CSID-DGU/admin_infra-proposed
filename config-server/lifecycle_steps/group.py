@@ -125,9 +125,7 @@ def _shared_group_gid(name, username):
             _main.app.logger.exception("[ACCOUNTS] gid 발급 기록 실패로 그룹 생성 중단: %s(%s)", name, gid)
             raise _failed("ADD_GROUP", "ISSUED_ID_RECORD_FAILED", "cannot record issued gid", 500, cause=e)
         lines.append(_main.format_group_entry({"name": name, "passwd": "x", "gid": gid, "members": []}))
-        f.seek(0)
-        f.write("\n".join(lines) + "\n")
-        f.truncate()
+        _main.replace_file_atomically(_main.app.config["GROUP_PATH"], "\n".join(lines) + "\n")
     _main.app.logger.info("[ACCOUNTS] 새 공유 그룹 gid 발급: %s(%s)", name, gid)
     return gid
 
@@ -198,9 +196,7 @@ def _write_group_line(name, gid, members):
         lines = [entry if r and r["name"] == name else line for r, line in zip(records, lines)]
         if not existing:
             lines.append(entry)
-        f.seek(0)
-        f.write("\n".join(lines) + "\n")
-        f.truncate()
+        _main.replace_file_atomically(_main.app.config["GROUP_PATH"], "\n".join(lines) + "\n")
     return gid
 
 

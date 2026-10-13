@@ -1587,10 +1587,7 @@ def step_create_account(ctx):
                 "shell": "/bin/bash",
             }
             lines.append(_main.format_passwd_entry(entry))
-            new_content = "\n".join(lines) + "\n"
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
+            _main.replace_file_atomically(_main.app.config["PASSWD_PATH"], "\n".join(lines) + "\n")
     except (_main.StepFailed, LeaseLost):
         raise
     except Exception as e:
@@ -1644,10 +1641,7 @@ def step_create_account(ctx):
                     g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
                 added_supp.append({"name": sg_name, "gid": sg_gid})
 
-            new_content = "\n".join(g_lines) + "\n"
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
+            _main.replace_file_atomically(_main.app.config["GROUP_PATH"], "\n".join(g_lines) + "\n")
     except Exception as e:
         _main.app.logger.exception("[ACCOUNTS] group write failed for user=%s, rolling back", name)
         _main.log_operation(request_id=request_id, username=name, resource_type="account",
@@ -1842,10 +1836,7 @@ def step_add_user_groups(ctx):
                     g_lines.append(_main.format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [username]}))
                 added_supp.append({"name": sg_name, "gid": sg_gid})
             
-            new_content = "\n".join(g_lines) + "\n"
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
+            _main.replace_file_atomically(_main.app.config["GROUP_PATH"], "\n".join(g_lines) + "\n")
         
         _main.log_operation(request_id=request_id, username=username, resource_type="groups",
                       action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
