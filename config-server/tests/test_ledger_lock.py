@@ -125,3 +125,57 @@ def test_group_membership_rereads_under_lock(etc):
         main._set_group_membership(["team"], "alice", member=False)
         lines = main.read_group_lines()
     assert "team:x:30001:" in lines and "late:x:30003:bob" in lines and "other:x:30002:" in lines
+
+
+@pytest.fixture
+def seed(tmp_path, monkeypatch):
+    """템플릿 하나와 빈 대상 경로, 원장 잠금을 잡은 횟수를 돌려준다."""
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    (templates / "passwd").write_text("root:x:0:0::/root:/bin/bash\n")
+    monkeypatch.setitem(main.app.config, "BASE_ETC_TEMPLATE_DIR", str(templates))
+    taken = []
+    real_acquire = utils._acquire_ledger_lock
+
+    def acquire():
+        taken.append(1)
+        return real_acquire()
+
+    monkeypatch.setattr(utils, "_acquire_ledger_lock", acquire)
+    with main.app.app_context():
+        yield tmp_path / "seeded" / "passwd", taken
+
+
+def test_seed_fills_empty_file_inside_ledger_lock(seed):
+    path, taken = seed
+
+    utils.ensure_seeded_file(str(path), "passwd")
+
+    assert path.read_text() == "root:x:0:0::/root:/bin/bash\n"
+    assert len(taken) == 1
+
+
+def test_seed_skips_ledger_lock_when_file_has_content(seed):
+    path, taken = seed
+    path.parent.mkdir()
+    path.write_text("alice:x:55000:55000::/home/alice:/bin/bash\n")
+
+    utils.ensure_seeded_file(str(path), "passwd")
+
+    assert path.read_text() == "alice:x:55000:55000::/home/alice:/bin/bash\n"
+    assert taken == []
+
+
+def test_seed_keeps_what_another_pod_wrote_while_waiting_for_ledger_lock(seed, monkeypatch):
+    path, taken = seed
+    real_acquire = utils._acquire_ledger_lock
+
+    def acquire_after_other_pod_writes():
+        path.write_text("alice:x:55000:55000::/home/alice:/bin/bash\n")
+        return real_acquire()
+
+    monkeypatch.setattr(utils, "_acquire_ledger_lock", acquire_after_other_pod_writes)
+
+    utils.ensure_seeded_file(str(path), "passwd")
+
+    assert path.read_text() == "alice:x:55000:55000::/home/alice:/bin/bash\n"
