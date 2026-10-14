@@ -856,16 +856,29 @@ def replace_file_atomically(path: str, content: str) -> None:
         raise
 
 
+def _has_content(path: str) -> bool:
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def ensure_seeded_file(path: str, template_name: str) -> None:
+    """빈 파일이면 템플릿으로 채운다. 원장을 읽고 쓸 때마다 불리므로 내용이 있으면 잠금 없이 바로 돌아간다.
+
+    채우는 쪽은 원장 잠금 안에서 다시 확인한다 — 로컬(/tmp) 락은 같은 Pod 안에서만 통해서, 새 스택 첫 기동 때
+    다른 Pod 가 방금 쓴 원장을 템플릿으로 덮어쓸 수 있다. 잠금 순서는 다른 원장 쓰기와 같다(원장 잠금 → 로컬 락)."""
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
 
+    if _has_content(path):
+        return
+
     template_dir = app.config.get("BASE_ETC_TEMPLATE_DIR", DEFAULT_BASE_ETC_TEMPLATE_DIR)
     template_path = os.path.join(template_dir, template_name)
 
-    thread_lock = _thread_lock_for_path(path)
-    with thread_lock:
+    with ledger_lock(), _thread_lock_for_path(path):
         with open(_local_lockfile_path(path), "a+") as lock_f:
             fcntl.lockf(lock_f.fileno(), fcntl.LOCK_EX)
             try:
