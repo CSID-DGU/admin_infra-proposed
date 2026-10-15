@@ -97,5 +97,15 @@ def test_every_error_code_is_covered_tested_or_waived(data):
     assert codes - case_codes - tested - waived == set(), "시험도 사례도 면제도 없는 오류 코드"
 
 
+def test_retry_dependent_cases_are_limited_to_modes_that_retry(data):
+    modes = {c["id"]: c.get("modes") for c in data["cases"]}
+    assert all(modes[cid] == ["noprobe", "full"] for cid in ("F03", "F04", "F06", "F07"))
+
+
+def test_unknown_mode_is_rejected():
+    with pytest.raises(catalog.CatalogError):
+        catalog.validate({"cases": [{"id": "X", "modes": ["operation"], "steps": []}]})
+
+
 def test_fault_cases_are_detected(data):
     assert {c["id"] for c in data["cases"] if catalog.is_fault_case(c)} >= {"F01", "F02", "F03", "F04", "F05"}

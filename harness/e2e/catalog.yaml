@@ -7,6 +7,8 @@
 # 사례 형식:
 #   id / title / covers: ["FROM>TO", ...] / codes: [기대 오류 코드] (신청 전이가 없는 사례는 covers를 뺀다)
 #   not_on: [스택] — 그 스택에서는 건너뛴다
+#   modes: [실행 방식] — config-server의 실행 방식(RUN_MODE: baseline/noprobe/full)이 여기 있을 때만 돌린다.
+#     스택 이름이 아니라 방식으로 가른다 — operation처럼 이름과 방식이 다른 스택이 있다.
 #   steps: 실제 스택에서 실행할 단계(runner.py의 do_<단계>) — 또는 —
 #   junit: "<클래스>#<메서드>" (admin_be 단위 시험) / pytest: "<파일>::<시험>" (config-server 가상 시험)
 # fault 단계가 있는 사례는 --allow-faults 없이는 건너뛴다.
@@ -250,10 +252,11 @@ cases:
 
   # 장애가 재시도 기간 안에 풀리면 스스로 회복하고, 끝까지 이어지면 관리자에게 넘긴다(DEGRADED — 신청은
   # PROCESSING에 남고 admin_be는 되돌리지 않는다). 재시도가 없는 baseline은 실패로 끝나 PENDING으로 돌아간다 —
-  # 그 전이(PROCESSING>PENDING)는 V02가 가리키는 admin_be 시험이 맡는다.
+  # 그 전이(PROCESSING>PENDING)는 V02가 가리키는 admin_be 시험이 맡는다. 그래서 아래 넷은 재시도가 있는 방식에서만 돌린다.
   - id: F03
     title: NAS 연결이 재시도 기간 내내 막힘 — 작업은 DEGRADED로 넘겨지고 신청은 PROCESSING에 남는다
     codes: [NAS_SSH_FAILED]
+    modes: [noprobe, full]
     steps:
       - user: a
       - apply: {user: a, as: r1}
@@ -266,6 +269,7 @@ cases:
   - id: F04
     title: AD(=KDC) 연결이 재시도 기간 내내 막힘 — 작업은 DEGRADED로 넘겨지고 신청은 PROCESSING에 남는다
     codes: [KDC_FAILED]
+    modes: [noprobe, full]
     steps:
       - user: a
       - apply: {user: a, as: r1}
@@ -279,6 +283,7 @@ cases:
     title: NAS 연결이 잠깐 막힘 — 실패를 겪은 뒤 연결이 돌아오면 재시도로 스스로 회복해 컨테이너가 뜬다
     covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
     codes: [NAS_SSH_FAILED]
+    modes: [noprobe, full]
     steps:
       - user: a
       - apply: {user: a, as: r1}
@@ -293,6 +298,7 @@ cases:
     title: AD(=KDC) 연결이 잠깐 막힘 — 실패를 겪은 뒤 연결이 돌아오면 재시도로 스스로 회복해 컨테이너가 뜬다
     covers: ["PENDING>PROCESSING", "PROCESSING>FULFILLED"]
     codes: [KDC_FAILED]
+    modes: [noprobe, full]
     steps:
       - user: a
       - apply: {user: a, as: r1}
