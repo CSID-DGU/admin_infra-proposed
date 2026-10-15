@@ -1,11 +1,13 @@
-"""노드 로컬 이미지 도우미 — 일회용 Pod 안에서 그 노드의 containerd에 명령을 내린다.
+"""노드 로컬 이미지 도우미 — 일회용 Pod 안에서 그 노드의 containerd와 cgroup에 명령을 내린다.
 
 config-server는 노드에 직접 들어갈 수 없으므로(adapters/node_image.py) 대상 노드에 이 스크립트를 실행하는
 Pod를 띄우고, 마지막 줄의 `RESULT {...}` 한 줄만 읽는다. nerdctl의 경고·진행 출력은 형식이 버전마다
 달라 결과로 쓰지 않는다. 표준 라이브러리만 쓴다 — 이 Pod에는 config-server 설정이 없다.
 """
 import argparse
+import glob
 import json
+import os
 import subprocess
 import sys
 import time
@@ -13,11 +15,18 @@ import time
 # 구운 층에 남기는 표식. 이미지 이력의 comment로 남아, 기본 이미지 층과 사용자가 쌓은 층을 구분한다.
 COMMIT_MARKER = "ailab-commit"
 RESULT_PREFIX = "RESULT "
-# 실행 중인 컨테이너가 다 멈추기를 기다리는 시간. runc는 10초만 기다리고(고정값) 실패를 돌려준다.
-PAUSE_WAIT_SEC = 60
-_PAUSE_POLL_SEC = 2
-# 풀었는데도 이 상태면 멈춘 채로 본다. 상태를 읽지 못한 것(None)도 멈추는 중이라 읽지 못한 것이다.
-_NOT_RUNNING_AGAIN = (None, "paused", "pausing")
+# 노드의 /sys/fs/cgroup을 마운트하는 자리(adapters/node_image.py가 같은 값을 쓴다).
+CGROUP_ROOT = "/host-cgroup"
+# 실행 중인 컨테이너가 다 멈추기를 기다리는 기본 시간.
+FREEZE_WAIT_SEC = 60
+_FREEZE_POLL_SEC = 0.5
+_THAW_WAIT_SEC = 5
+# 이 결과 코드는 config-server가 그대로 작업 오류 코드로 쓴다.
+LEFT_FROZEN_CODE = "IMAGE_LEFT_PAUSED"
+
+
+class LeftFrozen(RuntimeError):
+    """풀었는데도 컨테이너가 멈춰 있다. 사용자가 접속할 수 없다."""
 
 
 def _nerdctl(socket, *args):
@@ -45,53 +54,90 @@ def _inspect(socket, ref):
     return json.loads(done.stdout.strip().splitlines()[0])
 
 
-def commit(socket, container, ref, running, pause_wait_sec=PAUSE_WAIT_SEC):
-    if running:
-        # 멈추기는 직접 하고(nerdctl commit의 기본 --pause는 runc의 10초를 넘기면 바로 실패한다) 굽기는 멈춘 상태로 한다.
-        _pause(socket, container, pause_wait_sec)
-        try:
+def commit(socket, container, ref, running, freeze_wait_sec=FREEZE_WAIT_SEC, cgroup_root=CGROUP_ROOT):
+    if not running:
+        return _commit(socket, container, ref)
+    # 멈춤·풀기는 containerd(nerdctl pause)를 거치지 않고 cgroup에 직접 한다. runc는 다 멈추기를 10초만 기다리고
+    # 실패하면서 멈춤 요청은 남겨, containerd는 running·cgroup은 멈춤으로 어긋난다. 그러면 nerdctl unpause가
+    # "멈춰 있지 않다"며 거부해 풀 길이 없다. cgroup에서 직접 하면 containerd는 내내 running이라 어긋날 일이 없다.
+    directory = cgroup_dir(cgroup_root, container)
+    frozen = False
+    try:
+        frozen = _freeze(directory, freeze_wait_sec)
+        if frozen:
             result = _commit(socket, container, ref)
-        finally:
-            _nerdctl(socket, "unpause", container)
-        if _status(socket, container) in _NOT_RUNNING_AGAIN:
-            raise RuntimeError("committed but the container is still paused")
-        return result
-    return _commit(socket, container, ref)
+    finally:
+        if not _thaw(directory):
+            raise LeftFrozen("container still frozen after thaw")
+    if not frozen:
+        raise RuntimeError(f"container did not freeze within {freeze_wait_sec}s; thawed without committing")
+    return result
 
 
 def _commit(socket, container, ref):
+    # 실행 중이었다면 이미 cgroup에서 멈춰 두었다. nerdctl이 다시 멈추려 하면(기본 --pause) runc 10초 제한에 걸린다.
     done = _nerdctl(socket, "commit", "--pause=false", "--message", COMMIT_MARKER, container, ref)
     if done.returncode != 0:
         raise RuntimeError(f"commit failed: {done.stderr.strip()[-500:]}")
     return {"added_bytes": added_bytes(_inspect(socket, ref))}
 
 
-def _pause(socket, container, wait_sec):
-    """runc는 cgroup이 다 멈추기를 10초만 기다린 뒤 실패를 돌려주지만 멈춤 요청(cgroup.freeze=1)은 거두지 않아
-    커널은 계속 멈추는 중이다. 그래서 실패해도 wait_sec까지 상태를 다시 읽어 다 멈췄으면 이어 간다. 끝내 다 멈추지
-    않으면 실패로 끝낸다 — 풀기와 그 확인은 호출하는 쪽(adapters/node_image.py)이 맡는다."""
+def cgroup_dir(root, container):
+    """컨테이너의 cgroup v2 디렉터리. kubelet의 cgroup 드라이버와 Pod의 QoS 등급에 따라 경로가 다르다."""
+    patterns = [
+        f"{root}/kubepods/*/pod*/{container}",                              # cgroupfs, burstable·besteffort
+        f"{root}/kubepods/pod*/{container}",                                # cgroupfs, guaranteed
+        f"{root}/kubepods.slice/*/*/cri-containerd-{container}.scope",     # systemd, burstable·besteffort
+        f"{root}/kubepods.slice/*/cri-containerd-{container}.scope",       # systemd, guaranteed
+    ]
+    found = sorted({path for pattern in patterns for path in glob.glob(pattern)})
+    if len(found) != 1:
+        raise RuntimeError(f"cgroup of container not found exactly once: {len(found)} matches")
+    if not os.path.exists(os.path.join(found[0], "cgroup.freeze")):
+        raise RuntimeError("cgroup v2 freezer not available")
+    return found[0]
+
+
+def _freeze(directory, wait_sec):
+    """멈춤을 요청하고 다 멈추기를 wait_sec까지 기다린다. 다 멈췄으면 True."""
+    _write(directory, "cgroup.freeze", "1")
+    return _wait_frozen(directory, True, wait_sec)
+
+
+def _thaw(directory):
+    """멈춤을 거둔다. 풀기는 기다릴 것이 없어 바로 반영된다. 풀렸으면 True."""
+    _write(directory, "cgroup.freeze", "0")
+    return _wait_frozen(directory, False, _THAW_WAIT_SEC)
+
+
+def _wait_frozen(directory, want, wait_sec):
     deadline = time.monotonic() + wait_sec
-    done = _nerdctl(socket, "pause", container)
-    if done.returncode == 0:
-        return
-    while time.monotonic() < deadline:
-        if _status(socket, container) == "paused":
-            return
-        time.sleep(_PAUSE_POLL_SEC)
-    raise RuntimeError(f"pause failed within {wait_sec}s: {done.stderr.strip()[-500:]}")
+    while True:
+        if _is_frozen(directory) == want:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_FREEZE_POLL_SEC)
 
 
-def _status(socket, container):
-    """컨테이너 상태 문자열. 멈추는 중에는 runc도 상태를 읽지 못해(10초 대기 후 실패) None이다."""
-    done = _nerdctl(socket, "inspect", "--format", "{{.State.Status}}", container)
-    return done.stdout.strip() if done.returncode == 0 else None
+def _is_frozen(directory):
+    with open(os.path.join(directory, "cgroup.events")) as events:
+        for line in events:
+            key, _, value = line.partition(" ")
+            if key == "frozen":
+                return value.strip() == "1"
+    raise RuntimeError("cgroup.events has no frozen line")
 
 
-def unpause(socket, container):
-    """굽기가 실패하면 컨테이너가 멈춘 채 남을 수 있다. 풀어 본 뒤 실제 상태를 다시 읽어 돌려준다 — unpause의
-    종료 코드만으로는 '멈춰 있지 않았음'과 '풀지 못함'을 구분할 수 없다. 상태를 읽지 못하면 멈춘 것으로 본다."""
-    _nerdctl(socket, "unpause", container)
-    return {"paused": _status(socket, container) in _NOT_RUNNING_AGAIN}
+def _write(directory, name, value):
+    with open(os.path.join(directory, name), "w") as f:
+        f.write(value)
+
+
+def thaw(container, cgroup_root=CGROUP_ROOT):
+    """굽던 도우미가 끝을 맺지 못했을 때(시간 초과·강제 종료) 컨테이너가 멈춘 채 남지 않게 따로 푼다.
+    멈춰 있지 않으면 아무 일도 하지 않는다."""
+    return {"frozen": not _thaw(cgroup_dir(cgroup_root, container))}
 
 
 def remove(socket, ref):
@@ -117,17 +163,21 @@ def main(argv=None):
     commit_args.add_argument("--running", action="store_true")
     remove_args = commands.add_parser("remove")
     remove_args.add_argument("--ref", required=True)
-    unpause_args = commands.add_parser("unpause")
-    unpause_args.add_argument("--container", required=True)
+    commit_args.add_argument("--freeze-wait-sec", type=int, default=FREEZE_WAIT_SEC)
+    thaw_args = commands.add_parser("thaw")
+    thaw_args.add_argument("--container", required=True)
     args = parser.parse_args(argv)
 
     try:
         if args.command == "commit":
-            result = commit(args.socket, args.container, args.ref, args.running)
-        elif args.command == "unpause":
-            result = unpause(args.socket, args.container)
+            result = commit(args.socket, args.container, args.ref, args.running, args.freeze_wait_sec, CGROUP_ROOT)
+        elif args.command == "thaw":
+            result = thaw(args.container, CGROUP_ROOT)
         else:
             result = remove(args.socket, args.ref)
+    except LeftFrozen as e:
+        print(RESULT_PREFIX + json.dumps({"error": str(e), "code": LEFT_FROZEN_CODE}))
+        return 1
     except Exception as e:
         print(RESULT_PREFIX + json.dumps({"error": str(e)}))
         return 1
