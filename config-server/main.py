@@ -224,6 +224,7 @@ app.config.from_mapping({
     "IMAGE_HELPER_IMAGE": os.getenv("IMAGE_HELPER_IMAGE", ""),
     "CONTAINERD_SOCKET": os.getenv("CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
     "IMAGE_HELPER_TIMEOUT_SEC": int(os.getenv("IMAGE_HELPER_TIMEOUT_SEC", "900")),
+    "IMAGE_FREEZE_WAIT_SEC": int(os.getenv("IMAGE_FREEZE_WAIT_SEC", "60")),
     # 구운 변경분의 누적 상한(압축 기준). 구우면 컨테이너의 임시 저장 사용량이 이미지로 옮겨 가 한도가
     # 0부터 다시 시작하므로, 상한이 없으면 재생성을 반복해 DEFAULT_EPHEMERAL_STORAGE_LIMIT을 넘겨 쌓을 수 있다.
     "USER_IMAGE_MAX_ADDED_BYTES": int(os.getenv("USER_IMAGE_MAX_ADDED_BYTES", str(50 * 1024 ** 3))),
@@ -357,7 +358,8 @@ class PodSpecBuildError(Exception):
 def node_image_settings():
     return node_image.HelperSettings(
         namespace=app.config["NAMESPACE"], image=app.config["IMAGE_HELPER_IMAGE"],
-        socket=app.config["CONTAINERD_SOCKET"], timeout_sec=app.config["IMAGE_HELPER_TIMEOUT_SEC"])
+        socket=app.config["CONTAINERD_SOCKET"], timeout_sec=app.config["IMAGE_HELPER_TIMEOUT_SEC"],
+        freeze_wait_sec=app.config["IMAGE_FREEZE_WAIT_SEC"])
 
 
 def remove_node_image_quietly(node, ref):

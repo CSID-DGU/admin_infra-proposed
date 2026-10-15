@@ -67,26 +67,183 @@ def test_added_bytes_counts_only_committed_layers_on_top():
     assert node_image_cli.added_bytes(_inspected("buildkit", marker, marker)) == 50
 
 
-def test_failed_commit_of_running_container_unpauses_it(monkeypatch):
+def test_only_freezing_commands_mount_the_node_cgroup():
+    def volumes(args):
+        return [v["name"] for v in node_image._helper_pod(SETTINGS, "farm2", args)["spec"]["volumes"]]
+
+    assert volumes(["remove", "--ref", "r"]) == ["containerd"]
+    assert volumes(["commit", "--container", CID]) == ["containerd", "cgroup"]
+    assert volumes(["thaw", "--container", CID]) == ["containerd", "cgroup"]
+    container = node_image._helper_pod(SETTINGS, "farm2", ["thaw"])["spec"]["containers"][0]
+    assert "securityContext" not in container   # 특권 없이 쓰기 마운트만으로 된다
+
+
+def _helper_replies(monkeypatch, thaw):
+    """commit은 항상 실패하고, thaw는 thaw()의 결과를 돌려주는 도우미."""
     ran = []
 
     def helper(settings, node, args, fail_code):
         ran.append(args[0])
         if args[0] == "commit":
-            raise node_image.NodeImageError(fail_code, "killed mid-commit")
-        assert fail_code == "IMAGE_UNPAUSE_FAILED"
-        return {"unpaused": True}
+            raise node_image.NodeImageError(fail_code, "helper timed out")
+        assert fail_code == "IMAGE_THAW_FAILED"
+        return thaw()
 
     monkeypatch.setattr(node_image, "_run_helper", helper)
-    ref = node_image.ref_for("ns", "pod")
+    return ran
+
+
+def _commit_running(running=True):
     with pytest.raises(node_image.NodeImageError) as e:
-        node_image.commit(SETTINGS, "farm2", "containerd://" + CID, ref, running=True)
-    assert e.value.code == "IMAGE_COMMIT_FAILED" and ran == ["commit", "unpause"]
+        node_image.commit(SETTINGS, "farm2", "containerd://" + CID, node_image.ref_for("ns", "pod"), running=running)
+    return e.value
+
+
+def test_failed_commit_of_running_container_is_thawed_again(monkeypatch):
+    ran = _helper_replies(monkeypatch, lambda: {"frozen": False})
+    assert _commit_running().code == "IMAGE_COMMIT_FAILED" and ran == ["commit", "thaw"]
 
     ran.clear()
-    with pytest.raises(node_image.NodeImageError):
-        node_image.commit(SETTINGS, "farm2", "containerd://" + CID, ref, running=False)
+    assert _commit_running(running=False).code == "IMAGE_COMMIT_FAILED"
     assert ran == ["commit"]   # 멈춘 적이 없는 컨테이너는 풀 것이 없다
+
+
+def test_container_still_frozen_after_failed_commit_is_reported_as_left_paused(monkeypatch):
+    _helper_replies(monkeypatch, lambda: {"frozen": True})
+    error = _commit_running()
+    assert error.code == "IMAGE_LEFT_PAUSED" and "helper timed out" in error.detail
+
+
+def test_unconfirmed_thaw_is_reported_as_left_paused(monkeypatch):
+    def thaw():
+        raise node_image.NodeImageError("IMAGE_HELPER_TIMEOUT", "thaw helper stuck")
+
+    _helper_replies(monkeypatch, thaw)
+    error = _commit_running()
+    assert error.code == "IMAGE_LEFT_PAUSED" and "thaw helper stuck" in error.detail
+
+
+def test_left_frozen_that_thaws_on_retry_is_an_ordinary_failure(monkeypatch):
+    def helper(settings, node, args, fail_code):
+        if args[0] == "commit":
+            raise node_image.NodeImageError("IMAGE_LEFT_PAUSED", "container still frozen after thaw")
+        return {"frozen": False}
+
+    monkeypatch.setattr(node_image, "_run_helper", helper)
+    assert _commit_running().code == "IMAGE_COMMIT_FAILED"
+
+
+def test_helper_result_code_overrides_callers_code(monkeypatch):
+    _with_v1(monkeypatch, _FakeV1("Failed", 'RESULT {"error": "still frozen", "code": "IMAGE_LEFT_PAUSED"}'))
+    with pytest.raises(node_image.NodeImageError) as e:
+        node_image._run_helper(SETTINGS, "farm2", ["commit"], "IMAGE_COMMIT_FAILED")
+    assert e.value.code == "IMAGE_LEFT_PAUSED"
+
+
+class _FakeCgroup:
+    """컨테이너 cgroup 하나. freeze_after번째 읽기부터 다 멈춘다(None이면 끝내 다 멈추지 않는다)."""
+
+    def __init__(self, root, layout, freeze_after=0):
+        self.dir = root / layout.format(cid=CID)
+        self.dir.mkdir(parents=True)
+        self.freeze_after, self.reads = freeze_after, 0
+        (self.dir / "cgroup.freeze").write_text("0\n")
+
+    def frozen(self):
+        """도우미가 읽는 cgroup.events 대신 이 값을 쓴다."""
+        requested = (self.dir / "cgroup.freeze").read_text().strip() == "1"
+        if not requested:
+            return False
+        self.reads += 1
+        return self.freeze_after is not None and self.reads > self.freeze_after
+
+
+def _cli(monkeypatch, cgroup, commit_ok=True):
+    calls = []
+
+    def nerdctl(socket, *args):
+        calls.append(args[0])
+        assert args[0] != "commit" or cgroup.frozen(), "구울 때는 이미 다 멈춰 있어야 한다"
+        return types.SimpleNamespace(returncode=0 if commit_ok else 1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(node_image_cli, "_nerdctl", nerdctl)
+    monkeypatch.setattr(node_image_cli, "_is_frozen", lambda directory: cgroup.frozen())
+    monkeypatch.setattr(node_image_cli.time, "sleep", lambda sec: None)
+    monkeypatch.setattr(node_image_cli, "_inspect", lambda socket, ref: {})
+    monkeypatch.setattr(node_image_cli, "added_bytes", lambda inspected: 7)
+    return calls
+
+
+def _freeze_value(cgroup):
+    return (cgroup.dir / "cgroup.freeze").read_text()
+
+
+@pytest.mark.parametrize("layout", [
+    "kubepods/burstable/podu1/{cid}",
+    "kubepods/podu1/{cid}",
+    "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podu1.slice/cri-containerd-{cid}.scope",
+    "kubepods.slice/kubepods-podu1.slice/cri-containerd-{cid}.scope",
+])
+def test_cgroup_dir_is_found_for_both_drivers_and_all_qos(tmp_path, layout):
+    cgroup = _FakeCgroup(tmp_path, layout)
+    assert node_image_cli.cgroup_dir(str(tmp_path), CID) == str(cgroup.dir)
+
+
+def test_cgroup_without_freezer_is_refused(tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}")
+    (cgroup.dir / "cgroup.freeze").unlink()
+    with pytest.raises(RuntimeError, match="freezer"):
+        node_image_cli.cgroup_dir(str(tmp_path), CID)
+
+
+def test_running_container_is_frozen_committed_then_thawed(monkeypatch, tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}", freeze_after=3)
+    calls = _cli(monkeypatch, cgroup)
+    assert node_image_cli.commit("/s", CID, "r", running=True, cgroup_root=str(tmp_path)) == {"added_bytes": 7}
+    assert calls == ["commit"] and _freeze_value(cgroup) == "0"   # containerd에는 멈춤·풀기를 묻지 않는다
+
+
+def test_container_that_never_freezes_is_thawed_without_committing(monkeypatch, tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}", freeze_after=None)
+    calls = _cli(monkeypatch, cgroup)
+    with pytest.raises(RuntimeError, match="did not freeze within 0s"):
+        node_image_cli.commit("/s", CID, "r", running=True, freeze_wait_sec=0, cgroup_root=str(tmp_path))
+    assert calls == [] and _freeze_value(cgroup) == "0"
+
+
+def test_failed_commit_still_thaws(monkeypatch, tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}")
+    _cli(monkeypatch, cgroup, commit_ok=False)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        node_image_cli.commit("/s", CID, "r", running=True, cgroup_root=str(tmp_path))
+    assert _freeze_value(cgroup) == "0"
+
+
+def test_container_that_stays_frozen_is_reported_with_left_paused_code(monkeypatch, tmp_path, capsys):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}")
+    _cli(monkeypatch, cgroup)
+    monkeypatch.setattr(node_image_cli, "_is_frozen", lambda directory: True)   # 풀어도 그대로 멈춰 있다
+    monkeypatch.setattr(node_image_cli, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(node_image_cli, "_THAW_WAIT_SEC", 0)
+    assert node_image_cli.main(["--socket", "/s", "commit", "--container", CID, "--ref", "r", "--running"]) == 1
+    assert '"code": "IMAGE_LEFT_PAUSED"' in capsys.readouterr().out
+
+
+def test_stopped_container_is_committed_without_touching_cgroup(monkeypatch, tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}")
+    calls = _cli(monkeypatch, cgroup)
+    monkeypatch.setattr(node_image_cli, "_nerdctl", lambda socket, *args: calls.append(args[0])
+                        or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    node_image_cli.commit("/s", CID, "r", running=False, cgroup_root=str(tmp_path / "missing"))
+    assert calls == ["commit"]
+
+
+def test_thaw_command_unfreezes_and_reports(monkeypatch, tmp_path):
+    cgroup = _FakeCgroup(tmp_path, "kubepods/burstable/podu1/{cid}")
+    (cgroup.dir / "cgroup.freeze").write_text("1")
+    _cli(monkeypatch, cgroup)
+    assert node_image_cli.thaw(CID, cgroup_root=str(tmp_path)) == {"frozen": False}
+    assert _freeze_value(cgroup) == "0"
 
 
 class _FakeV1:
