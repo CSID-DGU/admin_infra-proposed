@@ -8,10 +8,16 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 
 # 구운 층에 남기는 표식. 이미지 이력의 comment로 남아, 기본 이미지 층과 사용자가 쌓은 층을 구분한다.
 COMMIT_MARKER = "ailab-commit"
 RESULT_PREFIX = "RESULT "
+# 실행 중인 컨테이너가 다 멈추기를 기다리는 시간. runc는 10초만 기다리고(고정값) 실패를 돌려준다.
+PAUSE_WAIT_SEC = 60
+_PAUSE_POLL_SEC = 2
+# 풀었는데도 이 상태면 멈춘 채로 본다. 상태를 읽지 못한 것(None)도 멈추는 중이라 읽지 못한 것이다.
+_NOT_RUNNING_AGAIN = (None, "paused", "pausing")
 
 
 def _nerdctl(socket, *args):
@@ -39,23 +45,53 @@ def _inspect(socket, ref):
     return json.loads(done.stdout.strip().splitlines()[0])
 
 
-def commit(socket, container, ref, running):
-    # 실행 중이 아닌 컨테이너는 멈출 작업이 없어 기본값(--pause)으로는 실패한다.
-    done = _nerdctl(socket, "commit", f"--pause={'true' if running else 'false'}",
-                    "--message", COMMIT_MARKER, container, ref)
+def commit(socket, container, ref, running, pause_wait_sec=PAUSE_WAIT_SEC):
+    if running:
+        # 멈추기는 직접 하고(nerdctl commit의 기본 --pause는 runc의 10초를 넘기면 바로 실패한다) 굽기는 멈춘 상태로 한다.
+        _pause(socket, container, pause_wait_sec)
+        try:
+            result = _commit(socket, container, ref)
+        finally:
+            _nerdctl(socket, "unpause", container)
+        if _status(socket, container) in _NOT_RUNNING_AGAIN:
+            raise RuntimeError("committed but the container is still paused")
+        return result
+    return _commit(socket, container, ref)
+
+
+def _commit(socket, container, ref):
+    done = _nerdctl(socket, "commit", "--pause=false", "--message", COMMIT_MARKER, container, ref)
     if done.returncode != 0:
         raise RuntimeError(f"commit failed: {done.stderr.strip()[-500:]}")
     return {"added_bytes": added_bytes(_inspect(socket, ref))}
 
 
+def _pause(socket, container, wait_sec):
+    """runc는 cgroup이 다 멈추기를 10초만 기다린 뒤 실패를 돌려주지만 멈춤 요청(cgroup.freeze=1)은 거두지 않아
+    커널은 계속 멈추는 중이다. 그래서 실패해도 wait_sec까지 상태를 다시 읽어 다 멈췄으면 이어 간다. 끝내 다 멈추지
+    않으면 실패로 끝낸다 — 풀기와 그 확인은 호출하는 쪽(adapters/node_image.py)이 맡는다."""
+    deadline = time.monotonic() + wait_sec
+    done = _nerdctl(socket, "pause", container)
+    if done.returncode == 0:
+        return
+    while time.monotonic() < deadline:
+        if _status(socket, container) == "paused":
+            return
+        time.sleep(_PAUSE_POLL_SEC)
+    raise RuntimeError(f"pause failed within {wait_sec}s: {done.stderr.strip()[-500:]}")
+
+
+def _status(socket, container):
+    """컨테이너 상태 문자열. 멈추는 중에는 runc도 상태를 읽지 못해(10초 대기 후 실패) None이다."""
+    done = _nerdctl(socket, "inspect", "--format", "{{.State.Status}}", container)
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
 def unpause(socket, container):
     """굽기가 실패하면 컨테이너가 멈춘 채 남을 수 있다. 풀어 본 뒤 실제 상태를 다시 읽어 돌려준다 — unpause의
-    종료 코드만으로는 '멈춰 있지 않았음'과 '풀지 못함'을 구분할 수 없다."""
+    종료 코드만으로는 '멈춰 있지 않았음'과 '풀지 못함'을 구분할 수 없다. 상태를 읽지 못하면 멈춘 것으로 본다."""
     _nerdctl(socket, "unpause", container)
-    done = _nerdctl(socket, "inspect", "--format", "{{.State.Status}}", container)
-    if done.returncode != 0:
-        raise RuntimeError(f"inspect failed: {done.stderr.strip()[-500:]}")
-    return {"paused": done.stdout.strip() in ("paused", "pausing")}
+    return {"paused": _status(socket, container) in _NOT_RUNNING_AGAIN}
 
 
 def remove(socket, ref):

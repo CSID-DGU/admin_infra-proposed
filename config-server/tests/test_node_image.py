@@ -131,6 +131,80 @@ def test_cli_unpause_reports_state_read_after_unpausing(monkeypatch):
     assert calls == ["unpause", "inspect", "unpause", "inspect"]
 
 
+def _nerdctl_script(monkeypatch, reply):
+    """nerdctl 호출마다 reply(args)가 (종료 코드, 표준 출력, 표준 오류)를 돌려준다."""
+    calls = []
+
+    def fake(socket, *args):
+        calls.append(args[0])
+        code, out, err = reply(args)
+        return types.SimpleNamespace(returncode=code, stdout=out, stderr=err)
+
+    monkeypatch.setattr(node_image_cli, "_nerdctl", fake)
+    monkeypatch.setattr(node_image_cli.time, "sleep", lambda sec: None)
+    monkeypatch.setattr(node_image_cli, "added_bytes", lambda inspected: 7)
+    monkeypatch.setattr(node_image_cli, "_inspect", lambda socket, ref: {})
+    return calls
+
+
+FREEZE_TIMEOUT = "OCI runtime pause failed: timeout of 10s reached waiting for the cgroup to freeze"
+
+
+def test_running_container_is_paused_then_committed_without_pausing_again_then_unpaused(monkeypatch):
+    state = {"paused": False}
+
+    def reply(args):
+        if args[0] in ("pause", "unpause"):
+            state["paused"] = args[0] == "pause"
+        if args[0] == "inspect":
+            return 0, "paused" if state["paused"] else "running", ""
+        return 0, "", ""
+
+    calls = _nerdctl_script(monkeypatch, reply)
+    assert node_image_cli.commit("/s", CID, "r", running=True) == {"added_bytes": 7}
+    assert calls == ["pause", "commit", "unpause", "inspect"]
+
+
+def test_freeze_slower_than_runc_timeout_is_waited_for(monkeypatch):
+    reads = []
+
+    def reply(args):
+        if args[0] == "pause":
+            return 1, "", FREEZE_TIMEOUT
+        if args[0] == "inspect":
+            reads.append(1)
+            if len(reads) < 3:          # 멈추는 중에는 상태를 읽지 못한다
+                return 1, "", FREEZE_TIMEOUT
+            return 0, "paused" if len(reads) == 3 else "running", ""
+        return 0, "", ""
+
+    calls = _nerdctl_script(monkeypatch, reply)
+    assert node_image_cli.commit("/s", CID, "r", running=True) == {"added_bytes": 7}
+    assert calls == ["pause", "inspect", "inspect", "inspect", "commit", "unpause", "inspect"]
+
+
+def test_freeze_that_never_finishes_fails_without_committing(monkeypatch):
+    calls = _nerdctl_script(monkeypatch, lambda args: (1, "", FREEZE_TIMEOUT))
+    with pytest.raises(RuntimeError) as e:
+        node_image_cli.commit("/s", CID, "r", running=True, pause_wait_sec=0)
+    assert "within 0s" in str(e.value) and "commit" not in calls
+
+
+def test_container_still_paused_after_commit_is_an_error(monkeypatch):
+    def reply(args):
+        return (0, "paused", "") if args[0] == "inspect" else (0, "", "")
+
+    _nerdctl_script(monkeypatch, reply)
+    with pytest.raises(RuntimeError, match="still paused"):
+        node_image_cli.commit("/s", CID, "r", running=True)
+
+
+def test_stopped_container_is_committed_without_pausing(monkeypatch):
+    calls = _nerdctl_script(monkeypatch, lambda args: (0, "", ""))
+    node_image_cli.commit("/s", CID, "r", running=False)
+    assert calls == ["commit"]
+
+
 class _FakeV1:
     """도우미 Pod 하나의 일생: 만들고, 끝나기를 기다리고, 로그를 읽고, 지운다."""
 
