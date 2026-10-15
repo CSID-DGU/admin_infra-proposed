@@ -49,9 +49,13 @@ def commit(socket, container, ref, running):
 
 
 def unpause(socket, container):
-    """굽는 도중 도우미가 죽으면 컨테이너가 멈춘 채 남는다. 멈춰 있지 않으면 아무 일도 하지 않는다."""
-    done = _nerdctl(socket, "unpause", container)
-    return {"unpaused": done.returncode == 0}
+    """굽기가 실패하면 컨테이너가 멈춘 채 남을 수 있다. 풀어 본 뒤 실제 상태를 다시 읽어 돌려준다 — unpause의
+    종료 코드만으로는 '멈춰 있지 않았음'과 '풀지 못함'을 구분할 수 없다."""
+    _nerdctl(socket, "unpause", container)
+    done = _nerdctl(socket, "inspect", "--format", "{{.State.Status}}", container)
+    if done.returncode != 0:
+        raise RuntimeError(f"inspect failed: {done.stderr.strip()[-500:]}")
+    return {"paused": done.stdout.strip() in ("paused", "pausing")}
 
 
 def remove(socket, ref):

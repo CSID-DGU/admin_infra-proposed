@@ -75,7 +75,7 @@ def test_failed_commit_of_running_container_unpauses_it(monkeypatch):
         if args[0] == "commit":
             raise node_image.NodeImageError(fail_code, "killed mid-commit")
         assert fail_code == "IMAGE_UNPAUSE_FAILED"
-        return {"unpaused": True}
+        return {"paused": False}
 
     monkeypatch.setattr(node_image, "_run_helper", helper)
     ref = node_image.ref_for("ns", "pod")
@@ -87,6 +87,48 @@ def test_failed_commit_of_running_container_unpauses_it(monkeypatch):
     with pytest.raises(node_image.NodeImageError):
         node_image.commit(SETTINGS, "farm2", "containerd://" + CID, ref, running=False)
     assert ran == ["commit"]   # 멈춘 적이 없는 컨테이너는 풀 것이 없다
+
+
+def _commit_then_unpause(monkeypatch, unpause):
+    def helper(settings, node, args, fail_code):
+        if args[0] == "commit":
+            raise node_image.NodeImageError(fail_code, "cgroup freeze timeout")
+        return unpause()
+
+    monkeypatch.setattr(node_image, "_run_helper", helper)
+    with pytest.raises(node_image.NodeImageError) as e:
+        node_image.commit(SETTINGS, "farm2", "containerd://" + CID, node_image.ref_for("ns", "pod"), running=True)
+    return e.value
+
+
+def test_container_still_paused_after_failed_commit_is_reported_as_left_paused(monkeypatch):
+    error = _commit_then_unpause(monkeypatch, lambda: {"paused": True})
+    assert error.code == "IMAGE_LEFT_PAUSED" and "cgroup freeze timeout" in error.detail
+
+
+def test_unconfirmed_unpause_is_reported_as_left_paused(monkeypatch):
+    def unpause():
+        raise node_image.NodeImageError("IMAGE_HELPER_TIMEOUT", "helper stuck")
+
+    error = _commit_then_unpause(monkeypatch, unpause)
+    assert error.code == "IMAGE_LEFT_PAUSED" and "helper stuck" in error.detail
+
+
+def test_cli_unpause_reports_state_read_after_unpausing(monkeypatch):
+    calls = []
+
+    def fake(socket, *args):
+        calls.append(args[0])
+        if args[0] == "unpause":   # 멈춰 있지 않았을 때도 0이 아니다 — 종료 코드로 판단하지 않는다
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="not paused")
+        return types.SimpleNamespace(returncode=0, stdout=state + "\n", stderr="")
+
+    monkeypatch.setattr(node_image_cli, "_nerdctl", fake)
+    state = "running"
+    assert node_image_cli.unpause("/s", CID) == {"paused": False}
+    state = "paused"
+    assert node_image_cli.unpause("/s", CID) == {"paused": True}
+    assert calls == ["unpause", "inspect", "unpause", "inspect"]
 
 
 class _FakeV1:

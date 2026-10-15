@@ -68,19 +68,23 @@ def commit(settings: HelperSettings, node: str, container: str, ref: str, runnin
         args.append("--running")
     try:
         return int(_run_helper(settings, node, args, "IMAGE_COMMIT_FAILED")["added_bytes"])
-    except Exception:
+    except Exception as failure:
         if running:
-            _unpause_quietly(settings, node, runtime_id)
+            _unpause_or_raise(settings, node, runtime_id, failure)
         raise
 
 
-def _unpause_quietly(settings: HelperSettings, node: str, runtime_id: str) -> None:
-    """실행 중인 컨테이너는 굽는 동안 멈춘다. 굽기가 중간에 끊기면 멈춘 채 남아 사용자의 작업이 얼어 있으므로
-    실패한 뒤에는 한 번 풀어 준다. 풀지 못해도 원래 실패를 가리지 않는다."""
+def _unpause_or_raise(settings: HelperSettings, node: str, runtime_id: str, failure: Exception) -> None:
+    """실행 중인 컨테이너는 굽는 동안 멈춘다. 굽기가 실패하면 멈춘 채 남아 사용자가 접속할 수 없으므로 한 번 풀고
+    실제로 풀렸는지 확인한다. 여전히 멈춰 있거나 확인하지 못하면 원래 실패 대신 IMAGE_LEFT_PAUSED로 알린다 —
+    기존 Pod를 그대로 두었다는 일반 실패와 달리 관리자가 손을 써야 한다."""
     try:
-        _run_helper(settings, node, ["unpause", "--container", runtime_id], "IMAGE_UNPAUSE_FAILED")
-    except Exception:
-        pass
+        paused = _run_helper(settings, node, ["unpause", "--container", runtime_id],
+                             "IMAGE_UNPAUSE_FAILED").get("paused", True)
+    except Exception as e:
+        raise NodeImageError("IMAGE_LEFT_PAUSED", f"{failure}; unpause not confirmed: {e}") from failure
+    if paused:
+        raise NodeImageError("IMAGE_LEFT_PAUSED", f"{failure}; container still paused after unpause") from failure
 
 
 def remove(settings: HelperSettings, node: str, ref: str) -> bool:
