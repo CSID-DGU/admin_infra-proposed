@@ -499,6 +499,9 @@ def step_fetch_user_config(ctx):
     _main.log_operation(request_id=request_id, username=username,
                   action=Action.FETCH_USER_CONFIG, phase=Phase.SUCCESS)
     _main.app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
+    if ctx.get("image"):
+        # 마이그레이션이 이미지를 바꿔 다시 만들 때: admin_be 는 작업이 성공한 뒤에야 신청의 이미지를 바꾼다.
+        user_info["image"] = ctx["image"]
     ctx["user_info"] = user_info
 
 

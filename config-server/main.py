@@ -1345,6 +1345,7 @@ def register_migrate(body: MigrateRequest):
     recreate가 true면 노드를 고르지 않고 현재 노드에서 Pod를 다시 만든다(GPU 목록 갱신·재시작). 이때
     keep_changes(기본 true)면 컨테이너 변경분을 그 노드의 이미지로 구워 새 Pod에 이어 준다. 실행 중이던
     프로세스는 이어지지 않는다. 굽지 못하면 작업은 실패하고 기존 Pod는 그대로 남는다.
+    image를 주면(recreate=true, keep_changes=false일 때만) 새 Pod를 그 이미지로 만들고 결과의 image에 돌려준다.
     ---
     tags:
     - Operations
@@ -1363,6 +1364,8 @@ def register_migrate(body: MigrateRequest):
            "recreate": bool(body.recreate), "keep_changes": body.keep_changes is not False}
     if body.min_improvement_ratio is not None:
         job["min_improvement_ratio"] = body.min_improvement_ratio
+    if body.image:
+        job["image"] = body.image
     if body.access_blocked:
         job["access_blocked"] = True
     job["decided_at"] = _now_ms()

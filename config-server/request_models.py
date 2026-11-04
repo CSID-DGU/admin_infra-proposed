@@ -201,12 +201,23 @@ class MigrateRequest(RequestBody):
     recreate: Optional[bool] = Field(default=None, description="true면 현재 노드에서 Pod를 다시 만든다")
     keep_changes: Optional[bool] = Field(default=None, description="recreate일 때 컨테이너 변경분을 구워 유지(기본 true). "
                                                                    "false면 기본 이미지로 초기화")
+    image: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$",
+                                 description="recreate이면서 keep_changes=false일 때 새 Pod를 이 이미지로 만든다. "
+                                             "생략하면 신청에 묶인 이미지", examples=["dguailab/decs:2"])
     nodes: List[str] = Field(default_factory=list, validate_default=True,
                              description="후보 노드 목록(현재 노드 포함). recreate면 쓰지 않는다",
                              examples=[["farm1", "farm2"]])
     min_improvement_ratio: Optional[float] = Field(default=None, ge=0, le=1, description="생략하면 기본값 0.2")
     force: Optional[bool] = Field(default=None, description="true면 개선 비율을 보지 않고 가장 여유 있는 노드로 이전")
     access_blocked: Optional[bool] = Field(default=None, description=ACCESS_BLOCKED_DESCRIPTION)
+
+    @field_validator("image")
+    @classmethod
+    def _image_only_on_reset_recreate(cls, value, info):
+        # 구운 변경분은 옛 이미지 위에 쌓여 있어 이미지를 바꾸면 이어 줄 수 없다. 노드를 옮길 때는 쓰지 않는다.
+        if value is not None and not (info.data.get("recreate") and info.data.get("keep_changes") is False):
+            raise ValueError("image requires recreate=true and keep_changes=false")
+        return value
 
     @field_validator("nodes")
     @classmethod

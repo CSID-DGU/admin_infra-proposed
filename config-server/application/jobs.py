@@ -371,7 +371,8 @@ def _job_ctx(kind, request_id, job):
         # 새 Pod 이름은 Pod 준비 단계가 정한다. 기존 Pod는 old_pod_name으로 따로 둔다.
         ctx.update(config_by_request=True, old_pod_name=job.get("pod_name"), nodes=job["nodes"],
                    min_ratio=job.get("min_improvement_ratio", 0.2), force=bool(job.get("force")),
-                   recreate=bool(job.get("recreate")), keep_changes=bool(job.get("keep_changes")))
+                   recreate=bool(job.get("recreate")), keep_changes=bool(job.get("keep_changes")),
+                   image=job.get("image"))
     return ctx
 
 def find_unfinished_jobs(limit=100):
@@ -467,7 +468,7 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             result.update(status="skipped" if skipped else "migrated", reason=ctx.get("skip_reason"),
                           from_node=ctx.get("from_node"), to_node=None if skipped else ctx.get("node"),
                           old_pod_name=ctx.get("old_pod_name"), old_pod_cleanup=ctx.get("old_pod_cleanup"),
-                          changes_kept=bool(ctx.get("committed_image")))
+                          changes_kept=bool(ctx.get("committed_image")), image=None if skipped else ctx.get("image"))
             if skipped:
                 result.update(pod_name=None, node=None, ports=[])
         _main.save_job_result(JOB_ACTIONS[kind].value, request_id, result)
