@@ -198,3 +198,11 @@ def test_migrate_rejects_negative_ratio_and_accepts_force():
         pass
     dumped = rm.MigrateRequest(username="u", nodes=["farm1"], force=True, pod_name="ailab-u-abc", request_id=3).model_dump(exclude_none=True)
     assert dumped == {"request_id": "3", "pod_name": "ailab-u-abc", "username": "u", "nodes": ["farm1"], "force": True}
+
+
+def test_migrate_image_needs_recreate_without_keep_changes():
+    ok = rm.MigrateRequest(request_id=1, username="u", recreate=True, keep_changes=False, image="a/b:1")
+    assert ok.image == "a/b:1"
+    for extra in ({"recreate": True}, {"recreate": True, "keep_changes": True}, {"nodes": ["farm1"]}):
+        with pytest.raises(ValidationError):
+            rm.MigrateRequest(request_id=1, username="u", image="a/b:1", **extra)

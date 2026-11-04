@@ -121,3 +121,29 @@ def test_revoke_removes_committed_image(env, monkeypatch):
 def test_nodes_are_required_unless_recreate(env):
     r = env.api.post("/operations/migrate", json={"request_id": "2006", "username": "exp-np-rc6"})
     assert r.status_code == 400
+
+
+def test_recreate_with_image_uses_that_image_and_reports_it(env, monkeypatch):
+    e = env
+    old_pod = _provisioned(e, monkeypatch, "2006", "exp-np-rc6")
+    _images(e, monkeypatch)
+    out = _recreate(e, "2006", "exp-np-rc6", old_pod, keep_changes=False, image="dguailab/decs:2")["result"]
+    assert out["status"] == "migrated" and out["image"] == "dguailab/decs:2"
+    assert _container(e, out["pod_name"])["image"] == "dguailab/decs:2"
+    assert not [c for c in e.calls if c[0] == "image_commit"]
+
+
+def test_recreate_without_image_reports_no_image(env, monkeypatch):
+    e = env
+    old_pod = _provisioned(e, monkeypatch, "2007", "exp-np-rc7")
+    _images(e, monkeypatch)
+    out = _recreate(e, "2007", "exp-np-rc7", old_pod, keep_changes=False)["result"]
+    assert out["image"] is None and _container(e, out["pod_name"])["image"] == BASE
+
+
+def test_image_with_keep_changes_or_without_recreate_is_rejected(env):
+    e = env
+    for extra in ({"recreate": True, "keep_changes": True}, {"recreate": True}, {"nodes": ["farm2"]}):
+        r = e.api.post("/operations/migrate", json={"request_id": "2008", "username": "exp-np-rc8",
+                                                    "image": "dguailab/decs:2", **extra})
+        assert r.status_code == 400, (extra, r.get_json())
