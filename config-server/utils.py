@@ -1136,6 +1136,7 @@ NAS_SSH_CONNECT_TIMEOUT_SEC = float(os.getenv("NAS_SSH_CONNECT_TIMEOUT_SEC", "10
 # 작업을 맡은 제어기가 그 작업을 쥔 채 멈춘다. 홈 삭제는 홈 크기만큼 걸리므로 한도를 따로 길게 둔다.
 NAS_SSH_COMMAND_TIMEOUT_SEC = float(os.getenv("NAS_SSH_COMMAND_TIMEOUT_SEC", "120"))
 NAS_SSH_DELETE_TIMEOUT_SEC = float(os.getenv("NAS_SSH_DELETE_TIMEOUT_SEC", "3600"))
+NAS_SSH_SIZE_TIMEOUT_SEC = float(os.getenv("NAS_SSH_SIZE_TIMEOUT_SEC", "600"))
 
 
 class NasCommandTimeout(RuntimeError):
@@ -1302,6 +1303,10 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> bool:
 
 
 NAS_GSS_FLUSH_COMMAND = "sudo -n /usr/local/sbin/decs-nfs-flush-gss"
+# NAS admin 의 NOPASSWD 는 chown/chmod/mkdir/rm 과 전용 스크립트뿐이라 `sudo du` 는 비밀번호를 묻고 실패한다.
+# 홈은 711 이라 admin 이 직접 읽을 수도 없다. 이름 하나만 받아 홈 한 곳의 `du -sb` 만 하는 스크립트를 둔다
+# (config-server/nas/decs-home-size, 설치는 README). 스크립트가 없으면 크기는 None 으로 남는다.
+NAS_HOME_SIZE_COMMAND = "/usr/local/sbin/decs-home-size"
 
 
 def nas_shared_gids_for_users(usernames, gid_min: int, gid_max) -> dict:
@@ -1348,6 +1353,21 @@ def nas_flush_gss_cache() -> None:
     app.logger.info("[NAS SSH] flushing GSS context cache")
     with _nas_ssh_client() as ssh:
         _ssh_run(ssh, NAS_GSS_FLUSH_COMMAND)
+
+
+def user_home_size_bytes(username: str):
+    """지우기 직전 홈 폴더 크기(바이트). 삭제 기록용이라 재지 못하면 None 을 돌려주고 예외는 올리지 않는다 —
+    크기를 못 쟀다고 삭제를 막지 않는다."""
+    try:
+        _user_home_path(username)  # 이름 검증(예약 접두어 포함)을 NAS 에 보내기 전에 통과시킨다
+        with _nas_ssh_client() as ssh:
+            exit_code, stdout, _ = _ssh_exec(
+                ssh, f"sudo -n {NAS_HOME_SIZE_COMMAND} {shlex.quote(username)}", NAS_SSH_SIZE_TIMEOUT_SEC)
+            head = stdout.read().decode(errors="replace").split("\t", 1)[0].strip()
+        return int(head) if exit_code == 0 and head.isdigit() else None
+    except Exception as e:
+        app.logger.warning(f"[NAS SSH] 홈 크기 측정 실패(삭제는 계속): {username} — {e}")
+        return None
 
 
 def delete_user_home_directory(username: str) -> None:

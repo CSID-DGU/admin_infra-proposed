@@ -30,6 +30,9 @@ spec:
               env:
                 - name: NAMESPACE
                   value: "{{ .Values.config.namespace }}"
+                # GPU 유실 때 노드 커널 로그를 읽는 일회용 Pod에 쓰는 이미지(이 크론잡과 같은 이미지)
+                - name: IMAGE_HELPER_IMAGE
+                  value: {{ include "containerssh-config-server.image" . | quote }}
                 - name: ADMIN_BE_INTERNAL_URL
                   value: "{{ .Values.infra.adminBeInternalUrl }}"
                 # admin_be /api/internal/** 호출에 필요한 내부 API 토큰

@@ -17,6 +17,10 @@ rules:
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["get", "list", "watch"]
+# GPU 점검 CronJob(check_gpu_pods.py)이 재알림 시각·노드 boot id·GPU 유실 진단 자료를 남기는 ConfigMap
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update"]
 # krb5 keytab Secret(krb5-keytab-<user>) 생성/조회/삭제 — #82 KRB5 계정 연동
 - apiGroups: [""]
   resources: ["secrets"]

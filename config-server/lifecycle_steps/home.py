@@ -67,6 +67,10 @@ def step_delete_expired_home(ctx):
 
     _main.log_operation(request_id=request_id, username=username, resource_type="home",
                         action=Action.DELETE_HOME, phase=Phase.START)
+    # 지운 뒤에는 잴 수 없다. 못 재도(None) 지우기는 계속한다. 같은 작업이 다시 도는 경우 반쯤 지워진 홈을
+    # 다시 재면 크기가 줄어 있으므로 처음 잰 값을 남긴다.
+    if "home_size_bytes" not in ctx:
+        ctx["home_size_bytes"] = _main.user_home_size_bytes(username)
     try:
         _main.delete_user_home_directory(username)
     except Exception as e:
