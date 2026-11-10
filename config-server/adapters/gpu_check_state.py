@@ -4,6 +4,7 @@ Redis가 없는 환경이라 점검 네임스페이스의 ConfigMap에 둔다(RB
 읽거나 쓰지 못해도 점검은 계속한다 — 그때는 재부팅 감지가 동작하지 않고, 오류 로그와 관리자 알림(한 시간에 한 번)을 낸다.
 """
 import json
+import time
 
 from kubernetes import client
 
@@ -111,13 +112,15 @@ def _fit(sections: dict) -> dict:
 
 
 def save_diagnostics(v1, namespace, pod, sections: dict) -> str:
-    """GPU 유실 시점의 자료를 Pod에 딸린 ConfigMap으로 저장한다(Pod가 사라지면 함께 지워진다). 이름을 돌려준다."""
-    name = DIAG_PREFIX + pod.metadata.name
+    """GPU 유실 시점의 자료를 Pod에 딸린 ConfigMap으로 저장한다(Pod가 사라지면 함께 지워진다). 이름을 돌려준다.
+    GPU 유실이 이어지면 1시간마다 새 ConfigMap 이 생기지만 Pod 와 함께 정리된다."""
+    # 이름마다 새로 만든다(create 만 쓴다) — RBAC 가 update 를 상태 ConfigMap 하나로 묶어 두므로 덮어쓸 수 없다.
+    name = f"{DIAG_PREFIX}{pod.metadata.name}-{int(time.time())}"
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(
             name=name, namespace=namespace,
             owner_references=[client.V1OwnerReference(
                 api_version="v1", kind="Pod", name=pod.metadata.name, uid=pod.metadata.uid)]),
         data=_fit(sections))
-    _upsert(v1, namespace, body)
+    v1.create_namespaced_config_map(namespace, body)
     return name

@@ -195,16 +195,8 @@ NoProbe·Full에서 계정 삭제(`step_delete_account`)는 계정 파일에 사
 
 baseline과 생성 실패 보상 경로는 운영처럼 `USER_NOT_FOUND`(404)로 돌려준다(admin_be는 이를 "이미 삭제됨"으로 처리한다).
 
-#### 홈 삭제 시 크기 기록 — NAS 스크립트 설치
+#### 홈 삭제 시 크기 기록 — NAS 스크립트
 
-홈 삭제 작업은 지우기 직전 `sudo -n /usr/local/sbin/decs-home-size <사용자명>`으로 크기를 재서 결과(`size_bytes`)에 싣는다. NAS `admin`의 NOPASSWD는 `chown/chmod/mkdir/rm`과 `decs-nfs-flush-gss`뿐이고 홈은 711이라 `sudo du`는 비밀번호를 묻고 실패한다. 그래서 이름 하나만 받아 그 홈의 `du -sb`만 하는 `config-server/nas/decs-home-size`를 `decs-nfs-flush-gss`와 같은 방식으로 둔다.
+홈 삭제 작업은 지우기 직전 NAS의 전용 스크립트 `decs-home-size`(`config-server/nas/decs-home-size`)로 홈 크기를 재서 결과(`size_bytes`)에 싣는다. 스크립트는 사용자 이름 하나만 받아 그 홈의 `du -sb`만 하며, NAS에 설치하고 NOPASSWD로 열어 두어야 한다. 정확한 설치 절차와 sudoers 규칙은 비공개 운영 문서를 따른다.
 
-```sh
-# NAS, 설치 계정으로(작업 중인 SSH 세션을 닫지 않는다)
-sudo install -o root -g root -m 0755 decs-home-size /usr/local/sbin/decs-home-size
-echo 'admin ALL=(root) NOPASSWD: /usr/local/sbin/decs-home-size' | sudo tee /etc/sudoers.d/decs-home-size >/dev/null
-sudo chmod 0440 /etc/sudoers.d/decs-home-size
-sudo cat /etc/sudoers.d/decs-home-size   # 보이면 sudo가 멀쩡하다
-```
-
-확인은 `admin`으로 한다(`sudo -n -l`에 항목이 보이고 `sudo -n /usr/local/sbin/decs-home-size <기존 사용자>`가 `<바이트>\t<경로>`를 출력). 스크립트가 없거나 실패하면 크기는 null이고 삭제는 그대로 진행되며 알림에 "확보 용량 미확인"으로 나온다. 스크립트의 `ROOT`는 차트 `NFS_USER_SHARE_PATH`와 같아야 한다(farm 홈 NAS는 btrfs `/volume1/share/user`로 확인, LAB NAS는 경로가 달라 설치할 때 이 줄을 고친다). `du`는 `nice -n 19`(NAS에 `ionice`가 있으면 `-c3`도)로 돌고 타임아웃은 `NAS_SSH_SIZE_TIMEOUT_SEC`(기본 600초)다. DSM 업그레이드가 `/usr/local/sbin`·`/etc/sudoers.d`를 지울 수 있다.
+스크립트가 없거나 실패하면 크기는 null이고 삭제는 그대로 진행되며 알림에 "확보 용량 미확인"으로 나온다. 스크립트의 `ROOT`는 차트 `NFS_USER_SHARE_PATH`와 같아야 하고(NAS마다 경로가 다르면 설치할 때 그 줄을 고친다), `du`는 `nice -n 19`(`ionice`가 있으면 `-c3`도)로 돌며 타임아웃은 `NAS_SSH_SIZE_TIMEOUT_SEC`(기본 600초)다.

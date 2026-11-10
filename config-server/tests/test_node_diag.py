@@ -85,3 +85,18 @@ def test_falls_back_to_syslog_then_journal_then_says_unreadable(tmp_path):
 
 def test_readable_but_no_gpu_lines_is_stated(tmp_path):
     assert "no GPU driver lines in: kern.log" in _run_script(tmp_path, {"kern.log": HDMI})
+
+
+def test_save_diagnostics_only_creates_with_unique_name():
+    created = []
+
+    class V1:
+        def create_namespaced_config_map(self, ns, body):
+            created.append(body.metadata.name)
+
+        def replace_namespaced_config_map(self, *a, **k):  # RBAC 가 허용하지 않는다
+            raise AssertionError("must not replace")
+
+    pod = NS(metadata=NS(name="p1", uid="u1"))
+    name = gpu_check_state.save_diagnostics(V1(), "ns", pod, {"a": "x"})
+    assert created == [name] and name.startswith("gpu-diag-p1-")
