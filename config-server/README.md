@@ -207,4 +207,4 @@ sudo chmod 0440 /etc/sudoers.d/decs-home-size
 sudo cat /etc/sudoers.d/decs-home-size   # 보이면 sudo가 멀쩡하다
 ```
 
-확인은 `admin`으로 한다(`sudo -n -l`에 항목이 보이고 `sudo -n /usr/local/sbin/decs-home-size <기존 사용자>`가 `<바이트>\t<경로>`를 출력). 스크립트가 없거나 실패하면 크기는 null이고 삭제는 그대로 진행되며 알림에 "확보 용량 미확인"으로 나온다. 스크립트의 `ROOT`는 차트 `NFS_USER_SHARE_PATH` 기본값과 같아야 한다. DSM 업그레이드가 `/usr/local/sbin`·`/etc/sudoers.d`를 지울 수 있다.
+확인은 `admin`으로 한다(`sudo -n -l`에 항목이 보이고 `sudo -n /usr/local/sbin/decs-home-size <기존 사용자>`가 `<바이트>\t<경로>`를 출력). 스크립트가 없거나 실패하면 크기는 null이고 삭제는 그대로 진행되며 알림에 "확보 용량 미확인"으로 나온다. 스크립트의 `ROOT`는 차트 `NFS_USER_SHARE_PATH`와 같아야 한다(farm 홈 NAS는 btrfs `/volume1/share/user`로 확인, LAB NAS는 경로가 달라 설치할 때 이 줄을 고친다). `du`는 `nice -n 19`(NAS에 `ionice`가 있으면 `-c3`도)로 돌고 타임아웃은 `NAS_SSH_SIZE_TIMEOUT_SEC`(기본 600초)다. DSM 업그레이드가 `/usr/local/sbin`·`/etc/sudoers.d`를 지울 수 있다.

@@ -177,6 +177,18 @@ def test_nfs_state_uses_user_read_exit_code(monkeypatch):
     assert "확인 불가" in c._nfs_state(None, [_pod(phase="Pending")])
 
 
+def test_node_ssh_uses_configured_port_and_never_guesses_22(monkeypatch):
+    seen = []
+    monkeypatch.setattr(c, "tcp_ssh_alive", lambda host, port=22, *a, **k: seen.append((host, port)) or port == 8081)
+    monkeypatch.setitem(c.app.config, "FARM_NODES", [{"name": "n1", "host": "h1", "port": "8081"}])
+    with c.app.app_context():
+        assert c._node_ssh_state(_node("n1", "b")) == "정상" and seen == [("h1", 8081)]
+        monkeypatch.setitem(c.app.config, "FARM_NODES", [{"name": "n1", "host": "h1", "port": "9999"}])
+        assert c._node_ssh_state(_node("n1", "b")) == "응답 없음"
+        seen.clear()
+        assert "확인 불가" in c._node_ssh_state(_node("other", "b")) and seen == []
+
+
 def test_gpu_state_reports_real_counts_and_unknown():
     assert "확인 불가" in c._gpu_state(None)
     assert c._gpu_state({"ok": 2, "lost": 1, "unknown": 1}) == "GPU Pod 점검 3개 중 유실 1개, 판단 불가 1개"

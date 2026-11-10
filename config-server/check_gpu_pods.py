@@ -272,10 +272,20 @@ def _gpu_state(counts) -> str:
     return text + (f", 판단 불가 {counts['unknown']}개" if counts["unknown"] else "")
 
 
+def _node_ssh_state(node) -> str:
+    """노드 sshd 응답. 노드는 22 가 아닌 포트(노드마다 다름)로 sshd 를 열어 두므로 설정의 FARM_NODES 에서
+    host:port 를 찾는다. 설정에 없으면 포트를 모르므로 22 로 찔러 "응답 없음"이라고 거짓 경보를 내지 않고
+    확인 불가로 남긴다."""
+    entry = next((n for n in app.config["FARM_NODES"] if n.get("name") == node.metadata.name), None)
+    if not entry or not entry.get("port"):
+        return "확인 불가(이 노드의 SSH 포트가 설정에 없음)"
+    host = entry.get("host") or _node_internal_ip(node)
+    return "정상" if tcp_ssh_alive(host, int(entry["port"])) else "응답 없음"
+
+
 def _node_report(v1, node, on_node, gpu_counts):
-    ssh_ok = tcp_ssh_alive(_node_internal_ip(node))
     down = [f"{p.metadata.name}({p.status.phase})" for p in on_node if _pod_is_down(p)]
-    return {"ssh": "정상" if ssh_ok else "응답 없음", "nfs": _nfs_state(v1, on_node),
+    return {"ssh": _node_ssh_state(node), "nfs": _nfs_state(v1, on_node),
             "gpu": _gpu_state(gpu_counts), "down": down}
 
 

@@ -50,3 +50,38 @@ def test_fit_truncates_per_section_by_bytes_and_marks():
 def test_fit_handles_none_and_empty():
     assert gpu_check_state._fit({}) == {}
     assert gpu_check_state._fit({"a": None}) == {"a": ""}
+
+
+def _run_script(tmp_path, files):
+    import subprocess
+    log = tmp_path / "log"
+    log.mkdir(parents=True)
+    for name, text in files.items():
+        path = log / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    script = node_diag._SCRIPT.replace("/host-log", str(log)).replace("/tmp/gpu-lines", str(tmp_path / "o"))
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True).stdout
+
+
+HDMI = "kernel: input: HDA NVidia HDMI/DP,pcm=3 as /devices/pci0000:80/snd_hda_intel\nkernel: nvidia-modeset: ERROR: GPU:0: Error while waiting\n"
+XID = "kernel: NVRM: Xid (PCI:0000:84:00): 79, GPU has fallen off the bus.\n"
+
+
+def test_filter_catches_driver_errors_not_hdmi_audio(tmp_path):
+    out = _run_script(tmp_path, {"kern.log": HDMI + XID})
+    assert "Xid" in out and "HDMI" not in out and "nvidia-modeset" not in out and "source: kern.log" in out
+
+
+def test_previous_rotated_file_is_read_too(tmp_path):
+    assert "Xid" in _run_script(tmp_path, {"kern.log": "x\n", "kern.log.1": XID})
+
+
+def test_falls_back_to_syslog_then_journal_then_says_unreadable(tmp_path):
+    assert "source: syslog" in _run_script(tmp_path / "a", {"syslog": XID})
+    assert "source: journal" in _run_script(tmp_path / "b", {"journal/id/system.journal": "\x00" + XID})
+    assert "no readable kernel log" in _run_script(tmp_path / "c", {})
+
+
+def test_readable_but_no_gpu_lines_is_stated(tmp_path):
+    assert "no GPU driver lines in: kern.log" in _run_script(tmp_path, {"kern.log": HDMI})

@@ -33,6 +33,9 @@ spec:
                 # GPU 유실 때 노드 커널 로그를 읽는 일회용 Pod에 쓰는 이미지(이 크론잡과 같은 이미지)
                 - name: IMAGE_HELPER_IMAGE
                   value: {{ include "containerssh-config-server.image" . | quote }}
+                # 재부팅 보고의 노드 SSH 점검이 노드별 sshd 포트를 찾는 데 쓴다(없으면 "확인 불가"로 보고한다)
+                - name: FARM_NODES_JSON
+                  value: '{{ .Values.farm.ssh.nodes | toJson }}'
                 - name: ADMIN_BE_INTERNAL_URL
                   value: "{{ .Values.infra.adminBeInternalUrl }}"
                 # admin_be /api/internal/** 호출에 필요한 내부 API 토큰
