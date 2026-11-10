@@ -9,8 +9,9 @@ from kubernetes import client
 
 STATE_NAME = "gpu-check-state"
 DIAG_PREFIX = "gpu-diag-"
-# ConfigMap 한도(1MiB) 안에 넣기 위해 항목마다 자른다.
-DIAG_MAX_CHARS = 200_000
+# ConfigMap 한도(1MiB) 안에 넣기 위해 전체 바이트를 이 값으로 묶고 항목마다 똑같이 나눠 자른다.
+DIAG_MAX_BYTES = 900_000
+TRUNCATED_MARK = "[...truncated, tail kept...]\n"
 
 
 def _upsert(v1, namespace, body):
@@ -93,6 +94,22 @@ class CheckState:
                    "gpu-check-state")
 
 
+def _tail_bytes(text: str, limit: int) -> str:
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= limit:
+        return text or ""
+    mark = TRUNCATED_MARK.encode()
+    return mark.decode() + raw[-(limit - len(mark)):].decode("utf-8", errors="ignore")
+
+
+def _fit(sections: dict) -> dict:
+    """항목마다 바이트 예산(전체 / 항목 수)을 주고 넘으면 끝부분(최근 로그)만 남긴다. 잘렸음을 앞에 표시한다."""
+    if not sections:
+        return {}
+    each = DIAG_MAX_BYTES // len(sections)
+    return {k: _tail_bytes(v, each) for k, v in sections.items()}
+
+
 def save_diagnostics(v1, namespace, pod, sections: dict) -> str:
     """GPU 유실 시점의 자료를 Pod에 딸린 ConfigMap으로 저장한다(Pod가 사라지면 함께 지워진다). 이름을 돌려준다."""
     name = DIAG_PREFIX + pod.metadata.name
@@ -101,6 +118,6 @@ def save_diagnostics(v1, namespace, pod, sections: dict) -> str:
             name=name, namespace=namespace,
             owner_references=[client.V1OwnerReference(
                 api_version="v1", kind="Pod", name=pod.metadata.name, uid=pod.metadata.uid)]),
-        data={k: (v or "")[-DIAG_MAX_CHARS:] for k, v in sections.items()})
+        data=_fit(sections))
     _upsert(v1, namespace, body)
     return name

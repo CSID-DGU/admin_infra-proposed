@@ -43,11 +43,15 @@ def kernel_gpu_log(v1, namespace, image, node) -> str:
     name = v1.create_namespaced_pod(namespace, _pod(image, node)).metadata.name
     try:
         deadline = time.monotonic() + _TIMEOUT_SEC
-        while v1.read_namespaced_pod(name, namespace).status.phase not in ("Succeeded", "Failed"):
+        while (phase := v1.read_namespaced_pod(name, namespace).status.phase) not in ("Succeeded", "Failed"):
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"node diag pod {name} did not finish in {_TIMEOUT_SEC}s")
             time.sleep(_POLL_SEC)
-        return v1.read_namespaced_pod_log(name, namespace)
+        log = v1.read_namespaced_pod_log(name, namespace)
+        if phase == "Failed":
+            # 실패한 Pod 의 로그는 수집 결과가 아니다 — 성공 데이터로 돌려주지 않는다.
+            raise RuntimeError(f"node diag pod {name} failed: {(log or '')[-300:]}")
+        return log
     finally:
         try:
             v1.delete_namespaced_pod(name, namespace, grace_period_seconds=0)
