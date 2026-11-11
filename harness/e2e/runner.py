@@ -56,6 +56,7 @@ class Run:
         self.admin_id = None
         self.resource_group = None
         self.image = None
+        self._run_mode = None
 
     # ---- 준비 ----
     def prepare(self):
@@ -72,6 +73,15 @@ class Run:
             "print(json.dumps([n['name'] for n in json.loads(os.environ.get('FARM_NODES_JSON', '[]'))]))")
         return json.loads(out.strip().splitlines()[-1])
 
+    def run_mode(self):
+        """스택의 config-server가 도는 실행 방식. 방식에 따라 기대가 다른 사례(modes)를 가르는 데 쓴다."""
+        if self._run_mode is None:
+            # main.py의 _resolve_run_mode와 같은 순서로 읽는다(main을 불러오면 서버 초기화가 함께 돈다).
+            out = self.cluster.config_server_python(
+                "import os\nprint(os.environ.get('RUN_MODE') or os.environ.get('VERIFY_MODE') or 'noprobe')")
+            self._run_mode = out.strip().splitlines()[-1].strip()
+        return self._run_mode
+
     def group_nodes(self):
         """신청에 쓰는 리소스 그룹에 속한 farm 노드. 다른 그룹 노드에는 신청한 GPU가 없어 옮길 수 없다."""
         rows = self.cluster.sql(f"SELECT node_id FROM nodes WHERE rsgroup_id={int(self.resource_group)};")
@@ -83,6 +93,9 @@ class Run:
             return {"id": case["id"], "result": "SKIP", "reason": "장애 사례 (--allow-faults 없음)"}
         if self.cluster.stack in case.get("not_on", []):
             return {"id": case["id"], "result": "SKIP", "reason": f"{self.cluster.stack} 스택에서는 돌리지 않는 사례"}
+        if "modes" in case and self.run_mode() not in case["modes"]:
+            return {"id": case["id"], "result": "SKIP",
+                    "reason": f"실행 방식 {self.run_mode()}에서는 돌리지 않는 사례 (대상: {', '.join(case['modes'])})"}
         ctx = Context(self, case["id"])
         started = time.monotonic()
         try:
