@@ -1252,6 +1252,9 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "SHELL", "value": "/bin/bash"},
                                                     {"name": "NVIDIA_VISIBLE_DEVICES", "value": visible_gpus},
+                                                    # 레거시 컨테이너와 같게 그래픽·디스플레이까지 연다. CUDA 이미지 기본값(compute,utility)이면
+                                                    # Vulkan 이 없어 Isaac Sim 이 못 뜬다.
+                                                    {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "all"},
                                                     # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
                                                     # `echo "$USER_ID:$USER_PW_HASH" | chpasswd -e`로 로그인 비밀번호를 설정한다.
                                                     # 평문은 받지 않는다 — admin_be가 신청 때 해시만 남긴다.
