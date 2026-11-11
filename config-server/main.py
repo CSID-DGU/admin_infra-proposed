@@ -57,6 +57,7 @@ from utils import (
     home_root_is_reachable,
     other_homes_owned_by,
     delete_user_home_directory,
+    user_home_size_bytes,
     HomeOwnerMismatch,
     sync_running_pod_groups,
     remove_running_pod_groups,

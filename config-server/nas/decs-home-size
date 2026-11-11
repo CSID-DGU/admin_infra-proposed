@@ -1,0 +1,21 @@
+#!/bin/sh
+# /usr/local/sbin/decs-home-size  (NAS, root 전용)
+#
+# 사용자 홈 한 곳의 크기(바이트)를 "<바이트><TAB><경로>" 로 출력한다. config-server 가 보존 기간이
+# 지난 홈을 지우기 직전에 "얼마를 확보했는지" 기록하려고 부른다.
+# 홈은 711(소유자만 읽음)이라 admin 이 직접 du 를 못 하고, admin 의 sudo 는 du 를 열어 두지 않았다.
+# du 를 통째로 열면 NAS 어디든 재게 되므로, 이름 하나만 받아 홈 아래만 재는 이 스크립트만 NOPASSWD 로 연다.
+set -eu
+# 홈이 놓인 NAS 경로. config-server 의 NFS_USER_SHARE_PATH 와 같아야 한다(farm 홈 NAS 는 btrfs /volume1/share/user).
+# LAB NAS 는 경로가 다르다(/294t/...) — 그쪽에 설치하면 이 줄을 그 경로로 바꾼다. sudo 는 환경변수를 지우므로 파일에서 고친다.
+ROOT=/volume1/share/user
+NAME="${1:-}"
+case "$NAME" in
+  ''|_g_*|*[!A-Za-z0-9_-]*|-*) echo "invalid name" >&2; exit 2 ;;
+esac
+[ -d "$ROOT/$NAME" ] || { echo "no such home" >&2; exit 3; }
+# NAS 부하를 줄이려고 가장 낮은 우선순위로 돈다. ionice 는 없는 NAS(DSM)가 있어 있을 때만 쓴다.
+if command -v ionice >/dev/null 2>&1; then
+  exec ionice -c3 nice -n 19 du -sb --one-file-system -- "$ROOT/$NAME"
+fi
+exec nice -n 19 du -sb --one-file-system -- "$ROOT/$NAME"

@@ -460,7 +460,7 @@ def _finish_job(kind, request_id, username, phase, error_code=None, error_detail
             result = {"gid": ctx.get("group_gid"), "pods": ctx.get("group_pods") or {}}
         if kind == "home":
             # deleted 가 false 면 지울 홈이 이미 없었다는 뜻이다.
-            result = {"deleted": bool(ctx.get("home_deleted"))}
+            result = {"deleted": bool(ctx.get("home_deleted")), "size_bytes": ctx.get("home_size_bytes")}
         if kind == "access":
             result = {"blocked": bool(ctx.get("blocked")), "services": ctx.get("access_services") or 0}
         if kind == "migrate":

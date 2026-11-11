@@ -17,6 +17,16 @@ rules:
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["get", "list", "watch"]
+# GPU 점검 CronJob(check_gpu_pods.py)이 재알림 시각·노드 boot id를 남기는 상태 ConfigMap 하나만 읽고 고친다.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["gpu-check-state"]
+  verbs: ["get", "update"]
+# create 는 resourceNames 로 묶을 수 없다(이름이 요청 본문에 있다). 상태 ConfigMap 첫 생성과 GPU 유실 진단 자료
+# (gpu-diag-<pod>-<시각>, 항상 새 이름으로 만든다)에 쓴다. 다른 ConfigMap 을 읽거나 덮어쓰는 권한은 아니다.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
 # krb5 keytab Secret(krb5-keytab-<user>) 생성/조회/삭제 — #82 KRB5 계정 연동
 - apiGroups: [""]
   resources: ["secrets"]

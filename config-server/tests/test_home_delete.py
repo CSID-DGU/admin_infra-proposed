@@ -34,7 +34,7 @@ def store(monkeypatch):
 def nas(monkeypatch):
     """NAS·클러스터·작업 목록 대역. owner 는 홈 소유자 uid(None 이면 홈 없음), deleted 는 지운 이름 목록."""
     state = types.SimpleNamespace(owner=UID, pods=[], unfinished=[], deleted=[], delete_error=None,
-                                  root_reachable=True)
+                                  root_reachable=True, size=1234)
 
     class FakeV1:
         def list_namespaced_pod(self, namespace, label_selector):
@@ -52,6 +52,7 @@ def nas(monkeypatch):
     monkeypatch.setattr(main, "find_unfinished_jobs", lambda limit=100: list(state.unfinished))
     monkeypatch.setattr(main, "user_home_owner_uid", lambda username: state.owner)
     monkeypatch.setattr(main, "delete_user_home_directory", delete)
+    monkeypatch.setattr(main, "user_home_size_bytes", lambda username: state.size)
     monkeypatch.setattr(main, "home_root_is_reachable", lambda: state.root_reachable)
     return state
 
@@ -125,7 +126,7 @@ def test_job_deletes_home_owned_by_expected_uid(logs, store, nas, monkeypatch):
     assert nas.deleted == ["alice"]
     assert _home_steps(logs) == [(Phase.START, None), (Phase.SUCCESS, None)]
     assert logs[-1]["action"] == Action.PURGE_HOME and logs[-1]["phase"] == Phase.SUCCESS
-    assert saved == {("PURGE_HOME", KEY): {"deleted": True}}
+    assert saved == {("PURGE_HOME", KEY): {"deleted": True, "size_bytes": 1234}}
     assert ("PURGE_HOME", KEY) not in store
 
 
@@ -138,7 +139,7 @@ def test_absent_home_is_success_without_deleting(logs, store, nas, monkeypatch):
 
     assert nas.deleted == [] and _home_steps(logs) == []
     assert logs[-1]["phase"] == Phase.SUCCESS
-    assert saved == {("PURGE_HOME", KEY): {"deleted": False}}
+    assert saved == {("PURGE_HOME", KEY): {"deleted": False, "size_bytes": None}}
 
 
 def test_home_owned_by_another_uid_is_not_deleted(logs, store, nas):
@@ -286,3 +287,52 @@ def test_recreate_failure_fails_the_step(logs, nas, ledger, monkeypatch):
         _restore()
 
     assert _create_home_logs(logs) == [(Phase.START, None), (Phase.FAIL, "NAS_SSH_FAILED")]
+
+
+def _fake_nas(monkeypatch, exit_code, out, calls):
+    import contextlib
+    import io
+    import utils
+
+    @contextlib.contextmanager
+    def client():
+        yield object()
+
+    def run(ssh, cmd, timeout):
+        calls.append(cmd)
+        return exit_code, io.BytesIO(out), io.BytesIO(b"")
+
+    monkeypatch.setattr(utils, "_nas_ssh_client", client)
+    monkeypatch.setattr(utils, "_ssh_exec", run)
+    monkeypatch.setenv("NFS_USER_SHARE_PATH", "/volume1/share/user")
+
+
+def test_size_uses_the_whitelisted_script_and_parses_bytes(monkeypatch):
+    import utils
+    calls = []
+    _fake_nas(monkeypatch, 0, b"4096\t/volume1/share/user/alice\n", calls)
+    with main.app.app_context():
+        assert utils.user_home_size_bytes("alice") == 4096
+    # NAS 의 NOPASSWD 에 열려 있는 건 전용 스크립트뿐이라 `sudo du` 를 보내면 안 된다.
+    assert calls == ["sudo -n /usr/local/sbin/decs-home-size alice"]
+
+
+def test_size_is_none_when_script_fails_or_name_is_reserved(monkeypatch):
+    import utils
+    calls = []
+    _fake_nas(monkeypatch, 1, b"", calls)
+    with main.app.app_context():
+        assert utils.user_home_size_bytes("alice") is None
+        assert utils.user_home_size_bytes("_g_team") is None
+    assert len(calls) == 1  # 예약 이름은 NAS 에 보내지 않는다
+
+
+def test_size_measure_failure_returns_none_and_does_not_raise(monkeypatch):
+    import utils
+
+    def boom():
+        raise RuntimeError("nas down")
+
+    monkeypatch.setattr(utils, "_nas_ssh_client", boom)
+    with main.app.app_context():
+        assert utils.user_home_size_bytes("alice") is None
