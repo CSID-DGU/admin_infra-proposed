@@ -591,6 +591,19 @@ def test_pod_env_carries_ticket_cache_path(env):
     assert env_map["KRB5CCNAME"] == f"FILE:/run/user/{env_map['UID']}/krb5cc_ailab"
 
 
+def test_pod_env_exposes_gpu_graphics_for_isaac_sim(env):
+    """CUDA 베이스 이미지 기본값(compute,utility)이면 Vulkan·그래픽 드라이버가 안 들어와 Isaac Sim 이
+    못 뜬다. 레거시 컨테이너(create_container.py)처럼 드라이버 기능 전부를 연다."""
+    e = env
+    e.api.post("/operations/provision", json={"request_id": "117", "username": "exp-np-gfx",
+                                              "account": {"passwd_base64": PW}})
+    tick(e)
+
+    pod = next(p for p in e.v1.pods.values() if "exp-np-gfx" in p.metadata.name)
+    env_map = {v["name"]: v.get("value") for v in pod.body["spec"]["containers"][0]["env"]}
+    assert env_map["NVIDIA_DRIVER_CAPABILITIES"] == "all"
+
+
 # ---------- Proposed-Full (VERIFY_MODE=full) ----------
 
 @pytest.fixture
