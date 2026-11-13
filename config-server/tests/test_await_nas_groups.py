@@ -145,7 +145,8 @@ def test_range_filter_of_the_real_query_function(monkeypatch):
 # ---------- step_await_nas_groups ----------
 
 @pytest.fixture
-def ad_on(monkeypatch):
+def ad_on(monkeypatch, pod_status):
+    """AD 를 쓰는 환경으로 둔다. 단계가 남기는 진행 문구는 Redis 대신 pod_status 목록으로 받는다."""
     monkeypatch.setitem(main.app.config, "KRB5_REALM", "TEST.REALM")
 
 
@@ -178,18 +179,31 @@ def test_step_waits_for_every_supp_group(ad_on, logs, nas_groups_ready, flush_ca
     assert flush_calls == []              # NAS 가 답했으면 캐시를 지울 일이 없다
 
 
-def test_step_is_skipped_without_supp_groups(ad_on, logs, nas_groups_ready):
+def test_step_tells_the_approval_screen_why_it_waits(ad_on, logs, pod_status, monkeypatch):
+    """계정 단계들은 진행 문구를 남기지 않아 승인 화면의 "현재 단계"가 "요청 접수"에 머문다. 이 단계는 5분쯤
+    기다릴 수 있으므로 기다리기 전에 이유를 적는다. stage 는 화면이 아는 값(started)이어야 한다."""
+    seen_at_wait = []
+    monkeypatch.setattr(main, "_wait_nas_groups", lambda u, g: seen_at_wait.append(list(pod_status)) or 1)
+    with main.app.app_context():
+        provision.step_await_nas_groups(_ctx())
+    assert pod_status == [("r1", "started", "NAS 공유 그룹 반영 확인 중")]
+    assert seen_at_wait == [[("r1", "started", "NAS 공유 그룹 반영 확인 중")]]      # 기다리기 전에 적었다
+
+
+def test_step_is_skipped_without_supp_groups(ad_on, logs, nas_groups_ready, pod_status):
     with main.app.app_context():
         provision.step_await_nas_groups(_ctx(supp_groups=[]))
         provision.step_await_nas_groups({"request_id": "r1", "name": "alice"})
     assert nas_groups_ready == [] and logs == []
+    assert pod_status == []               # 기다리지 않으면 문구도 바꾸지 않는다
 
 
-def test_step_is_skipped_when_ad_is_disabled(logs, nas_groups_ready, monkeypatch):
+def test_step_is_skipped_when_ad_is_disabled(logs, nas_groups_ready, pod_status, monkeypatch):
     monkeypatch.setitem(main.app.config, "KRB5_REALM", "")
     with main.app.app_context():
         provision.step_await_nas_groups(_ctx())
     assert nas_groups_ready == [] and logs == []
+    assert pod_status == []
 
 
 @pytest.mark.parametrize("failure", [
