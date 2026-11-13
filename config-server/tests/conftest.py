@@ -52,6 +52,16 @@ def pod_password_sync(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def nas_groups_ready(monkeypatch):
+    """새 계정의 보조 그룹을 NAS 에 조회하며 기다리는 일을 막는다(NAS 에 SSH 로 나가고 첫 조회 전에 10초를 쉰다).
+    NAS 가 바로 답한 것으로 돌린다. 대기 자체는 test_await_nas_groups 에서 따로 본다.
+    반환: (username, [gid]) 호출 목록"""
+    calls = []
+    monkeypatch.setattr(main, "_wait_nas_groups", lambda u, gids: calls.append((u, list(gids))) or 1)
+    return calls
+
+
 @pytest.fixture
 def logs(monkeypatch):
     """log_operation 호출을 DB 대신 목록에 모은다."""

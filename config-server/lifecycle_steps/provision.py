@@ -1903,12 +1903,43 @@ def step_sync_ad_groups(ctx):
     _main.log_operation(request_id=request_id, username=name, resource_type="groups",
                   action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
 
+def step_await_nas_groups(ctx):
+    """새 계정의 보조 그룹을 NAS 가 답할 때까지 기다린 뒤에 컨테이너를 만들게 한다(#279).
+
+    NAS 는 계정의 GSS 컨텍스트를 만들 때 그룹 목록을 한 번 정하고, GSS 컨텍스트 캐시를 지울 때까지 다시
+    조회하지 않는다(#153). 새 계정의 첫 GSS 컨텍스트는 AD 그룹에 넣은 약 2초 뒤에 생기는데, 그때 NAS 가
+    새 멤버십을 답하지 못하면 컨테이너의 `id` 에는 그룹이 나와도 group-dir-share 가 거절되고, 30분 크론이
+    캐시를 지울 때까지 그대로다(2026-11-13 실측: 21분 넘게 거절).
+
+    읽기만 하므로 되돌릴 것이 없고 다시 돌려도 된다. NAS 의 답을 확인하지 못해도 작업을 실패시키지 않는다 —
+    계정과 컨테이너는 쓸 수 있고 그룹 공유만 늦어지기 때문이다. 그때는 이 단계가 없던 때와 같은 상태이므로
+    NAS GSS 캐시 온디맨드 flush 를 띄워 30분 크론보다 먼저 고쳐지게 한다."""
+    request_id = ctx["request_id"]
+    name = ctx.get("name") or ctx["username"]
+    gids = sorted({int(sg["gid"]) for sg in (ctx.get("supp_groups") or [])})
+    if not gids or not _main._ad_enabled():
+        return
+
+    common = dict(request_id=request_id, username=name, resource_type="nas_groups", action=Action.CREATE_ACCOUNT)
+    _main.log_operation(phase=Phase.START, **common)
+    try:
+        polls = _main._wait_nas_groups(name, gids)
+    except Exception as e:
+        _main.app.logger.warning(
+            "[ACCOUNTS] NAS 가 보조 그룹을 답하는지 확인하지 못함 — 컨테이너는 만들고 NAS GSS 캐시 flush 를 띄움: "
+            "user=%s: %s", name, e)
+        _main.log_operation(phase=Phase.FAIL, error_code="NAS_GROUPS_UNCONFIRMED", error_detail=str(e)[:1000], **common)
+        step_trigger_nas_gss_flush(ctx)
+        return
+    _main.log_operation(phase=Phase.SUCCESS, error_detail=json.dumps({"nas_polls": polls}), **common)
+
 ACCOUNT_CREATE_STEPS = [
     step_create_account,
     step_create_home,
     step_create_krb5_principal,
     step_await_ad_replication,
     step_sync_ad_groups,
+    step_await_nas_groups,
 ]
 
 def step_trigger_nas_gss_flush(ctx):
