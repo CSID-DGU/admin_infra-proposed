@@ -72,6 +72,7 @@ from utils import (
     commit_and_save_user_image,
     create_nodeport_services,
     delete_nodeport_services,
+    nas_shared_gids_for_users,
 )
 
 app = Flask(__name__)
@@ -857,6 +858,48 @@ def _wait_node_identity(node: dict, username: str, uid: int) -> None:
             raise NodeIdentityTimeout(
                 f"{node['name']}에서 {username}(uid {uid})이 {int(NODE_IDENTITY_WAIT_SEC)}초 안에 준비되지 않음: {state}")
         time.sleep(NODE_IDENTITY_POLL_SEC)
+
+
+# NAS 는 한 계정의 그룹 목록을 한 번 조회하면 약 300초 동안 같은 답을 준다(NAS smb.conf 에 winbind cache time
+# 설정이 없어 기본값 300초, 2026-11-13 실측 281~309초). AD 그룹에 넣은 변경이 NAS 가 조회하는 DC 에 복제되기
+# 전에 NAS 에 조회하면 그 조회 때문에 NAS 가 옛 답을 300초 유지한다. 그래서 첫 조회 전에 복제될 시간을 먼저
+# 기다린다 — DC 사이 복제는 5초 주기로 나가므로 변경이 다른 DC 에 나타나기까지 최대 5초쯤 걸린다(같은 날
+# 실측: 다른 DC 에 변경이 나타난 시각 14건이 모두 5초 간격에 맞음). 주기 두 번을 넘기도록 10초로 잡는다.
+# 이 대기가 모자라거나 다른 프로그램이 먼저 조회했더라도 아래 반복 조회가 NAS 의 답이 바뀔 때까지 기다리므로
+# 결과는 같고 시간만 더 걸린다. 한도는 NAS 캐시 수명 한 번(300초)과 조회 간격을 넘기도록 잡는다.
+NAS_GROUP_SETTLE_SEC = float(os.getenv("NAS_GROUP_SETTLE_SEC", "10"))
+NAS_GROUP_WAIT_SEC = float(os.getenv("NAS_GROUP_WAIT_SEC", "420"))
+NAS_GROUP_POLL_SEC = float(os.getenv("NAS_GROUP_POLL_SEC", "20"))
+
+
+class NasGroupsTimeout(RuntimeError):
+    """NAS 가 한도 안에 사용자의 보조 그룹을 기대한 gid 로 답하지 않음."""
+
+
+def _wait_nas_groups(username: str, gids) -> int:
+    """NAS 가 이 사용자의 보조 그룹으로 gids 를 모두 답할 때까지 기다린다. 읽기만 한다.
+    답을 받기까지 NAS 에 조회한 횟수를 돌려준다(1이면 기다리지 않고 바로 답한 것)."""
+    wanted = {int(g) for g in gids}
+    if not wanted:
+        return 0
+    time.sleep(NAS_GROUP_SETTLE_SEC)
+    deadline = time.monotonic() + NAS_GROUP_WAIT_SEC
+    polls = 0
+    while True:
+        polls += 1
+        # 조회 범위를 기다리는 gid 에 맞춘다. 공용 대역 설정(SHARED_GID_MIN/MAX)과 어긋난 gid 가 와도
+        # NAS 가 답한 값이 걸러져 끝까지 기다리는 일이 없다.
+        seen = nas_shared_gids_for_users([username], min(wanted), max(wanted)).get(username)
+        if seen is not None and wanted <= seen:
+            return polls
+        if polls == 1:
+            missing = "계정을 조회하지 못함" if seen is None else f"없는 gid {sorted(wanted - seen)}"
+            app.logger.info(f"[NAS 그룹 대기] {username}: NAS 가 아직 공용 그룹을 답하지 않음({missing})")
+        if time.monotonic() >= deadline:
+            raise NasGroupsTimeout(
+                f"NAS 가 {username}의 보조 그룹 {sorted(wanted)}을 {int(NAS_GROUP_WAIT_SEC)}초 안에 답하지 않음"
+                f"(마지막 답: {'계정을 조회하지 못함' if seen is None else sorted(seen)}, 조회 {polls}회)")
+        time.sleep(NAS_GROUP_POLL_SEC)
 
 
 def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:

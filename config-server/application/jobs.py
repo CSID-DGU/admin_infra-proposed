@@ -78,7 +78,7 @@ RERUN_SAFE = {
     "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_commit_image",
     "step_migrate_cleanup_old",
-    "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication",
+    "step_add_user_groups", "step_sync_ad_groups", "step_await_ad_replication", "step_await_nas_groups",
     "step_change_login_password", "step_delete_expired_home", "step_restore_missing_home",
     "step_group_create", "step_group_add_member", "step_group_remove_member", "step_resolve_new_groups",
     "step_change_ports", "step_set_account_access",
