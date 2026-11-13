@@ -1920,6 +1920,11 @@ def step_await_nas_groups(ctx):
     if not gids or not _main._ad_enabled():
         return
 
+    # 이 단계는 평소 10초, NAS 가 옛 답을 유지하는 동안에는 5분쯤 기다린다. 계정 단계들은 진행 문구를 남기지
+    # 않아 그동안 승인 화면의 "현재 단계"가 "요청 접수"에 머문다(2026-11-13 baseline 실측) — 멈춘 것으로 보이지
+    # 않게 기다리는 이유를 적어 둔다. stage 는 등록 때와 같은 started 를 쓴다. 화면은 자기가 아는 stage 만
+    # 진행 중으로 표시하고, 모르는 값은 글자 그대로 내보낸다.
+    _main.set_pod_creation_status(request_id, "started", "NAS 공유 그룹 반영 확인 중")
     common = dict(request_id=request_id, username=name, resource_type="nas_groups", action=Action.CREATE_ACCOUNT)
     _main.log_operation(phase=Phase.START, **common)
     try:
