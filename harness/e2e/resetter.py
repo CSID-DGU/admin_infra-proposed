@@ -171,6 +171,10 @@ class Resetter:
         has_cleanups = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
                                         "AND table_name = 'home_cleanups';")
         cleanups = f"DELETE FROM home_cleanups WHERE user_id IN (SELECT * FROM ({users}) t);\n" if has_cleanups else ""
+        # 서버별 리눅스 계정 표(V23)는 users 를 가리킨다. 이 표가 없는 옛 admin_be 스택에서도 돌 수 있게 있을 때만 지운다.
+        has_accounts = self.cluster.sql("SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() "
+                                        "AND table_name = 'ubuntu_accounts';")
+        accounts = f"DELETE FROM ubuntu_accounts WHERE user_id IN (SELECT * FROM ({users}) t);\n" if has_accounts else ""
         e2e_group = f"SELECT group_id FROM `groups` WHERE group_name = '{safe(self.group_name)}'"
         group = (f"DELETE FROM `groups` WHERE group_name = '{safe(self.group_name)}' "
                  f"AND NOT EXISTS (SELECT 1 FROM user_groups WHERE group_id IN (SELECT * FROM ({e2e_group}) t)) "
@@ -182,6 +186,7 @@ class Resetter:
             f"{resets}"
             f"{group_ops}"
             f"{cleanups}"
+            f"{accounts}"
             f"DELETE FROM pod_external_ports WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM port_requests WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
             f"DELETE FROM change_request WHERE request_id IN (SELECT * FROM ({reqs}) t);\n"
