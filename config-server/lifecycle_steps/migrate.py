@@ -167,7 +167,8 @@ def step_migrate_cleanup_old(ctx):
         _main.delete_nodeport_services(old_pod, ns)
         _main.release_nodeports(old_pod)
         _main.load_k8s()
-        old_image = _old_pod_image(ns, old_pod)
+        old = _old_pod(ns, old_pod)
+        old_image = old.spec.containers[0].image if old is not None else None
         try:
             _main.delete_pod_util(old_pod, ns)
         except client.exceptions.ApiException as e:
@@ -179,6 +180,14 @@ def step_migrate_cleanup_old(ctx):
         if _main.node_image.is_user_image(old_image) and old_image != ctx.get("committed_image"):
             _main.wait_for_pod_deleted(client.CoreV1Api(), old_pod, ns)
             _main.remove_node_image_quietly(ctx.get("from_node"), old_image)
+        # 기존 Pod가 홈을 Pod 전용 NFS client 의 마운트로 받았으면 그것도 지운다. 기존 컨테이너가 끝날 때까지 노드가
+        # "아직 사용 중"이라고 답하므로 그동안 기다린다(release_pod_nfs). 새 Pod의 것은 Pod 이름이 달라 따로 있다.
+        if old is not None and _main.pod_uses_nfs_client(old):
+            # 기다리는 동안(기존 컨테이너의 종료 유예 시간, 보통 30초 안쪽) 화면의 "현재 단계"가 앞 단계의
+            # "컨테이너 생성 완료"에 머물지 않게 한다. 새 컨테이너는 이미 쓸 수 있으므로 단계 이름은 ready 그대로다.
+            _main.set_pod_creation_status(ctx["request_id"], "ready", "기존 컨테이너의 NFS 연결 정리 중")
+            _main.release_pod_nfs(ctx.get("from_node"), old_pod,
+                                  request_id=ctx["request_id"], username=ctx["username"])
         # 기존 노드의 keytab도 정리한다(같은 사용자의 다른 Pod가 그 노드에 남아 있으면 유지). 안 지우면 회수 때는
         # 마지막 노드만 정리되므로 기존 노드에 keytab이 계속 남는다.
         _main.step_cleanup_pod_node_krb5({"username": ctx["username"], "pod_name": old_pod,
@@ -192,9 +201,10 @@ def step_migrate_cleanup_old(ctx):
     _main.set_pod_creation_status(ctx["request_id"], "ready", f"마이그레이션 완료 (node={ctx['node']})")
 
 
-def _old_pod_image(ns, old_pod):
+def _old_pod(ns, old_pod):
+    """기존 Pod. 이미 없으면 None."""
     try:
-        return client.CoreV1Api().read_namespaced_pod(old_pod, ns).spec.containers[0].image
+        return client.CoreV1Api().read_namespaced_pod(old_pod, ns)
     except client.exceptions.ApiException as e:
         if e.status == 404:
             return None

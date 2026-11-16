@@ -116,13 +116,14 @@ def test_reconcile_does_nothing_when_ad_is_off(ledger, farm, monkeypatch):
     assert calls == []
 
 
-def test_cron_runs_idmap_sync_last():
-    """노드가 응답하지 않아도 앞의 재조정(keytab 정리·NAS 캐시)은 이미 끝나 있어야 한다."""
+def test_cron_runs_the_node_calls_last():
+    """노드가 응답하지 않아도 앞의 재조정(keytab 정리·NAS 캐시)은 이미 끝나 있어야 한다. 노드마다 접속하는
+    두 가지(공유 그룹 등록, Pod 없는 NFS client 정리)가 뒤에 오고, 마운트 해제를 기다릴 수 있는 쪽이 맨 뒤다."""
     src = pathlib.Path(rec.__file__).read_text(encoding="utf-8")
     main_block = src[src.index('if __name__ == "__main__":'):]
     order = [line.strip() for line in main_block.splitlines() if line.strip().startswith("reconcile_")]
     assert order == ["reconcile_krb5_cleanup_pending()", "reconcile_krb5_orphans()",
-                     "reconcile_nas_gss_cache()", "reconcile_idmap_groups()"]
+                     "reconcile_nas_gss_cache()", "reconcile_idmap_groups()", "reconcile_pod_nfs()"]
 
 
 # ---------- 노드 호출 ----------

@@ -520,7 +520,7 @@ def get_pod_status(request_id):
 # //////////////////////// Pod 삭제 //////////////////////
 
 # ---------- Pod 회수 단계 (v2.0) ----------
-# 순서: NodePort Service 삭제 → NodePort 반환 → k8s Pod 삭제 → 그 노드의 keytab 정리
+# 순서: NodePort Service 삭제 → NodePort 반환 → k8s Pod 삭제 → 그 Pod 전용 NFS client 정리 → 그 노드의 keytab 정리
 
 
 
@@ -990,6 +990,136 @@ def _remove_krb5_from_all_farms(username: str) -> None:
             _record_krb5_cleanup_pending(username, node["name"])
 
 
+# ---- Pod 별 독립 NFS client ----
+# 노드가 NAS 를 한 번 마운트한 것을 그 노드의 Pod 가 모두 함께 쓰면, Pod 들이 NFS client 하나와 TCP 연결 하나를
+# 나눠 쓴다. 한 Pod 의 대량 쓰기가 같은 연결을 쓰는 다른 Pod 의 요청을 늦춘다. 리눅스의 NFS client 는 네트워크
+# 네임스페이스마다 따로 생기므로, 노드의 provi-pod-nfs 가 Pod 마다 네트워크 네임스페이스를 만들어 그 안에서 NAS 를
+# 마운트한다(admin_infra_server kerberos-nfs/script/farm/provi-pod-nfs). 여기서는 그 스크립트를
+# ailab-krb5-admin 의 nfs-attach·nfs-detach·nfs-list 로 부르기만 한다.
+#
+# 노드가 마운트하는 경로. 노드 스크립트의 MOUNT_ROOT 와 같아야 하며, 노드가 답한 경로가 이 값과 다르면 Pod 를
+# 만들지 않는다. /run 아래라 노드가 재부팅하면 경로가 사라지고, hostPath(type: Directory)로 받는 Pod 는 그때
+# 시작되지 않는다 — 마운트 없는 빈 디렉터리를 /home 으로 받는 일이 없다.
+POD_NFS_MOUNT_ROOT = "/run/provi/nfs"
+# Pod 삭제를 요청한 뒤 컨테이너가 끝날 때까지 노드는 "아직 사용 중"(busy)이라고 답한다. 사용자 컨테이너는 종료
+# 신호를 받고 끝나기까지 유예 시간 30초를 다 쓰는 일이 많아 그보다 길게 기다린다. 그 뒤에도 busy 면 그대로 두고
+# krb5-reconcile(reconcile_pod_nfs)이 다시 지운다.
+POD_NFS_DETACH_WAIT_SEC = float(os.getenv("POD_NFS_DETACH_WAIT_SEC", "60"))
+POD_NFS_DETACH_POLL_SEC = float(os.getenv("POD_NFS_DETACH_POLL_SEC", "3"))
+
+
+class PodNfsError(RuntimeError):
+    """노드가 Pod 전용 NFS client 를 만들거나 지우지 못함. 메시지는 노드 스크립트가 답한 이유다."""
+
+
+def pod_nfs_enabled() -> bool:
+    """새로 만드는 Pod 에 Pod 별 독립 NFS client 를 붙이는가. Kerberos 를 쓰는 환경이면 항상 붙인다 — Pod 를 만들기
+    직전에 노드가 그 Pod 전용 NFS client 로 NAS 를 따로 마운트하고, Pod 는 그 마운트를 /home 으로 받는다
+    (_attach_pod_nfs). Kerberos 가 꺼진 환경에서는 노드의 NFS client(노드가 마운트해 둔 것)를 쓴다.
+    이미 만든 Pod 를 지울 때는 이 값이 아니라 그 Pod 의 설정(pod_uses_nfs_client)을 본다."""
+    return bool(app.config["KRB5_REALM"])
+
+
+def pod_nfs_path(pod_name: str) -> str:
+    return f"{POD_NFS_MOUNT_ROOT}/{app.config['NAMESPACE']}/{pod_name}"
+
+
+def pod_uses_nfs_client(pod) -> bool:
+    """이 Pod 가 /home 을 Pod 전용 NFS client 의 마운트로 받았는가. 지울 때 노드 정리가 필요한지를 이 값으로
+    정한다 — 이 기능을 넣기 전에 노드의 NFS client 로 만든 Pod 는 노드에서 정리할 것이 없다."""
+    for volume in getattr(pod.spec, "volumes", None) or []:
+        host_path = getattr(volume, "host_path", None)
+        if volume.name == "nfs-home" and host_path is not None \
+                and str(host_path.path).startswith(POD_NFS_MOUNT_ROOT + "/"):
+            return True
+    return False
+
+
+def _pod_nfs_answer(text) -> dict:
+    """노드 스크립트 출력의 마지막 nfs_state 줄을 {이름: 값}으로. 예: nfs_state=busy reason=holders=1(pid=7:/home)"""
+    for line in reversed((text if isinstance(text, str) else "").splitlines()):
+        if line.startswith("nfs_state="):
+            return dict(part.split("=", 1) for part in line.split() if "=" in part)
+    return {}
+
+
+def _pod_nfs_call(node_name: str, command: str) -> dict:
+    """노드 스크립트를 한 번 부르고 답을 돌려준다. 스크립트는 busy(종료 코드 75)·failed(1)일 때도 표준출력에
+    상태 줄을 남기고, _farm_ssh 는 그 출력을 예외에 붙여 준다. 상태 줄이 없으면(접속 실패, 스크립트 없음) 예외를 그대로 올린다."""
+    node = _get_farm_node_info(node_name)
+    try:
+        return _pod_nfs_answer(_farm_ssh(node["host"], node["port"], command))
+    except RuntimeError as e:
+        answer = _pod_nfs_answer(getattr(e, "stdout", None))
+        if not answer:
+            raise
+        return answer
+
+
+def _attach_pod_nfs(username: str, uid: int, node_name: str, pod_name: str) -> str:
+    """노드에 이 Pod 전용 NFS client 를 만들고, Pod 가 /home 으로 받을 노드 경로를 돌려준다. _deploy_krb5_to_farm
+    뒤에 부른다 — 노드는 그때 받은 사용자 티켓으로 마운트한다. 같은 Pod 이름으로 다시 부르면 노드는 이미 만든
+    것을 그대로 답하므로, Pod 생성을 다시 시도할 때 그대로 불러도 된다."""
+    ns = app.config["NAMESPACE"]
+    answer = _pod_nfs_call(node_name, f"nfs-attach {username} {int(uid)} {ns} {pod_name}")
+    path = pod_nfs_path(pod_name)
+    if answer.get("nfs_state") != "ready":
+        raise PodNfsError(f"{node_name}: {answer.get('reason') or answer or '노드 스크립트가 상태를 답하지 않음'}")
+    if answer.get("path") != path:
+        raise PodNfsError(f"{node_name}: 노드가 답한 경로 {answer.get('path')!r} 가 {path!r} 와 다름")
+    app.logger.info(f"[POD NFS] 준비됨: {pod_name} @ {node_name} (slot={answer.get('slot')}, reused={answer.get('reused')})")
+    return path
+
+
+def _detach_pod_nfs(node_name: str, pod_name: str, wait_sec: float = 0.0, min_age_sec: int = 0) -> dict:
+    """노드에서 이 Pod 전용 NFS client 를 지우고 노드의 답을 돌려준다. nfs_state 는 removed(지움)·absent(없었음)·
+    busy(지우지 않음) 중 하나다. 그 밖의 답과 접속 실패는 예외로 올린다.
+
+    busy 는 그 마운트를 잡은 컨테이너나 NAS 로 가는 연결이 아직 있다는 뜻이고, 노드는 그때 아무것도 지우지 않는다
+    (NAS 가 응답하지 않는 동안 지우면 그 NFS client 가 복구되지 못한다). wait_sec 를 주면 그동안 다시 부른다.
+    min_age_sec 를 주면 노드는 마지막 nfs-attach 뒤 그 시간이 지나지 않은 것도 busy 로 답하고 그대로 둔다."""
+    ns = app.config["NAMESPACE"]
+    command = f"nfs-detach {ns} {pod_name}" + (f" {int(min_age_sec)}" if min_age_sec else "")
+    deadline = time.monotonic() + wait_sec
+    while True:
+        answer = _pod_nfs_call(node_name, command)
+        state = answer.get("nfs_state")
+        if state in ("removed", "absent"):
+            return answer
+        if state != "busy":
+            raise PodNfsError(f"{node_name}: {answer.get('reason') or answer or '노드 스크립트가 상태를 답하지 않음'}")
+        if time.monotonic() >= deadline:
+            return answer
+        time.sleep(POD_NFS_DETACH_POLL_SEC)
+
+
+def release_pod_nfs(node_name, pod_name, request_id=None, username=None) -> str:
+    """Pod 삭제를 요청한 뒤 그 Pod 전용 NFS client 를 노드에서 지운다. 지우지 못해도 예외를 올리지 않는다 — 남은 것은
+    krb5-reconcile(reconcile_pod_nfs)이 다시 지운다. 결과(removed·absent·busy·failed)를 돌려준다.
+    request_id 를 주면 작업 이력에 단계로 남긴다."""
+    def record(phase, **extra):
+        if request_id is not None:
+            log_operation(request_id=request_id, username=username, pod_name=pod_name, node_name=node_name,
+                          resource_type="pod_nfs", action=Action.DETACH_POD_NFS, phase=phase, **extra)
+
+    record(Phase.START)
+    try:
+        answer = _detach_pod_nfs(node_name, pod_name, wait_sec=POD_NFS_DETACH_WAIT_SEC)
+    except Exception as e:
+        app.logger.warning(f"[POD NFS] 정리 실패, krb5-reconcile 에 맡김: {pod_name} @ {node_name} — {str(e)[-500:]}")
+        record(_fail_phase(e), error_code="POD_NFS_DETACH_FAILED", error_detail=str(e)[-1000:])
+        return "failed"
+    state = answer["nfs_state"]
+    if state == "busy":
+        app.logger.warning(
+            f"[POD NFS] 아직 사용 중이라 남겨 둠, krb5-reconcile 에 맡김: {pod_name} @ {node_name} — {answer.get('reason')}")
+        record(Phase.FAIL, error_code="POD_NFS_BUSY", error_detail=answer.get("reason"))
+        return state
+    app.logger.info(f"[POD NFS] 정리됨({state}): {pod_name} @ {node_name}")
+    record(Phase.SUCCESS, error_detail=json.dumps({"nfs_state": state}))
+    return state
+
+
 accounts_bp = Blueprint("accounts", __name__)
 
 # ---------- 계정 생성 단계 (v2.0) ----------
@@ -1189,7 +1319,7 @@ from lifecycle_steps.provision import (  # noqa: E402
     account_secret_name, ensure_account_secret, own_account_secret, delete_account_secret,
     LoginPasswordMissing, decode_login_password, login_password_for_recreate, login_password_hash)
 from lifecycle_steps.revoke import (  # noqa: E402
-    step_delete_services, step_release_nodeports, step_delete_pod_k8s,
+    step_delete_services, step_release_nodeports, step_delete_pod_k8s, step_detach_pod_nfs,
     step_cleanup_pod_node_krb5, _new_delete_rollback, POD_DELETE_STEPS,
     step_check_account_revocable, step_delete_account, step_remove_krb5,
 )

@@ -57,9 +57,11 @@ def test_step_order_matches_current_flow():
     assert [s.__name__ for s in main.POD_CREATE_STEPS] == [
         "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
         "step_create_pod_k8s", "step_wait_ready", "step_create_services"]
+    # Pod 전용 NFS client 는 Pod 가 사라진 뒤, 그 노드의 keytab 을 지우기 전에 정리한다 — 노드는 마운트를 해제하면서
+    # 남은 요청을 사용자 티켓으로 보낸다.
     assert [s.__name__ for s in main.POD_DELETE_STEPS] == [
-        "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_remove_node_image",
-        "step_cleanup_pod_node_krb5"]
+        "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_detach_pod_nfs",
+        "step_remove_node_image", "step_cleanup_pod_node_krb5"]
 
 
 # ---------- DELETE /pods/<name>은 단계 결과를 응답으로 돌려준다 ----------

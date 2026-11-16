@@ -382,7 +382,9 @@ NODE_OUTAGE_TOLERATIONS = [
 ]
 
 
-def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
+def _cleanup_create_failure(pod_name, v1=None, delete_services=False, node=None):
+    """node 는 Pod 를 만들려던 노드다. Pod 전용 NFS client 는 Pod 보다 먼저 만들어지므로(build_pod_spec) Pod 가
+    생기기 전에 실패해도 그 노드에 남아 있다 — 노드를 넘겨야 여기서 지운다."""
     ns = _main.app.config["NAMESPACE"]
     rollback = {
         "nodeportsReleased": False,
@@ -424,6 +426,11 @@ def _cleanup_create_failure(pod_name, v1=None, delete_services=False):
         except Exception:
             _main.app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
         delete_account_secret(v1, ns, pod_name)
+
+    if node and _main.pod_nfs_enabled():
+        # 컨테이너가 떠 있었다면 끝날 때까지 노드가 busy 로 답하므로 그동안 기다린다. 끝내 지우지 못해도
+        # 같은 Pod 이름으로 다시 만들 때 nfs-attach 가 남은 것을 그대로 쓰고, 다시 만들지 않으면 krb5-reconcile 이 지운다.
+        rollback["podNfs"] = _main.release_pod_nfs(node, pod_name)
 
     return rollback
 
@@ -675,7 +682,10 @@ def step_build_pod_spec(ctx):
             image=ctx.get("committed_image"),
         )
     except _main.PodSpecBuildError as e:
-        _main.set_pod_creation_status(request_id, "failed", "pod spec 생성 실패")
+        # 승인 화면은 이 문구를 실패 원인으로 보여 준다. build_pod_spec 이 어느 단계에서 실패했는지 붙여 올렸으면
+        # (failed_stage) 그 문구를 쓴다.
+        _main.set_pod_creation_status(request_id, "failed",
+                                      getattr(e.__cause__, "failed_stage", None) or "pod spec 생성 실패")
         raise _main.StepFailed(_main.infra_error(
             "BUILD_POD_SPEC",
             "POD_SPEC_BUILD_FAILED",
@@ -722,7 +732,7 @@ def step_create_pod_k8s(ctx):
         v1 = client.CoreV1Api()
     except Exception as e:
         _main.app.logger.exception("[CREATE POD] k8s client setup failed")
-        rollback = _main._cleanup_create_failure(pod_name)
+        rollback = _main._cleanup_create_failure(pod_name, node=best_node)
         raise _main.StepFailed(_main.infra_error(
             "CREATE_POD",
             "K8S_CLIENT_SETUP_FAILED",
@@ -736,7 +746,7 @@ def step_create_pod_k8s(ctx):
         passwd_hash = login_password_hash(ctx["user_info"])
     except LoginPasswordMissing as e:
         _main.set_pod_creation_status(request_id, "failed", "로그인 비밀번호 없음")
-        rollback = _main._cleanup_create_failure(pod_name)
+        rollback = _main._cleanup_create_failure(pod_name, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="pod",
                       action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
@@ -760,7 +770,7 @@ def step_create_pod_k8s(ctx):
     except client.exceptions.ApiException as e:
         _main.app.logger.exception("[CREATE POD] pod creation failed")
         _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1)
+        rollback = _main._cleanup_create_failure(pod_name, v1, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="pod",
                       action=Action.CREATE_POD_K8S, phase=Phase.FAIL,
@@ -776,7 +786,7 @@ def step_create_pod_k8s(ctx):
     except Exception as e:
         _main.app.logger.exception("[CREATE POD] pod creation failed")
         _main.set_pod_creation_status(request_id, "failed", "pod 생성 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1)
+        rollback = _main._cleanup_create_failure(pod_name, v1, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="pod",
                       action=Action.CREATE_POD_K8S, phase=_main._fail_phase(e),
@@ -863,7 +873,7 @@ def step_wait_ready(ctx):
             close_sub(Phase.FAIL, "POD_READY_TIMEOUT")
             _main.app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
             _main.set_pod_creation_status(request_id, "failed", failure_reason.split(":", 1)[0])
-            rollback = _main._cleanup_create_failure(pod_name, v1)
+            rollback = _main._cleanup_create_failure(pod_name, v1, node=best_node)
             # 컨테이너가 남긴 마지막 출력을 이 단계 행에 함께 남긴다. 작업 단위 행에도 실리지만,
             # 단계별로 볼 때 먼저 보게 되는 것은 이 행이다.
             log_tail = rollback.get("podLogTail")
@@ -887,7 +897,7 @@ def step_wait_ready(ctx):
         close_sub(Phase.FAIL, "POD_READY_CHECK_FAILED")
         _main.app.logger.exception("[CREATE POD] pod ready check failed")
         _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1)
+        rollback = _main._cleanup_create_failure(pod_name, v1, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="pod",
                       action=Action.WAIT_READY, phase=Phase.FAIL,
@@ -904,7 +914,7 @@ def step_wait_ready(ctx):
         close_sub(Phase.FAIL, "POD_READY_CHECK_FAILED")
         _main.app.logger.exception("[CREATE POD] pod ready check failed")
         _main.set_pod_creation_status(request_id, "failed", "pod ready 확인 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1)
+        rollback = _main._cleanup_create_failure(pod_name, v1, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="pod",
                       action=Action.WAIT_READY, phase=_main._fail_phase(e),
@@ -941,7 +951,7 @@ def step_create_services(ctx):
     except client.exceptions.ApiException as e:
         _main.app.logger.exception("[CREATE POD] service creation failed")
         _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True)
+        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="service",
                       action=Action.CREATE_SERVICE, phase=Phase.FAIL,
@@ -957,7 +967,7 @@ def step_create_services(ctx):
     except Exception as e:
         _main.app.logger.exception("[CREATE POD] service creation failed")
         _main.set_pod_creation_status(request_id, "failed", "서비스 생성 실패")
-        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True)
+        rollback = _main._cleanup_create_failure(pod_name, v1, delete_services=True, node=best_node)
         _main.log_operation(request_id=request_id, username=username, pod_name=pod_name,
                       node_name=best_node, resource_type="service",
                       action=Action.CREATE_SERVICE, phase=_main._fail_phase(e),
@@ -1148,15 +1158,15 @@ def build_pod_spec(
         volume_mounts = [
             {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
         ]
-        volumes = [
-            {
-                "name": "nfs-home",
-                # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
-                # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
-                # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
-                "hostPath": {"path": _main.resolve_farm_home_mount_root(target_node), "type": "Directory"},
-            },
-        ]
+        # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
+        # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
+        # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
+        # Pod 별 독립 NFS client 를 쓰면 아래 Kerberos 배포 뒤에 그 Pod 전용 마운트 경로로 바꾼다.
+        home_volume = {
+            "name": "nfs-home",
+            "hostPath": {"path": _main.resolve_farm_home_mount_root(target_node), "type": "Directory"},
+        }
+        volumes = [home_volume]
 
         if _main.app.config["KRB5_REALM"]:
             # keytab은 컨테이너에 마운트하지 않는다 — farm 노드에만 배포하고 호스트가 갱신한 TGT만 공유한다.
@@ -1176,6 +1186,32 @@ def build_pod_spec(
             _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
                           node_name=target_node, resource_type="kerberos",
                           action=Action.DEPLOY_KRB5, phase=Phase.SUCCESS)
+
+            if _main.pod_nfs_enabled():
+                # 노드가 이 Pod 전용 NFS client 로 NAS 를 마운트하고, Pod 는 그 마운트를 /home 으로 받는다. 위에서
+                # 배포한 사용자 티켓으로 마운트하므로 Kerberos 배포 뒤에 한다. 실패하면 예외가 아래 except 로 전달되어
+                # nodeport 롤백 + Pod 미생성으로 처리된다(노드 스크립트는 만들다 만 것을 스스로 되돌린다).
+                # 진행 단계 이름은 화면이 아는 것(deploying_krb5)을 그대로 쓰고 문구만 바꾼다.
+                _main.set_pod_creation_status(status_key, "deploying_krb5", f"홈 디렉터리 NFS 연결 중 (node={target_node})")
+                _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                              node_name=target_node, resource_type="pod_nfs",
+                              action=Action.ATTACH_POD_NFS, phase=Phase.START)
+                try:
+                    home_path = _main._attach_pod_nfs(username, uid, target_node, pod_name)
+                except Exception as e:
+                    _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                                  node_name=target_node, resource_type="pod_nfs",
+                                  action=Action.ATTACH_POD_NFS, phase=_main._fail_phase(e),
+                                  error_code="POD_NFS_ATTACH_FAILED", error_detail=str(e)[-1000:])
+                    # 승인 화면의 실패 원인이 "pod spec 생성 실패"로만 나오지 않게 한다(step_build_pod_spec 이 읽는다).
+                    e.failed_stage = "홈 디렉터리 NFS 연결 실패"
+                    raise
+                _main.log_operation(request_id=status_key, username=username, pod_name=pod_name,
+                              node_name=target_node, resource_type="pod_nfs",
+                              action=Action.ATTACH_POD_NFS, phase=Phase.SUCCESS)
+                # 경로가 없으면 컨테이너가 시작되지 않게 Directory 로 둔다(DirectoryOrCreate 면 kubelet 이 빈
+                # 디렉터리를 만들어 /home 으로 넘긴다).
+                home_volume["hostPath"] = {"path": home_path, "type": "Directory"}
 
             # rpc-gssd가 호스트에서 ccache를 읽을 수 있도록 Pod와 호스트가 /run/user/<uid> 공유
             volume_mounts.append({

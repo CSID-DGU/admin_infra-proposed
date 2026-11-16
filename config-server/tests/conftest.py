@@ -53,6 +53,26 @@ def pod_password_sync(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def pod_nfs_node(monkeypatch):
+    """Kerberos 를 쓰면 사용자 Pod 는 항상 Pod 별 독립 NFS client 를 쓰므로, Kerberos 를 켠 시험에서 Pod 를 만들고 지우면 노드에
+    nfs-attach·nfs-detach 를 보낸다. 노드에 나가지 않도록 노드가 곧바로 성공한 것으로 답한다. 노드와 주고받는 내용과
+    busy·실패 같은 답은 test_pod_nfs_client 에서 따로 본다(그 파일은 이 대역을 실제 함수로 되돌린다).
+    반환: (노드, 명령) 목록"""
+    calls = []
+
+    def answer(node_name, command):
+        calls.append((node_name, command))
+        words = command.split()
+        if words[0] == "nfs-attach":
+            return {"nfs_state": "ready", "path": main.pod_nfs_path(words[4]), "slot": "0", "reused": "0"}
+        if words[0] == "nfs-detach":
+            return {"nfs_state": "removed"}
+        raise AssertionError(f"알 수 없는 노드 명령: {command}")
+    monkeypatch.setattr(main, "_pod_nfs_call", answer)
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def nas_groups_ready(monkeypatch):
     """새 계정의 보조 그룹을 NAS 에 조회하며 기다리는 일을 막는다(NAS 에 SSH 로 나가고 첫 조회 전에 10초를 쉰다).
     NAS 가 바로 답한 것으로 돌린다. 대기 자체는 test_await_nas_groups 에서 따로 본다.

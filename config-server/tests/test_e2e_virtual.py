@@ -55,14 +55,18 @@ class FakeV1:
             metadata=types.SimpleNamespace(name=name, labels=body["metadata"]["labels"], uid=f"uid-{name}"),
             spec=types.SimpleNamespace(
                 node_name=body["spec"]["nodeName"],
-                containers=[types.SimpleNamespace(name=c["name"], image=c["image"]) for c in body["spec"]["containers"]]),
+                containers=[types.SimpleNamespace(name=c["name"], image=c["image"]) for c in body["spec"]["containers"]],
+                volumes=[types.SimpleNamespace(name=v["name"], host_path=types.SimpleNamespace(path=v["hostPath"]["path"]))
+                         for v in body["spec"].get("volumes", []) if "hostPath" in v]),
             status=types.SimpleNamespace(container_statuses=[types.SimpleNamespace(
                 name=c["name"], container_id="containerd://" + f"{len(self.pods):064x}",
                 state=types.SimpleNamespace(running=object())) for c in body["spec"]["containers"]]),
             body=body)
         return self.pods[name]
 
-    def list_namespaced_pod(self, ns, label_selector):
+    def list_namespaced_pod(self, ns, label_selector=None):
+        if label_selector is None:
+            return types.SimpleNamespace(items=list(self.pods.values()))
         key, value = label_selector.split("=")
         return types.SimpleNamespace(items=[p for p in self.pods.values() if p.metadata.labels.get(key) == value])
 
@@ -263,7 +267,7 @@ def result(e, kind, rid):
 
 # ---------- 시나리오 ----------
 
-def test_provision_then_revoke_full_flow(env):
+def test_provision_then_revoke_full_flow(env, pod_nfs_node):
     e = env
     r = e.api.post("/operations/provision", json={"request_id": "101", "username": "exp-np-e2e",
                                                   "account": {"passwd_base64": PW}})
@@ -275,7 +279,8 @@ def test_provision_then_revoke_full_flow(env):
     steps = [a for a, p in rows(e, "101") if p == "SUCCESS"]
     assert steps == ["CREATE_ACCOUNT", "CREATE_HOME", "CREATE_KRB5_PRINCIPAL", "CREATE_KRB5_PRINCIPAL",
                      "FETCH_USER_CONFIG", "SELECT_NODE",
-                     "ALLOCATE_NODEPORT", "DEPLOY_KRB5", "CREATE_POD_K8S", "WAIT_READY", "CREATE_SERVICE", "PROVISION"]
+                     "ALLOCATE_NODEPORT", "DEPLOY_KRB5", "ATTACH_POD_NFS", "CREATE_POD_K8S", "WAIT_READY",
+                     "CREATE_SERVICE", "PROVISION"]
     assert "exp-np-e2e" in passwd_names()
     uid = int(passwd_line("exp-np-e2e").split(":")[2])
     assert 50000 <= uid <= 54999
@@ -293,13 +298,17 @@ def test_provision_then_revoke_full_flow(env):
     names = [c[0] for c in e.calls]
     assert "delete_home" not in names                     # 홈 보존
     assert ("krb5_remove", ("exp-np-e2e", "farm2")) in e.calls   # 지운 Pod의 노드에서 keytab 정리
+    # 기본은 Pod 별 독립 NFS client: 생성 때 그 Pod 의 NFS client 를 만들고, 회수 때 Pod 를 지운 뒤 노드에서 지운다
+    ns = main.app.config["NAMESPACE"]
+    assert pod_nfs_node == [("farm2", f"nfs-attach exp-np-e2e {uid} {ns} {pod_name}"),
+                            ("farm2", f"nfs-detach {ns} {pod_name}")]
     assert "krb5_principal_delete" in names
     # 작업 번호: 생성 작업의 모든 행이 같은 번호, 회수 작업은 다른 번호. 목표 상태에 비밀번호 해시 없음
     jobs = e.db.execute("SELECT action, job_id, target_state FROM operation_log WHERE request_id='101'").fetchall()
-    create_ids = {j for a, j, t in jobs if a not in ("REVOKE", "DELETE_SERVICE", "RELEASE_NODEPORT", "DELETE_POD_K8S",
-                                                     "DELETE_ACCOUNT", "REMOVE_KRB5")}
-    revoke_ids = {j for a, j, t in jobs if a in ("REVOKE", "DELETE_SERVICE", "RELEASE_NODEPORT", "DELETE_POD_K8S",
-                                                 "DELETE_ACCOUNT", "REMOVE_KRB5")}
+    revoke_actions = ("REVOKE", "DELETE_SERVICE", "RELEASE_NODEPORT", "DELETE_POD_K8S", "DETACH_POD_NFS",
+                      "DELETE_ACCOUNT", "REMOVE_KRB5")
+    create_ids = {j for a, j, t in jobs if a not in revoke_actions}
+    revoke_ids = {j for a, j, t in jobs if a in revoke_actions}
     assert len(create_ids) == 1 and len(revoke_ids) == 1 and create_ids != revoke_ids and None not in create_ids
     start_target = next(t for a, j, t in jobs if a == "PROVISION" and t)
     assert "exp-np-e2e" in start_target and "$6$" not in start_target and "passwd_hash" not in start_target
