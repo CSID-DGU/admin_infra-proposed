@@ -108,6 +108,10 @@ class Action(str, Enum):
     MOUNT_VOLUME = "MOUNT_VOLUME"        # 볼륨 마운트 재시도 중
     # 같은 노드에서 Pod를 다시 만들기 전에 컨테이너 변경분을 그 노드의 이미지로 굽는다.
     COMMIT_IMAGE = "COMMIT_IMAGE"
+    # Pod 별 독립 NFS client. Pod 를 만들기 전에 노드가 그 Pod 전용 NFS client 로 NAS 를 마운트하고(ATTACH),
+    # Pod 를 지운 뒤 노드에서 지운다(DETACH). Kerberos 를 쓰는 환경에서 기록된다.
+    ATTACH_POD_NFS = "ATTACH_POD_NFS"
+    DETACH_POD_NFS = "DETACH_POD_NFS"
 
 
 class Phase(str, Enum):

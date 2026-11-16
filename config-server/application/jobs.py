@@ -74,7 +74,7 @@ RERUN_SAFE = {
     "step_fetch_user_config", "step_prepare_pod", "step_select_node", "step_build_pod_spec",
     "step_create_home", "step_wait_ready", "step_create_services",
     "step_delete_services", "step_release_nodeports", "step_delete_pod_k8s", "step_remove_node_image",
-    "step_cleanup_pod_node_krb5", "step_check_account_revocable",
+    "step_detach_pod_nfs", "step_cleanup_pod_node_krb5", "step_check_account_revocable",
     "step_delete_account", "step_remove_krb5",
     "step_migrate_select_target", "step_migrate_inherit_password", "step_migrate_commit_image",
     "step_migrate_cleanup_old",
@@ -97,7 +97,7 @@ DEFER_DONE = {"step_build_pod_spec": "step_create_pod_k8s"}
 SAVED_CTX_KEYS = ("uid", "gid", "pod_name", "node", "allocated_ports", "pod_node_name",
                   "verify_ports", "verify_node", "home_created", "account_write_started",
                   "old_pod_name", "from_node", "skipped", "skip_reason", "old_pod_cleanup", "committed_image",
-                  "committed_image_node")
+                  "committed_image_node", "pod_nfs_node")
 
 def _saved_ctx(ctx):
     return {k: ctx[k] for k in SAVED_CTX_KEYS if k in ctx}

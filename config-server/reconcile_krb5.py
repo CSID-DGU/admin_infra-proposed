@@ -3,8 +3,11 @@ import tempfile
 import threading
 import time
 
+from kubernetes import client
+
 from main import (app, _get_farm_node_info, _remove_krb5_from_farm, _farm_ssh, _ad_enabled,
-                  _record_krb5_cleanup_pending, SHARED_GID_MIN, SHARED_GID_MAX)
+                  _record_krb5_cleanup_pending, SHARED_GID_MIN, SHARED_GID_MAX,
+                  load_k8s, _detach_pod_nfs)
 from utils import (get_db_connection, read_group_lines, parse_group_line,
                    read_passwd_lines, parse_passwd_line,
                    nas_shared_gids_for_users, nas_flush_gss_cache, _VALID_USERNAME_RE)
@@ -112,6 +115,59 @@ def reconcile_krb5_orphans() -> None:
                 f"[KRB5 RECONCILE] 고아 후보(자동 삭제 안 함, 확인 필요): {username} @ {node['name']} "
                 "— nodeport_allocations엔 없지만 레거시 계정일 수 있음, 직접 확인 후 정리할 것"
             )
+
+
+# Pod 전용 NFS client 는 Pod 를 만들기 직전에 노드에 만들어진다(_attach_pod_nfs). 그래서 "노드에는 있는데 Pod 가
+# 없는" 순간이 정상 흐름에도 잠깐 있다. 마지막 nfs-attach 뒤 이 시간이 지나지 않은 것은 노드가 지우지 않는다 —
+# 시간 판정을 노드에 맡기는 이유는, 여기서 목록을 읽은 뒤 지우라고 부르기 전에 같은 Pod 이름으로 nfs-attach 가
+# 다시 올 수 있어서다(생성 작업의 재시도). Pod 준비 대기 한도(POD_READY_MAX_WAIT_SEC=500)보다 길게 잡는다.
+POD_NFS_ORPHAN_MIN_AGE_SEC = 600
+
+
+def reconcile_pod_nfs() -> None:
+    """노드에 남은 Pod 전용 NFS client 중 Pod 가 없는 것을 지운다.
+
+    Pod 를 지우는 작업은 Pod 가 사라진 뒤 노드에 nfs-detach 를 부르지만, 그때 지우지 못하는 경우가 있다 — 노드가
+    "아직 사용 중"이라고 답했거나(NAS 가 응답하지 않아 컨테이너가 끝나지 못함), 노드 접속이 실패했거나, 작업이
+    도중에 죽었거나, Pod 가 이 서버를 거치지 않고 지워진 경우다. 따로 예약을 적어 두지 않고 노드의 목록(nfs-list)과
+    지금 있는 Pod 를 대조해 찾는다. 노드는 그 마운트를 잡은 컨테이너나 NAS 로 가는 연결이 남아 있으면 지우지 않고
+    busy 로 답하므로, 여기서 잘못 골라도 쓰는 중인 것은 지워지지 않는다.
+
+    노드에는 여러 스택의 것이 함께 있다. 이 스택의 네임스페이스로 만든 것만 본다.
+    노드에 provi-pod-nfs 가 없으면 그 노드는 경고만 남기고 넘어간다."""
+    if not app.config["KRB5_REALM"]:
+        return
+    ns = app.config["NAMESPACE"]
+    try:
+        load_k8s()
+        live = {p.metadata.name for p in client.CoreV1Api().list_namespaced_pod(ns).items}
+    except Exception as e:
+        # Pod 목록을 모르는 채로 진행하면 살아 있는 Pod 의 것을 고아로 본다. 이번 주기는 아무것도 지우지 않는다.
+        app.logger.warning(f"[POD NFS RECONCILE] Pod 목록 조회 실패, 이번 주기는 건너뜀: {e}")
+        return
+
+    for node in app.config["FARM_NODES"]:
+        try:
+            listing = _farm_ssh(node["host"], node["port"], "nfs-list")
+        except Exception as e:
+            app.logger.warning(f"[POD NFS RECONCILE] {node['name']} 목록 조회 실패: {str(e)[-300:]}")
+            continue
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) < 2 or fields[0] != ns or fields[1] in live:
+                continue
+            pod_name = fields[1]
+            try:
+                answer = _detach_pod_nfs(node["name"], pod_name, min_age_sec=POD_NFS_ORPHAN_MIN_AGE_SEC)
+            except Exception as e:
+                app.logger.warning(
+                    f"[POD NFS RECONCILE] Pod 없는 NFS client 정리 실패(다음 주기 재시도): {pod_name} @ {node['name']} — {str(e)[-300:]}")
+                continue
+            if answer["nfs_state"] == "busy":
+                app.logger.info(
+                    f"[POD NFS RECONCILE] Pod 없는 NFS client 를 남겨 둠(다음 주기 재시도): {pod_name} @ {node['name']} — {answer.get('reason')}")
+            else:
+                app.logger.info(f"[POD NFS RECONCILE] Pod 없는 NFS client 정리({answer['nfs_state']}): {pod_name} @ {node['name']}")
 
 
 def _ledger_shared_gids() -> set:
@@ -391,3 +447,5 @@ if __name__ == "__main__":
         reconcile_nas_gss_cache()
         # 맨 뒤에 둔다 — 노드가 응답하지 않아도 앞의 재조정은 이미 끝나 있다.
         reconcile_idmap_groups()
+        # 노드마다 접속하고 마운트 해제를 기다릴 수 있어 가장 뒤에 둔다.
+        reconcile_pod_nfs()

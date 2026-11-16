@@ -121,6 +121,9 @@ def step_delete_pod_k8s(ctx):
         image = next((c.image for c in (getattr(pod.spec, "containers", None) or [])), None)
         if _main.node_image.is_user_image(image):
             ctx["committed_image"], ctx["committed_image_node"] = image, pod.spec.node_name
+        # 홈을 Pod 전용 NFS client 의 마운트로 받은 Pod면 Pod를 지운 뒤 노드에서 그것도 지운다(step_detach_pod_nfs).
+        if _main.pod_uses_nfs_client(pod):
+            ctx["pod_nfs_node"] = pod.spec.node_name
     except Exception:
         _main.app.logger.warning("[DELETE POD] pod lookup failed, farm·이미지 정리 건너뜀: %s", pod_name, exc_info=True)
     ctx["pod_node_name"] = pod_node_name
@@ -220,6 +223,19 @@ def step_delete_pod_k8s(ctx):
                   action=Action.DELETE_POD_K8S, phase=Phase.SUCCESS)
     _main.app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
+def step_detach_pod_nfs(ctx):
+    """지운 Pod가 홈을 Pod 전용 NFS client 의 마운트로 받았으면 그 노드에서 NFS client 를 지운다.
+
+    keytab 정리보다 먼저 한다 — 노드는 마운트를 해제하면서 남은 요청을 사용자 티켓으로 보낸다.
+    지우지 못해도(노드가 "아직 사용 중"이라고 답하거나 접속 실패) 작업은 계속한다. Pod는 이미 지웠고,
+    남은 것은 krb5-reconcile(reconcile_pod_nfs)이 다시 지운다."""
+    node = ctx.get("pod_nfs_node")
+    if not node:
+        return
+    ctx["rollback"]["podNfs"] = _main.release_pod_nfs(
+        node, ctx["pod_name"], request_id=ctx["request_id"], username=ctx["username"])
+
+
 def step_cleanup_pod_node_krb5(ctx):
     """지운 Pod가 있던 노드에서 keytab을 정리한다.
 
@@ -276,6 +292,7 @@ POD_DELETE_STEPS = [
     step_delete_services,
     step_release_nodeports,
     step_delete_pod_k8s,
+    step_detach_pod_nfs,
     step_remove_node_image,
     step_cleanup_pod_node_krb5,
 ]

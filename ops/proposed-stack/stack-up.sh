@@ -82,6 +82,9 @@ VERIFY_MODE="$STACK"
 # 장애 주입 훅은 실험 스택 셋에서만 켠다. 운영(operation)에서는 어떤 경우에도 켜지 않는다.
 FAULT_INJECTION=false
 case "$STACK" in noprobe|full|baseline) FAULT_INJECTION=true ;; esac
+# 사용자 Pod 의 /home 은 모든 스택에서 Pod 별 독립 NFS client 로 받는다. 이 스택이 쓰는 노드 모두에 provi-pod-nfs 가
+# 설치돼 있어야 한다(admin_infra_server kerberos-nfs/ansible/deploy_farm_krb5_admin.yml) — 없는 노드에서는 Pod 생성이 실패한다.
+# 새로 만드는 Pod 부터 적용되고, 이미 떠 있는 Pod 는 다시 만들 때 바뀐다.
 NS=ailab-$STACK
 RELEASE=config-server-$STACK
 # 스택 화면은 운영 프론트엔드가 쓰는 ingress 컨트롤러(nodePort 30081, 방화벽 허용)에 호스트 규칙을 더해 연다.
