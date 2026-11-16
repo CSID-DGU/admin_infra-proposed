@@ -665,9 +665,12 @@ def test_reconcile_is_off_without_kerberos(nodes, cluster, monkeypatch):
     assert nodes.calls == [] and cluster.selectors == []
 
 
-def test_revoke_left_busy_is_finished_by_the_next_reconcile(env, nodes):
+def test_revoke_left_busy_is_finished_by_the_next_reconcile(env, nodes, monkeypatch):
     """회수 때 노드가 busy 로 답해 남은 것을, Pod 가 사라진 뒤의 정리 작업이 지운다."""
     e = env
+    # env 는 main.load_k8s 만 바꾼다. reconcile_krb5 는 그 함수를 이름으로 가져와 따로 들고 있어, 바꾸지 않으면
+    # 이 기기의 kubeconfig 를 읽고 kubeconfig 가 없는 곳(CI)에서는 정리를 건너뛴다.
+    monkeypatch.setattr(rec, "load_k8s", lambda: None)
     pod_name = _provision(e, "331", "exp-np-c1")["result"]["pod_name"]
     nodes.held.add(pod_name)
     assert _revoke(e, "331", pod_name)["phase"] == "SUCCESS"
