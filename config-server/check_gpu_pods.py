@@ -9,7 +9,9 @@ GPU 디바이스는 컨테이너 생성 시점에만 주입되고 그 이후 호
 점검 항목: ① Pod에 배정된 GPU(NVIDIA_VISIBLE_DEVICES의 UUID)가 컨테이너 안에서 하나씩 다 보이는지
 ② Pod의 sshd가 응답하는지. 문제가 있으면 같은 Pod는 1시간에 한 번만 알린다. GPU가 사라졌을 때는 그 시점의
 nvidia-smi 출력과 노드 커널 로그를 ConfigMap에 남긴다. 노드 재부팅(boot id 변경)을 감지하면 그 노드의
-SSH·NFS·GPU 점검 결과와 내려간 Pod 목록을 알린다. 어느 경우에도 Pod를 자동으로 건드리지 않는다.
+SSH·NFS·GPU 점검 결과와 내려간 Pod 목록을 알린다. ③ 실행 중인 사용자 Pod마다 컨테이너 안에서 사용자 계정으로
+홈(NFS)을 읽어 본다. 읽히지 않는 Pod는 한 메시지에 모아 알리고, 그 Pod의 홈은 1시간 동안 다시 읽지 않는다.
+어느 경우에도 Pod를 자동으로 건드리지 않는다.
 """
 from main import app, load_k8s, admin_be_headers
 from adapters import gpu_check_state, node_diag
@@ -33,7 +35,16 @@ REALERT_INTERVAL_SEC = 3600
 CRON_PERIOD_SEC = 600
 # 실행 제한(300초) 안에 끝나도록, 노드 커널 로그 수집은 시작 뒤 이 시간이 지나면 하지 않는다.
 DIAG_BUDGET_SEC = 150
+# 홈 읽기: timeout 이 이 시간 뒤에 TERM 을 보내고, 그래도 남아 있으면 NFS_CHECK_KILL_AFTER_SEC 뒤에 KILL 을 보낸다.
+# 둘을 더한 값이 EXEC_TIMEOUT_SEC 보다 작아야 종료 코드를 받는다.
 NFS_CHECK_TIMEOUT_SEC = 10
+NFS_CHECK_KILL_AFTER_SEC = 2
+# 홈 읽기에 실패한 Pod 는 이 시간 동안 다시 읽지 않는다. NFS 가 멈춰 있으면 읽던 프로세스가 끝나지 못하고
+# 컨테이너에 남는데, 실행(10분)마다 다시 읽으면 그런 프로세스가 계속 쌓인다.
+HOME_RECHECK_SEC = REALERT_INTERVAL_SEC
+# 실행 제한(300초) 안에 끝나도록, 시작 뒤 이 시간이 지나면 남은 Pod 의 홈 읽기는 다음 실행으로 미룬다.
+# NAS 가 응답하지 않으면 Pod 하나에 EXEC_TIMEOUT_SEC 씩 걸린다.
+HOME_CHECK_DEADLINE_SEC = 240
 # MIG- UUID 는 nvidia-smi --query-gpu=uuid 에 나오지 않아(부모 GPU- 만 나온다) 하나씩 비교할 수 없다.
 _UUID_PREFIXES = ("GPU-",)
 _SAFE_USERNAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -79,12 +90,41 @@ def _exec(v1, pod_name, command) -> str:
 
 
 def _exec_rc(v1, pod_name, command):
-    """sh -c 로 실행해 (출력, 종료코드). stream 은 종료코드를 돌려주지 않아 직접 붙인다."""
+    """sh -c 로 실행해 (출력, 종료코드). stream 은 종료코드를 돌려주지 않아 직접 붙인다.
+    종료코드 뒤에 다른 출력이 더 올 수 있다(timeout 이 su 를 죽이면 su 가 "Killed"를 뒤늦게 찍는다)."""
     out = _exec(v1, pod_name, ["/bin/sh", "-c", command + '; echo "__RC=$?"']) or ""
     head, sep, tail = out.rpartition("__RC=")
-    if not sep or not tail.strip().lstrip("-").isdigit():
+    code = re.match(r"-?\d+", tail)
+    if not sep or not code:
         return out.strip(), -1
-    return head.strip(), int(tail.strip())
+    return (head + tail[code.end():]).strip(), int(code.group())
+
+
+def _read_home(v1, pod_name, user):
+    """컨테이너 안에서 사용자 계정으로 홈을 읽어 본다. (판정, 설명)을 돌려준다. 판정은 "ok"·"fail"·"unknown"이다.
+
+    krb5 마운트는 root 가 아니라 사용자 티켓으로 열리므로 su 로 그 사용자가 되어 읽는다. 생성 직후 점검
+    (step_verify_home_io)은 홈에 파일을 썼다 지우지만, 이 점검은 사용 중인 홈에 파일을 만들지 않으려고 읽기만 한다.
+    stat -f 는 캐시를 쓰지 않고 NAS 에 요청(STATFS)을 보내고, ls 는 홈 목록을 읽는다.
+    timeout 이 su 를 끝내도 읽던 프로세스가 남아 출력 통로를 잡고 있으면, 종료코드는 받지만 exec 는
+    EXEC_TIMEOUT_SEC 까지 기다린다. exec 자체가 실패하면 예외를 그대로 올린다(부른 쪽이 판단 불가로 다룬다)."""
+    started = time.monotonic()
+    out, rc = _exec_rc(v1, pod_name,
+                       f"timeout -k {NFS_CHECK_KILL_AFTER_SEC} {NFS_CHECK_TIMEOUT_SEC} "
+                       f"su -s /bin/sh {user} -c 'stat -f ~ >/dev/null && ls ~ >/dev/null'")
+    if rc == 0:
+        return "ok", ""
+    if rc in (124, 137):  # timeout 이 TERM(124) 또는 KILL(137)로 끝냈다
+        return "fail", f"{NFS_CHECK_TIMEOUT_SEC}초 안에 읽히지 않음"
+    if rc == -1:
+        # 종료코드를 받지 못했다. exec 제한 시간까지 기다렸다면 읽기가 끝나지 않은 것이고, 그 전에 끊겼다면 알 수 없다.
+        if time.monotonic() - started >= EXEC_TIMEOUT_SEC - 1:
+            return "fail", f"{EXEC_TIMEOUT_SEC}초 안에 읽기가 끝나지 않음"
+        return "unknown", "점검 명령의 종료코드를 받지 못함"
+    if rc in (126, 127):  # 컨테이너에 timeout·su 가 없거나 실행할 수 없다
+        return "unknown", f"점검 명령을 실행할 수 없음 (rc={rc})"
+    last_line = out.splitlines()[-1].strip()[:150] if out else ""
+    return "fail", f"읽기 실패 (rc={rc}{': ' + last_line if last_line else ''})"
 
 
 def check_gpu_pods() -> None:
@@ -160,6 +200,8 @@ def check_gpu_pods() -> None:
             state.save()  # 중간에 제한 시간으로 끊겨도 보낸 알림이 다시 나가지 않게 알릴 때마다 남긴다
 
     _check_node_reboots(v1, state, gpu_by_node)
+    state.save()
+    _check_homes(v1, state, now)
     state.save()
     state.report_degraded(now, _send_slack)
 
@@ -249,19 +291,86 @@ def _check_node_reboots(v1, state, gpu_by_node) -> None:
 
 
 def _nfs_state(v1, on_node) -> str:
-    """노드의 NFS 홈이 사용자 권한으로 읽히는가. krb5 마운트는 root 가 아니라 사용자 티켓으로 열리므로
-    실행 중인 사용자 Pod 안에서 그 사용자로 홈을 읽어 본다(생성 직후 점검 verify_home_io 와 같은 방식)."""
-    running = next((p for p in on_node if p.status.phase == "Running" and _is_user_pod(p)
-                    and _SAFE_USERNAME.fullmatch(p.metadata.labels["username"])), None)
+    """재부팅한 노드의 NFS 홈이 사용자 권한으로 읽히는가. 그 노드에서 실행 중인 사용자 Pod 하나를 골라
+    컨테이너 안에서 홈을 읽어 본다(_read_home)."""
+    running = next((p for p in on_node if _home_check_target(p)), None)
     if running is None:
         return "확인 불가(점검에 쓸 실행 중 Pod 없음)"
-    user = running.metadata.labels["username"]
     try:
-        _, rc = _exec_rc(v1, running.metadata.name,
-                         f"timeout {NFS_CHECK_TIMEOUT_SEC} su -s /bin/sh {user} -c 'ls -d ~ && ls ~ >/dev/null'")
+        verdict, why = _read_home(v1, running.metadata.name, running.metadata.labels["username"])
     except Exception as e:
         return f"확인 실패 ({str(e)[:100]})"
-    return "정상" if rc == 0 else f"이상 (홈 읽기 실패, rc={rc})"
+    if verdict == "ok":
+        return "정상"
+    return f"확인 불가 ({why})" if verdict == "unknown" else f"이상 (홈 {why})"
+
+
+def _home_check_target(pod) -> bool:
+    """홈을 읽어 볼 Pod 인가. 실행 중이고 지워지는 중이 아닌 사용자 Pod 만 본다. 계정 이름은 셸 명령에 넣으므로
+    형식이 맞는 것만 받는다."""
+    return (_is_user_pod(pod) and pod.status.phase == "Running"
+            and getattr(pod.metadata, "deletion_timestamp", None) is None
+            and bool(_SAFE_USERNAME.fullmatch(pod.metadata.labels["username"])))
+
+
+def _check_homes(v1, state, now) -> None:
+    """실행 중인 사용자 Pod 마다 컨테이너 안에서 사용자 계정으로 홈(NFS)을 읽어 본다.
+
+    NAS 가 응답하지 않거나 사용자의 Kerberos 티켓이 만료되면 Pod 는 Running 이고 sshd 도 응답하지만 홈이
+    읽히지 않는다. 읽히지 않는 Pod 는 한 메시지에 모아 알린다(NAS 가 응답하지 않으면 모든 Pod 가 함께 실패한다).
+    실패한 Pod 의 홈은 HOME_RECHECK_SEC 동안 다시 읽지 않고, 그 뒤에 다시 읽어 여전히 실패하면 다시 알린다."""
+    if not state.home_check_allowed(now, HOME_RECHECK_SEC):
+        return
+    try:
+        pods = [p for p in v1.list_namespaced_pod(NAMESPACE).items if _home_check_target(p)]
+    except Exception as e:
+        app.logger.warning(f"[GPU CHECK] Pod 목록 조회 실패, 홈 읽기 점검 스킵: {e}")
+        return
+    state.prune_home_failures({p.metadata.name for p in pods})
+
+    postponed = 0
+    for pod in pods:
+        pod_name = pod.metadata.name
+        previous = state.home_failures.get(pod_name)
+        if previous and now - previous.get("at", 0) < HOME_RECHECK_SEC:
+            continue
+        if time.time() - now > HOME_CHECK_DEADLINE_SEC:
+            postponed += 1
+            continue
+        try:
+            verdict, why = _read_home(v1, pod_name, pod.metadata.labels["username"])
+        except Exception as e:
+            verdict, why = "unknown", str(e)[:100]
+        if verdict == "fail":
+            app.logger.error(f"[GPU CHECK] 홈 읽기 실패: pod={pod_name} node={pod.spec.node_name} — {why}")
+            state.record_home_failure(pod_name, now, why)
+        else:
+            if verdict == "unknown":
+                app.logger.warning(f"[GPU CHECK] 홈 읽기 판단 불가: pod={pod_name} — {why}")
+            state.clear_home_failure(pod_name)
+    if postponed:
+        app.logger.warning(f"[GPU CHECK] 시간이 모자라 홈 읽기 {postponed}개를 다음 실행으로 미룸")
+    # 알림을 보내지 못해도 "실패한 Pod 는 다시 읽지 않는다"는 지켜지도록, 알리기 전에 실패 기록부터 저장한다.
+    state.save()
+
+    failed = [p for p in pods if p.metadata.name in state.home_failures]
+    pending = [p for p in failed if not state.home_failures[p.metadata.name].get("alerted")]
+    if pending and _notify_home_failures(pending, state.home_failures, len(pods), len(failed)):
+        state.mark_home_alerted([p.metadata.name for p in pending])
+
+
+def _notify_home_failures(pending, records, total, failed_count) -> bool:
+    lines = [f"▶ {p.spec.node_name} {p.metadata.name} (사용자 {p.metadata.labels['username']}): "
+             f"{records[p.metadata.name].get('why', '')}"
+             for p in sorted(pending, key=lambda p: (p.spec.node_name or "", p.metadata.name))]
+    message = (
+        ":warning: *사용자 홈(NFS) 읽기 이상*\n"
+        + "\n".join(lines) + "\n"
+        f"▶ 실행 중인 사용자 Pod {total}개 중 {failed_count}개의 홈이 컨테이너 안에서 읽히지 않습니다.\n"
+        "▶ NAS와 해당 노드의 NFS client 상태를 확인해주세요. Pod는 자동으로 건드리지 않습니다. "
+        "같은 Pod는 1시간에 한 번만 알리고, 그동안은 그 Pod의 홈을 다시 읽지 않습니다."
+    )
+    return _send_slack(message, f"home pods={len(pending)}")
 
 
 def _gpu_state(counts) -> str:
