@@ -1,4 +1,4 @@
-"""GPU 점검 CronJob이 실행 사이에 남기는 값 — 같은 Pod 재알림 시각, 노드별 마지막 boot id, 진단 자료.
+"""GPU 점검 CronJob이 실행 사이에 남기는 값 — 같은 Pod 재알림 시각, 노드별 마지막 boot id, 홈 읽기 실패 기록, 진단 자료.
 
 Redis가 없는 환경이라 점검 네임스페이스의 ConfigMap에 둔다(RBAC: configmaps get/create/update).
 읽거나 쓰지 못해도 점검은 계속한다 — 그때는 재부팅 감지가 동작하지 않고, 오류 로그와 관리자 알림(한 시간에 한 번)을 낸다.
@@ -26,7 +26,8 @@ def _upsert(v1, namespace, body):
 
 
 class CheckState:
-    """alerts: {"<pod>:<문제 종류>": 마지막 알림 epoch초}, boot_ids: {node: boot id}.
+    """alerts: {"<pod>:<문제 종류>": 마지막 알림 epoch초}, boot_ids: {node: boot id},
+    home_failures: {"<pod>": {"at": 홈 읽기에 실패한 epoch초, "why": 실패 내용, "alerted": 알림을 보냈는지}}.
 
     상태를 읽지 못하면(RBAC 누락·ConfigMap 접근 실패 등) 조용히 넘어가지 않는다 — 로그를 오류로 남기고,
     저장도 하지 않으며(비어 있는 값으로 덮어써 기록을 잃지 않게), 재알림 억제는 저장 없이도 되는 시각 창으로
@@ -34,13 +35,14 @@ class CheckState:
 
     def __init__(self, v1, namespace, logger, now, period_sec=600):
         self._v1, self._ns, self._log, self._period = v1, namespace, logger, period_sec
-        self.alerts, self.boot_ids = {}, {}
+        self.alerts, self.boot_ids, self.home_failures = {}, {}, {}
         self.problem = None
         self._dirty = False
         try:
             data = v1.read_namespaced_config_map(STATE_NAME, namespace).data or {}
             self.alerts = json.loads(data.get("alerts", "{}"))
             self.boot_ids = json.loads(data.get("boot_ids", "{}"))
+            self.home_failures = json.loads(data.get("home_failures", "{}"))
         except client.exceptions.ApiException as e:
             if e.status != 404:
                 self._fail(f"읽기 실패(HTTP {e.status}: RBAC에 configmaps get 이 있는지 확인)")
@@ -73,12 +75,39 @@ class CheckState:
             self.boot_ids[node] = boot_id
             self._dirty = True
 
+    def home_check_allowed(self, now, interval_sec):
+        """이번 실행에서 홈 읽기 점검을 해도 되는가. 상태를 저장하지 못하면 "실패한 Pod 는 interval_sec 동안 다시
+        읽지 않는다"를 지킬 수 없다. 그때는 재알림 억제와 같은 시각 창으로 interval_sec 에 한 번만 점검한다."""
+        return not self.problem or now % interval_sec < self._period
+
+    def record_home_failure(self, pod, now, why):
+        self.home_failures[pod] = {"at": now, "why": why, "alerted": False}
+        self._dirty = True
+
+    def clear_home_failure(self, pod):
+        if self.home_failures.pop(pod, None) is not None:
+            self._dirty = True
+
+    def mark_home_alerted(self, pods):
+        for pod in pods:
+            record = self.home_failures.get(pod)
+            if record and not record.get("alerted"):
+                record["alerted"] = True
+                self._dirty = True
+
+    def prune_home_failures(self, live_pods):
+        """사라진 Pod 의 홈 읽기 실패 기록을 지운다."""
+        keep = {pod: record for pod, record in self.home_failures.items() if pod in live_pods}
+        if keep != self.home_failures:
+            self.home_failures, self._dirty = keep, True
+
     def save(self):
         if not self._dirty or self.problem:
             return
         body = client.V1ConfigMap(
             metadata=client.V1ObjectMeta(name=STATE_NAME, namespace=self._ns),
-            data={"alerts": json.dumps(self.alerts), "boot_ids": json.dumps(self.boot_ids)})
+            data={"alerts": json.dumps(self.alerts), "boot_ids": json.dumps(self.boot_ids),
+                  "home_failures": json.dumps(self.home_failures)})
         try:
             _upsert(self._v1, self._ns, body)
             self._dirty = False
