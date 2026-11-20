@@ -199,6 +199,11 @@ echo "ailab-stack-component 적용"
 
 step "SSH 키 복사 ($PROD_NS → $NS)"
 for s in nas-ssh-key farm-ssh-key farm-ad-ssh-key; do
+  # 과제용 키로 바꿔 둔 Secret(라벨 pod-nfs-assignment=keep)은 운영 키로 덮어쓰지 않는다.
+  if [ "$(kubectl -n "$NS" get secret "$s" -o jsonpath='{.metadata.labels.pod-nfs-assignment}' 2>/dev/null)" = "keep" ]; then
+    echo "$s (과제용 키 유지)"
+    continue
+  fi
   TYPE=$(kubectl -n "$PROD_NS" get secret "$s" -o jsonpath='{.type}')
   {
     printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\ntype: %s\ndata:\n' "$s" "$TYPE"
