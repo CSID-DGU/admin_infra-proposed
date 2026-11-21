@@ -175,7 +175,7 @@ class Context:
     def do_approve(self, arg):
         alias, expect = self._target(arg, "req")
         self._call("POST", f"/api/admin/requests/{self._req(alias)}/approval", as_user=self.run.admin_id,
-                   body={"imageId": self.run.image, "resourceGroupId": self.run.resource_group, "adminComment": "e2e"},
+                   body={"imageId": self.run.image, "resourceGroupId": self.run.resource_group, "adminComment": "e2e", "professorApprovalConfirmed": True},
                    expect=expect)
 
     def do_reject(self, arg):
