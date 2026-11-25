@@ -78,7 +78,7 @@ bash ops/proposed-stack/make-admin.sh noprobe <가입한 이메일>
 ## kubectl로 직접 시험
 
 ```bash
-kubectl -n ailab-noprobe port-forward svc/containerssh-config-service 8000:80   # config-server
+kubectl -n ailab-noprobe port-forward svc/config-server-noprobe 8000:80         # config-server
 kubectl -n ailab-noprobe port-forward svc/ailab-frontend 8080:80                # 화면
 kubectl -n ailab-noprobe get pods -o wide
 ```

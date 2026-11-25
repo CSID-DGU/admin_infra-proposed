@@ -1,6 +1,6 @@
 # config-server 디렉토리
 
-ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 기반 설정 서버이다. Kubernetes Pod/PVC/Service 생성, NodePort 할당, Linux 계정 파일 관리, 사용자 이미지 저장/로드 상태 기록을 담당한다.
+ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 기반 설정 서버이다. 동일 이미지를 FARM/LAB에 각각 배포하며, 필수 `CLUSTER_ID`와 릴리스별 Helm 리소스로 두 클러스터를 구분한다. Kubernetes Pod/PVC/Service 생성, NodePort 할당, Linux 계정 파일 관리, 사용자 이미지 저장/로드 상태 기록을 담당한다.
 
 ## 파일 구성
 
@@ -20,7 +20,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 | 이름 | 종류 | 역할 | 입력 | 출력/효과 |
 | --- | --- | --- | --- | --- |
-| `health` | route `GET /health` | 서버 상태 확인 | 없음 | `"OK"`, HTTP 200 |
+| `health` | route `GET /health` | 서버 상태와 배포 클러스터 확인 | 없음 | `status`, `run_mode`, `cluster_id`, HTTP 200 |
 | `load_k8s` | function | in-cluster config를 우선 로드하고 실패 시 kubeconfig를 로드한다. | 없음 | Kubernetes client 설정 |
 | `reconcile_nodeport_allocations` | function | MySQL의 `nodeport_allocations`와 실제 Kubernetes NodePort Service 상태를 동기화한다. | namespace | 삭제한 stale DB row 수 |
 | `allocate_nodeports` | function | 요청된 내부 포트마다 사용 가능한 NodePort를 DB row lock으로 할당한다. | username, pod_name, node_name, port dict list | `internal_port`, `external_port`, `usage_purpose` 목록 |
