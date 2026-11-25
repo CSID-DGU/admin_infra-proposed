@@ -1,10 +1,10 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: config-server-role
+  name: {{ include "containerssh-config-server.fullname" . }}-role
   namespace: {{ .Values.config.namespace }}
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 rules:
 - apiGroups: [""]
   resources: ["pods", "pods/exec", "pods/log", "services"]
@@ -20,7 +20,7 @@ rules:
 # GPU 점검 CronJob(check_gpu_pods.py)이 재알림 시각·노드 boot id를 남기는 상태 ConfigMap 하나만 읽고 고친다.
 - apiGroups: [""]
   resources: ["configmaps"]
-  resourceNames: ["gpu-check-state"]
+  resourceNames: [{{ include "containerssh-config-server.gpuStateConfigMapName" . | quote }}]
   verbs: ["get", "update"]
 # create 는 resourceNames 로 묶을 수 없다(이름이 요청 본문에 있다). 상태 ConfigMap 첫 생성과 GPU 유실 진단 자료
 # (gpu-diag-<pod>-<시각>, 항상 새 이름으로 만든다)에 쓴다. 다른 ConfigMap 을 읽거나 덮어쓰는 권한은 아니다.
@@ -38,17 +38,17 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: config-server-rolebinding
+  name: {{ include "containerssh-config-server.fullname" . }}-rolebinding
   namespace: {{ .Values.config.namespace }}
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 subjects:
 - kind: ServiceAccount
-  name: config-server
+  name: {{ include "containerssh-config-server.serviceAccountName" . }}
   namespace: {{ .Values.config.namespace }}
 roleRef:
   kind: Role
-  name: config-server-role
+  name: {{ include "containerssh-config-server.fullname" . }}-role
   apiGroup: rbac.authorization.k8s.io
 ---
 # nodes는 cluster-scoped — resolve_k8s_node_name() 등에서 list/get node 필요
@@ -57,7 +57,7 @@ kind: ClusterRole
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}-node-reader
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
@@ -68,10 +68,10 @@ kind: ClusterRoleBinding
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}-node-reader-binding
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: config-server
+    name: {{ include "containerssh-config-server.serviceAccountName" . }}
     namespace: {{ .Values.config.namespace }}
 roleRef:
   kind: ClusterRole
@@ -85,7 +85,7 @@ kind: ClusterRole
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}-service-reader
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -96,10 +96,10 @@ kind: ClusterRoleBinding
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}-service-reader-binding
   labels:
-    app: containerssh-config-server
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: config-server
+    name: {{ include "containerssh-config-server.serviceAccountName" . }}
     namespace: {{ .Values.config.namespace }}
 roleRef:
   kind: ClusterRole

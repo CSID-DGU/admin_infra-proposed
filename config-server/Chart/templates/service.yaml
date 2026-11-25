@@ -1,13 +1,21 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: containerssh-config-service
+  name: {{ include "containerssh-config-server.serviceName" . }}
   namespace: {{ .Values.config.namespace }}
+  labels:
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
 spec:
   type: {{ .Values.service.type }}
   selector:
+    {{- if eq (include "containerssh-config-server.selectorMode" .) "legacy" }}
     app: containerssh-config-server
     component: api
+    {{- else }}
+    {{- include "containerssh-config-server.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    {{- end }}
   ports:
     - name: http
       protocol: TCP
@@ -17,4 +25,3 @@ spec:
       {{- /* ClusterIP 에 이 항목이 있으면 쿠버네티스가 적용 자체를 거부한다. */}}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
-

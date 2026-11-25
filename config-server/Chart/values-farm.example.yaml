@@ -1,0 +1,73 @@
+# 예시 전용 값이다. 문서용 TEST-NET 주소와 REPLACE_* 표시는 배포 전에 FARM 운영값으로 바꾼다.
+compatibility:
+  # 신규 릴리스용. 구 운영 Deployment를 제자리 upgrade할 때는 legacy를 유지한다.
+  deploymentSelectorMode: release
+
+cluster:
+  id: farm
+  homeMountRootTemplate: /home/tako{index}/share/user
+  ssh:
+    user: REPLACE_WITH_FARM_NODE_SERVICE_ACCOUNT
+    keyPath: /etc/infra-ssh/id_ed25519
+    nodes:
+      - name: farm1
+        host: 192.0.2.11
+        port: 22
+  adSsh:
+    user: REPLACE_WITH_FARM_AD_SERVICE_ACCOUNT
+    keyPath: /etc/infra-ad-ssh/id_ed25519
+    nodes:
+      - name: farm-ad1
+        host: 192.0.2.21
+        port: 22
+
+image:
+  tag: REPLACE_WITH_IMMUTABLE_IMAGE_TAG
+
+nfs:
+  server: 192.0.2.31
+  userSharePath: /REPLACE_WITH_FARM_USER_SHARE
+  kubeSharePath: /REPLACE_WITH_FARM_KUBE_SHARE
+
+nas:
+  ssh:
+    host: 192.0.2.31
+    port: 22
+    user: REPLACE_WITH_FARM_NAS_SERVICE_ACCOUNT
+    keyPath: /etc/nas-ssh/id_ed25519
+
+krb5:
+  realm: FARM.EXAMPLE.INVALID
+  kdcHosts: [192.0.2.21]
+  adminServer: 192.0.2.21
+  domain: farm.example.invalid
+
+infra:
+  adminBeInternalUrl: http://REPLACE_WITH_ADMIN_BE_SERVICE
+
+monitoring:
+  prometheusUrl: http://REPLACE_WITH_FARM_PROMETHEUS
+
+imageStore:
+  claimName: REPLACE_WITH_FARM_IMAGE_STORE_PVC
+
+db:
+  host: REPLACE_WITH_FARM_DB_HOST
+  name: REPLACE_WITH_FARM_LEDGER_DB
+  user: REPLACE_WITH_FARM_DB_USER
+
+logDb:
+  host: REPLACE_WITH_FARM_LOG_DB_HOST
+  name: REPLACE_WITH_FARM_LOG_DB
+  user: REPLACE_WITH_FARM_LOG_DB_USER
+
+redis:
+  host: REPLACE_WITH_FARM_REDIS_HOST
+  db: 0
+
+nodeSelector:
+  provi.dgu.ac.kr/role: farm-management
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
