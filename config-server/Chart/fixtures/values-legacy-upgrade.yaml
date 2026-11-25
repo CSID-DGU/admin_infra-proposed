@@ -1,0 +1,25 @@
+# 구 운영 차트의 values 구조를 새 차트로 제자리 upgrade하는 렌더 계약 시험용이다.
+farm:
+  ssh:
+    user: legacy-node-user
+    keyPath: /etc/farm-ssh/id_ed25519
+    nodes:
+      - name: farm1
+        host: 192.0.2.11
+  adSsh:
+    user: legacy-ad-user
+    keyPath: /etc/farm-ad-ssh/id_ed25519
+    nodes:
+      - name: farm-ad1
+        host: 192.0.2.21
+
+krb5:
+  realm: LEGACY.EXAMPLE
+  kdcHost: 192.0.2.31
+
+apiToken:
+  secretName: config-server-api-token
+sshKnownHosts:
+  secretName: config-server-ssh-known-hosts
+controller:
+  enabled: true

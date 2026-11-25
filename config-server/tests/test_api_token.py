@@ -4,6 +4,10 @@ import pytest
 import main
 
 
+def _headers(token="s3cret", cluster=None):
+    return {"X-Internal-Token": token, "X-Cluster-Id": cluster or main.CLUSTER_ID}
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(main, "API_AUTH_DISABLED", False)
@@ -17,12 +21,12 @@ def test_request_without_token_is_rejected_before_validation(client):
 
 
 def test_wrong_token_is_rejected(client):
-    r = client.delete("/pods/ailab-u-1", headers={"X-Internal-Token": "nope"})
+    r = client.delete("/pods/ailab-u-1", headers=_headers("nope"))
     assert r.status_code == 401
 
 
 def test_right_token_reaches_the_route(client):
-    r = client.post("/operations/provision", json={}, headers={"X-Internal-Token": "s3cret"})
+    r = client.post("/operations/provision", json={}, headers=_headers())
     assert r.status_code == 400   # 토큰은 통과하고 본문 검증에서 걸린다
 
 
@@ -36,7 +40,14 @@ def test_only_health_stays_open(client):
 def test_api_docs_and_status_need_the_token(client, path):
     """Service가 NodePort라 노드 밖에서도 닿는다. 경로·요청 형식(API 문서)과 신청 진행 상황은 토큰을 가진 쪽에만 준다."""
     assert client.get(path).status_code == 401
-    assert client.get(path, headers={"X-Internal-Token": "s3cret"}).status_code != 401
+    assert client.get(path, headers=_headers()).status_code != 401
+
+
+def test_cluster_id_is_required_after_token_authentication(client):
+    missing = client.post("/operations/provision", json={}, headers={"X-Internal-Token": "s3cret"})
+    wrong = client.post("/operations/provision", json={}, headers=_headers(cluster="lab-wrong"))
+    assert missing.status_code == 409 and missing.get_json()["error"] == "CLUSTER_ID_MISMATCH"
+    assert wrong.status_code == 409 and wrong.get_json()["error"] == "CLUSTER_ID_MISMATCH"
 
 
 def test_missing_token_config_rejects_instead_of_opening(monkeypatch):
@@ -57,9 +68,12 @@ def test_explicit_opt_out_disables_check(monkeypatch):
 
 def test_admin_be_headers_carry_token(monkeypatch):
     monkeypatch.setattr(main, "API_TOKEN", "s3cret")
-    assert main.admin_be_headers() == {"X-Internal-Token": "s3cret"}
+    assert main.admin_be_headers() == {
+        "X-Internal-Token": "s3cret",
+        "X-Cluster-Id": main.CLUSTER_ID,
+    }
 
 
 def test_admin_be_headers_empty_when_not_configured(monkeypatch):
     monkeypatch.setattr(main, "API_TOKEN", "")
-    assert main.admin_be_headers() == {}
+    assert main.admin_be_headers() == {"X-Cluster-Id": main.CLUSTER_ID}
