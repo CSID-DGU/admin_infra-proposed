@@ -34,6 +34,7 @@ if [ -n "$CS_POD" ]; then
 import os, time, requests
 api = requests.Session()
 api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
+api.headers["X-Cluster-Id"] = os.environ.get("CLUSTER_ID", "").strip().upper()
 base, prefix, node = "http://127.0.0.1:8000", os.environ["PREFIX"], os.environ.get("NODE") or None
 pods = [p for p in os.environ.get("PODS", "").split() if p]
 # 계정 대장이 없으면(이미 정리됐거나 마운트가 안 붙은 상태) 지울 계정이 없는 것으로 보고 계속한다 —

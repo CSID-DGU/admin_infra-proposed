@@ -11,7 +11,8 @@ def targets(values):
     nas = (values.get("nas") or {}).get("ssh") or {}
     if nas.get("host"):
         out.add((str(nas["host"]), str(nas.get("port") or 22)))
-    farm = values.get("farm") or {}
+    # 새 차트의 cluster.*를 우선하고, 아직 전환하지 않은 운영 릴리스의 farm.*도 읽는다.
+    farm = values.get("cluster") or values.get("farm") or {}
     for group in ("ssh", "adSsh"):
         for node in (farm.get(group) or {}).get("nodes") or []:
             if node.get("host"):
