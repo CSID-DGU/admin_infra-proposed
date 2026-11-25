@@ -29,6 +29,7 @@ def get_db_connection():
 
         conn = pymysql.connect(
             host=os.environ["DB_HOST"],
+            port=int(os.getenv("DB_PORT", "3306")),
             user=os.environ["DB_USER"],
             password=os.environ["DB_PASSWORD"],
             database=os.environ["DB_NAME"],
@@ -50,6 +51,7 @@ def get_log_db_connection(**timeouts):
 
         conn = pymysql.connect(
             host=os.environ["LOG_DB_HOST"],
+            port=int(os.getenv("LOG_DB_PORT", "3306")),
             user=os.environ["LOG_DB_USER"],
             password=os.environ["LOG_DB_PASSWORD"],
             database=os.environ["LOG_DB_NAME"],
@@ -64,14 +66,32 @@ def get_log_db_connection(**timeouts):
         app.logger.exception("Failed to create log DB connection")
         raise
 
+KUBERNETES_CLIENT_MODES = ("in-cluster", "kubeconfig")
+
+
+def resolve_kubernetes_client(env=None):
+    """Kubernetes 인증 모드와 kubeconfig 경로를 명시적으로 확정한다."""
+    env = os.environ if env is None else env
+    mode = (env.get("KUBERNETES_CLIENT_MODE") or "").strip()
+    if mode not in KUBERNETES_CLIENT_MODES:
+        raise SystemExit(
+            f"KUBERNETES_CLIENT_MODE must be one of {KUBERNETES_CLIENT_MODES}, got {mode!r}"
+        )
+    kubeconfig_path = (env.get("KUBECONFIG_PATH") or "").strip()
+    if mode == "kubeconfig" and not kubeconfig_path:
+        raise SystemExit("KUBECONFIG_PATH is required when KUBERNETES_CLIENT_MODE=kubeconfig")
+    return mode, kubeconfig_path
+
+
 def load_k8s():
-    # k8s client 초기
-    try:
-        app.logger.debug("Loading in-cluster Kubernetes config")
+    """선택한 인증 방식만 사용한다. in-cluster 실패를 kubeconfig로 우회하지 않는다."""
+    mode, kubeconfig_path = resolve_kubernetes_client()
+    if mode == "in-cluster":
+        logging.getLogger(__name__).debug("Loading in-cluster Kubernetes config")
         k8s_config.load_incluster_config()
-    except Exception:
-        app.logger.debug("In-cluster config failed, loading kubeconfig")
-        k8s_config.load_kube_config()
+        return
+    logging.getLogger(__name__).debug("Loading explicit kubeconfig: %s", kubeconfig_path)
+    k8s_config.load_kube_config(config_file=kubeconfig_path)
 
 
 def resolve_k8s_node_name(candidate: Optional[str]) -> Optional[str]:
@@ -102,6 +122,30 @@ def resolve_k8s_node_name(candidate: Optional[str]) -> Optional[str]:
 
 
 FARM_NODE_NAME_PATTERN = re.compile(r"^farm(\d+)$", re.IGNORECASE)
+NODE_TRAILING_INDEX_PATTERN = re.compile(r"(\d+)$")
+
+
+def resolve_home_mount_root(target_node: str, template: str | None = None) -> str:
+    """클러스터별 노드 마운트 템플릿에서 /home 경로를 만든다.
+
+    ``{node}``는 전체 노드명, ``{index}``는 노드명 끝 숫자다. 새 설정이 없을 때만 기존
+    FARM 경로 규칙을 사용해 이전 배포를 호환한다.
+    """
+    template = os.getenv("HOME_MOUNT_ROOT_TEMPLATE", "") if template is None else template
+    if template:
+        match = NODE_TRAILING_INDEX_PATTERN.search(target_node or "")
+        if "{index}" in template and not match:
+            raise ValueError(f"cannot derive node index for home mount path: {target_node!r}")
+        try:
+            return template.format(node=target_node, index=match.group(1) if match else "")
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"invalid HOME_MOUNT_ROOT_TEMPLATE: {template!r}") from exc
+
+    match = FARM_NODE_NAME_PATTERN.match(target_node or "")
+    if not match:
+        raise ValueError(
+            f"HOME_MOUNT_ROOT_TEMPLATE is required for non-FARM node: {target_node!r}")
+    return f"/home/tako{match.group(1)}/share/user"
 
 
 def resolve_farm_home_mount_root(target_node: str) -> str:
@@ -114,10 +158,7 @@ def resolve_farm_home_mount_root(target_node: str) -> str:
     뜬 Pod는 전부 hostPath가 로컬에 없는 디렉터리를 가리켜 FailedMount로 영원히 Ready가
     안 됐다. 노드 번호를 그대로 따라가도록 고친다.
     """
-    match = FARM_NODE_NAME_PATTERN.match(target_node or "")
-    if not match:
-        raise ValueError(f"cannot derive farm home mount path for node: {target_node!r}")
-    return f"/home/tako{match.group(1)}/share/user"
+    return resolve_home_mount_root(target_node)
 
 
 def is_pod_ready(pod):
@@ -749,6 +790,7 @@ class LedgerLockTimeout(RuntimeError):
 def _ledger_lock_connection():
     return pymysql.connect(
         host=os.environ["DB_HOST"],
+        port=int(os.getenv("DB_PORT", "3306")),
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
         database=os.environ["DB_NAME"],

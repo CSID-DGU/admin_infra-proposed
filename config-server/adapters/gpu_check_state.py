@@ -4,11 +4,12 @@ Redis가 없는 환경이라 점검 네임스페이스의 ConfigMap에 둔다(RB
 읽거나 쓰지 못해도 점검은 계속한다 — 그때는 재부팅 감지가 동작하지 않고, 오류 로그와 관리자 알림(한 시간에 한 번)을 낸다.
 """
 import json
+import os
 import time
 
 from kubernetes import client
 
-STATE_NAME = "gpu-check-state"
+STATE_NAME = os.getenv("GPU_CHECK_STATE_NAME", "gpu-check-state")
 DIAG_PREFIX = "gpu-diag-"
 # ConfigMap 한도(1MiB) 안에 넣기 위해 전체 바이트를 이 값으로 묶고 항목마다 똑같이 나눠 자른다.
 DIAG_MAX_BYTES = 900_000

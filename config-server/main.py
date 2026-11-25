@@ -3,7 +3,7 @@ import fcntl
 import re
 import time
 from typing import List, Optional
-from kubernetes import client, config as k8s_config, watch
+from kubernetes import client, watch
 import pymysql
 import os
 import requests
@@ -14,6 +14,37 @@ from flasgger import Swagger
 
 from dotenv import load_dotenv
 load_dotenv()
+
+_CLUSTER_ID_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _resolve_cluster_id(env=None):
+    """배포 대상 클러스터를 식별한다. 묵시적 FARM 기본값은 두 릴리스를 섞을 수 있어 허용하지 않는다."""
+    env = os.environ if env is None else env
+    configured_id = (env.get("CLUSTER_ID") or "").strip()
+    if not configured_id:
+        raise SystemExit("CLUSTER_ID is required")
+    if not _CLUSTER_ID_PATTERN.fullmatch(configured_id):
+        raise SystemExit(f"CLUSTER_ID must be a lowercase DNS label, got {configured_id!r}")
+    if configured_id not in ("farm", "lab"):
+        raise SystemExit(f"CLUSTER_ID must be farm or lab, got {configured_id!r}")
+    # Helm value와 Kubernetes label은 farm/lab 소문자로 유지한다. Admin BE의
+    # ResourceGroup.serverName 및 내부 API 계약은 FARM/LAB 대문자를 정본으로 쓰므로,
+    # 프로세스가 헤더와 JSON에 노출하는 런타임 식별자만 여기서 정규화한다.
+    return configured_id.upper()
+
+
+def _env_with_farm_fallback(name: str, legacy_name: str, default: str = "") -> str:
+    """새 INFRA_* 이름을 우선하고 FARM 런타임에서만 기존 FARM_* 이름을 읽는다."""
+    value = os.getenv(name)
+    if value:
+        return value
+    if CLUSTER_ID == "FARM":
+        return os.getenv(legacy_name, default)
+    return default
+
+
+CLUSTER_ID = _resolve_cluster_id()
 
 import base64
 import hmac
@@ -67,12 +98,19 @@ from utils import (
     list_node_gpus,
     normalize_gpu_model,
     resolve_k8s_node_name,
-    resolve_farm_home_mount_root,
+    resolve_home_mount_root,
+    resolve_kubernetes_client as _resolve_kubernetes_client,
+    load_k8s,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
     delete_nodeport_services,
     nas_shared_gids_for_users,
+)
+
+KUBERNETES_CLIENT_MODE, KUBECONFIG_PATH = _resolve_kubernetes_client()
+KUBERNETES_CLIENT_VALIDATE_AT_STARTUP = (
+    os.getenv("KUBERNETES_CLIENT_VALIDATE_AT_STARTUP", "").strip().lower() == "true"
 )
 
 app = Flask(__name__)
@@ -82,7 +120,16 @@ from flask.logging import default_handler  # noqa: E402
 app.logger.removeHandler(default_handler)
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
+
+
+class _ClusterLogFilter(logging.Filter):
+    def filter(self, record):
+        record.cluster_id = CLUSTER_ID
+        return True
+
+
+handler.addFilter(_ClusterLogFilter())
+formatter = logging.Formatter("[%(asctime)s] %(levelname)s cluster=%(cluster_id)s in %(module)s: %(message)s")
 handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
@@ -142,7 +189,10 @@ _TOKEN_FREE_GET = re.compile(r"^/health$")
 
 def admin_be_headers():
     """admin_be의 내부 전용 API(/api/requests/config/**, /api/internal/**)도 같은 토큰으로 호출자를 확인한다."""
-    return {"X-Internal-Token": API_TOKEN} if API_TOKEN else {}
+    headers = {"X-Cluster-Id": CLUSTER_ID}
+    if API_TOKEN:
+        headers["X-Internal-Token"] = API_TOKEN
+    return headers
 
 
 @app.before_request
@@ -157,10 +207,17 @@ def _require_api_token():
     # 헤더 값과 토큰을 바이트로 맞춰 비교한다. 문자열끼리 비교하면 헤더에 비ASCII 문자가 섞였을 때
     # 예외가 나서 401 대신 500이 나갔다 — 바깥에서 쉽게 유발할 수 있는 경로다.
     sent = request.headers.get("X-Internal-Token", "").encode("utf-8", "surrogateescape")
-    if hmac.compare_digest(sent, API_TOKEN.encode("utf-8")):
-        return None
-    app.logger.warning(f"[AUTH] 내부 API 토큰 없음 또는 불일치: {request.method} {request.path}")
-    return jsonify(infra_error("AUTHENTICATE", "UNAUTHORIZED", "내부 API 토큰이 없거나 틀립니다")), 401
+    if not hmac.compare_digest(sent, API_TOKEN.encode("utf-8")):
+        app.logger.warning(f"[AUTH] 내부 API 토큰 없음 또는 불일치: {request.method} {request.path}")
+        return jsonify(infra_error("AUTHENTICATE", "UNAUTHORIZED", "내부 API 토큰이 없거나 틀립니다")), 401
+    sent_cluster = request.headers.get("X-Cluster-Id", "")
+    if sent_cluster != CLUSTER_ID:
+        app.logger.warning("[AUTH] 클러스터 식별자 불일치: expected=%s actual=%r path=%s",
+                           CLUSTER_ID, sent_cluster, request.path)
+        return jsonify(infra_error(
+            "AUTHENTICATE", "CLUSTER_ID_MISMATCH",
+            f"요청 대상 클러스터 식별자가 {CLUSTER_ID!r}와 일치하지 않습니다")), 409
+    return None
 
 
 @app.before_request
@@ -189,12 +246,13 @@ def _enforce_account_prefix():
                                    f"이 환경은 '{ACCOUNT_PREFIX}'로 시작하는 계정만 다룹니다")), 403
     return None
 app.config.from_mapping({
+    "CLUSTER_ID": CLUSTER_ID,
     # Namespace
     # 사용자 Pod·Service·keytab 시크릿을 만들고 지우는 네임스페이스. 차트가 config.namespace를 넣어 준다.
     "NAMESPACE": os.getenv("NAMESPACE", "ailab-infra"),
 
     # External endpoints & timeouts
-    "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
+    "PROM_URL": os.getenv("PROMETHEUS_URL", "http://monitoring-kube-prometheus-prometheus.monitoring:9090"),
     "WAS_URL_TEMPLATE": ADMIN_BE_INTERNAL_URL + "/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
     # 타임아웃 체인은 안쪽 레이어가 바깥쪽보다 항상 짧아야 한다 (그래야 바깥쪽이
@@ -237,15 +295,16 @@ app.config.from_mapping({
     # Kerberos (비어있으면 비활성)
     "KRB5_REALM":           os.getenv("KRB5_REALM", ""),
 
-    # farm 노드 keytab/timer 자동 배포용 SSH (전용 서비스 계정)
-    "FARM_SSH_USER":     os.getenv("FARM_SSH_USER", ""),
-    "FARM_SSH_KEY_PATH": os.getenv("FARM_SSH_KEY_PATH", ""),
-    "FARM_NODES":        json.loads(os.getenv("FARM_NODES_JSON", "[]")),
+    # 클러스터 노드 keytab/timer 자동 배포용 SSH. FARM_*는 기존 배포 호환용 fallback이다.
+    "INFRA_SSH_USER": _env_with_farm_fallback("INFRA_SSH_USER", "FARM_SSH_USER"),
+    "INFRA_SSH_KEY_PATH": _env_with_farm_fallback("INFRA_SSH_KEY_PATH", "FARM_SSH_KEY_PATH"),
+    "INFRA_NODES": json.loads(_env_with_farm_fallback("INFRA_NODES_JSON", "FARM_NODES_JSON", "[]")),
 
-    # AD 계정 생성/삭제용 SSH (전용 서비스 계정, 별도 DC 노드 세트에만 배포됨)
-    "FARM_AD_SSH_USER":     os.getenv("FARM_AD_SSH_USER", ""),
-    "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
-    "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
+    # AD 계정 생성/삭제용 SSH. DC는 클러스터별 values가 독립적으로 지정한다.
+    "INFRA_AD_SSH_USER": _env_with_farm_fallback("INFRA_AD_SSH_USER", "FARM_AD_SSH_USER"),
+    "INFRA_AD_SSH_KEY_PATH": _env_with_farm_fallback("INFRA_AD_SSH_KEY_PATH", "FARM_AD_SSH_KEY_PATH"),
+    "INFRA_AD_DC_NODES": json.loads(_env_with_farm_fallback(
+        "INFRA_AD_DC_NODES_JSON", "FARM_AD_DC_NODES_JSON", "[]")),
 
     # GPU 유실 점검(check_gpu_pods.py)이 admin_be 내부 API(/api/internal/slack/notify)로
     # 보낼 때 지정할 Slack webhook URL. 비어있으면 알림을 스킵하고 로그만 남긴다.
@@ -271,6 +330,33 @@ app.config.from_mapping({
     "ISSUED_ID_MAX_PATH": BASE_ETC_DIR + "/issued_id_max.json",
 })
 
+# 기존 시험·운영 확장 코드가 읽는 키도 같은 객체를 가리키게 유지한다. 새 코드는 INFRA_*를 사용한다.
+app.config.update({
+    "FARM_SSH_USER": app.config["INFRA_SSH_USER"],
+    "FARM_SSH_KEY_PATH": app.config["INFRA_SSH_KEY_PATH"],
+    "FARM_NODES": app.config["INFRA_NODES"],
+    "FARM_AD_SSH_USER": app.config["INFRA_AD_SSH_USER"],
+    "FARM_AD_SSH_KEY_PATH": app.config["INFRA_AD_SSH_KEY_PATH"],
+    "FARM_AD_DC_NODES": app.config["INFRA_AD_DC_NODES"],
+})
+app.logger.info("[CONFIG] config-server identity initialized: cluster_id=%s namespace=%s",
+                CLUSTER_ID, app.config["NAMESPACE"])
+
+
+def _infra_setting(name: str):
+    """새 INFRA_* 설정을 읽되 FARM 런타임에서만 기존 FARM_* 키를 호환용으로 사용한다."""
+    value = app.config.get(f"INFRA_{name}")
+    if value not in (None, "", []):
+        return value
+    if CLUSTER_ID == "FARM":
+        return app.config.get(f"FARM_{name}")
+    return None
+
+
+def _infra_nodes() -> list:
+    return _infra_setting("NODES") or []
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """
@@ -288,13 +374,13 @@ def health():
         description: 서버 정상. run_mode 는 실행 중인 조건.
         schema:
           type: object
-          example: {"status": "OK", "run_mode": "noprobe"}
+          example: {"status": "OK", "run_mode": "noprobe", "cluster_id": "FARM"}
     """
     # 이 응답은 준비 상태 점검(5초)이 읽는다. 그래서 이 프로세스가 요청을 받을 수 있는지만 답하고
     # 바깥 자원은 건드리지 않는다. 예전에는 작업 이력 기록 실패 건수를 Redis에서 함께 읽었는데,
     # Redis가 사라지자 그 조회가 17초씩 걸려 준비 상태 점검이 계속 실패했고, 설치가 대기 한도
     # 10분을 채우고 중단됐다. 부가 정보는 /health/details 로 옮겼다.
-    return jsonify(status="OK", run_mode=VERIFY_MODE), 200
+    return jsonify(status="OK", run_mode=VERIFY_MODE, cluster_id=CLUSTER_ID), 200
 
 
 @app.route("/health/details", methods=["GET"])
@@ -315,17 +401,21 @@ def health_details():
           (조회 불능이면 null — 0 과 구분).
         schema:
           type: object
-          example: {"status": "OK", "run_mode": "noprobe", "oplog_write_failures": 0}
+          example: {"status": "OK", "run_mode": "noprobe", "cluster_id": "FARM", "oplog_write_failures": 0}
     """
     # 부가 저장소를 조회하므로 저장소가 멈추면 이 경로도 함께 느려진다. 준비 상태 점검에는 쓰지 않는다.
-    return jsonify(status="OK", run_mode=VERIFY_MODE,
+    return jsonify(status="OK", run_mode=VERIFY_MODE, cluster_id=CLUSTER_ID,
                    oplog_write_failures=write_failure_count()), 200
 
-def load_k8s():
-    try:
-        k8s_config.load_incluster_config()
-    except:
-        k8s_config.load_kube_config()
+def _reject_farm_only_operation(kind: str):
+    """계정 전역 상태를 한 클러스터에서만 바꾸는 작업을 LAB Config Server에서 막는다."""
+    if CLUSTER_ID == "FARM":
+        return None
+    app.logger.warning("[CLUSTER] FARM 전용 작업 거절: cluster=%s kind=%s", CLUSTER_ID, kind)
+    return jsonify(infra_error(
+        "CHECK_CLUSTER_OPERATION", "CLUSTER_OPERATION_UNSUPPORTED",
+        f"{kind} 작업은 FARM Config Server에서만 실행할 수 있습니다",
+    )), 409
 
 
 def wait_for_pod_deleted(v1, pod_name, namespace, timeout_sec=60):
@@ -631,18 +721,18 @@ def _farm_ad_ssh(remote_command: str, stdin_data: str = "", timeout: float = 30)
     """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
     그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
     DC 하나가 실패하면 다음 DC로 넘어간다."""
-    nodes = app.config["FARM_AD_DC_NODES"]
+    nodes = _infra_setting("AD_DC_NODES") or []
     if not nodes:
-        raise RuntimeError("FARM_AD_DC_NODES가 설정되지 않음")
+        raise RuntimeError("INFRA_AD_DC_NODES가 설정되지 않음")
     last_error: Exception | None = None
     for node in nodes:
         cmd = ["ssh",
-               "-i", app.config["FARM_AD_SSH_KEY_PATH"],
+               "-i", _infra_setting("AD_SSH_KEY_PATH"),
                *_ssh_host_key_options(),
                "-o", "BatchMode=yes",
                "-o", "ConnectTimeout=10",
                "-p", str(node["port"]),
-               f"{app.config['FARM_AD_SSH_USER']}@{node['host']}",
+               f"{_infra_setting('AD_SSH_USER')}@{node['host']}",
                remote_command]
         try:
             result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=timeout)
@@ -762,13 +852,14 @@ def _set_group_membership(groupnames, username: str, member: bool) -> None:
 
 
 def _get_farm_node_info(node_name: str) -> dict:
-    for node in app.config["FARM_NODES"]:
+    for node in _infra_nodes():
         if node["name"] == node_name:
             return node
     raise ValueError(f"unknown farm node: {node_name!r}")
 
 
-FARM_SSH_TIMEOUT_SEC = float(os.getenv("FARM_SSH_TIMEOUT_SEC", "150"))
+INFRA_SSH_TIMEOUT_SEC = float(_env_with_farm_fallback("INFRA_SSH_TIMEOUT_SEC", "FARM_SSH_TIMEOUT_SEC", "150"))
+FARM_SSH_TIMEOUT_SEC = INFRA_SSH_TIMEOUT_SEC
 
 
 def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -> str:
@@ -781,19 +872,19 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     명시적으로 꺼서 재시도에 의존하지 않고 매번 빠르게 붙도록 한다."""
     cmd = ["ssh",
            "-v",
-           "-i", app.config["FARM_SSH_KEY_PATH"],
+           "-i", _infra_setting("SSH_KEY_PATH"),
            *_ssh_host_key_options(),
            "-o", "BatchMode=yes",
            "-o", "GSSAPIAuthentication=no",
            "-o", "ConnectTimeout=10",
            "-p", str(port),
-           f"{app.config['FARM_SSH_USER']}@{host}",
+           f"{_infra_setting('SSH_USER')}@{host}",
            remote_command]
 
     result = None
     last_error = None
     for attempt in range(2):
-        app.logger.info(f"[FARM SSH] {host}:{port} 접속 시도 {attempt+1}/2")
+        app.logger.info(f"[INFRA SSH:{CLUSTER_ID}] {host}:{port} 접속 시도 {attempt+1}/2")
         start = time.monotonic()
         try:
             # 원격 ailab-krb5-admin 스크립트는 systemd 호출을 최대 120초까지 기다린다(노드에
@@ -801,9 +892,9 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
             # 멈출 수 있다). 클라이언트가 그보다 먼저 끊으면 원격은 계속 일하는데 우리만
             # 재시도해 같은 대기를 두 번 겪는다. 원격 한도보다 넉넉한 150초로 둔다.
             result = subprocess.run(
-                cmd, input=stdin_data, capture_output=True, text=True, timeout=FARM_SSH_TIMEOUT_SEC,
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=INFRA_SSH_TIMEOUT_SEC,
             )
-            app.logger.info(f"[FARM SSH] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
+            app.logger.info(f"[INFRA SSH:{CLUSTER_ID}] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
             break
         except subprocess.TimeoutExpired as e:
             last_error = e
@@ -812,7 +903,7 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
             # 다음에 같은 증상이 재발했을 때 원인 후보를 추론이 아니라 로그로 확인할 수 있다.
             trace = (e.stderr or "").strip()
             app.logger.warning(
-                f"[FARM SSH] {host}:{port} 타임아웃, 재시도 {attempt+1}/2, "
+                f"[INFRA SSH:{CLUSTER_ID}] {host}:{port} 타임아웃, 재시도 {attempt+1}/2, "
                 f"{time.monotonic() - start:.1f}초 경과 시점 ssh 트레이스 마지막 부분:\n"
                 f"{trace[-2000:]}"
             )
@@ -982,7 +1073,7 @@ def _clear_krb5_cleanup_pending(username: str, node_name: str) -> None:
 
 
 def _remove_krb5_from_all_farms(username: str) -> None:
-    for node in app.config["FARM_NODES"]:
+    for node in _infra_nodes():
         try:
             _remove_krb5_from_farm(username, node["name"])
         except Exception as e:
@@ -1570,6 +1661,9 @@ def register_password_change(body: PasswordChangeRequest):
       400: {description: 입력 오류}
       409: {description: 같은 신청의 비밀번호 교체 작업이 아직 끝나지 않음}
     """
+    rejected = _reject_farm_only_operation("password")
+    if rejected:
+        return rejected
     job = {"username": body.username, "passwd_hash": body.passwd_hash}
     return _register_job("password", body.request_id, body.username, job)
 
@@ -1598,6 +1692,9 @@ def register_home_delete(body: HomeDeleteRequest):
       400: {description: 입력 오류}
       409: {description: 같은 번호의 홈 삭제 작업이 아직 끝나지 않음}
     """
+    rejected = _reject_farm_only_operation("home")
+    if rejected:
+        return rejected
     job = {"username": body.username, "expected_uid": body.expected_uid}
     return _register_job("home", body.request_id, body.username, job)
 
@@ -1691,6 +1788,9 @@ def register_group_change(body: GroupJobRequest):
       404: {description: 사용자 또는 그룹 없음}
       409: {description: 이름·번호 충돌, 기본 그룹 제거, 또는 같은 번호의 작업이 아직 끝나지 않음}
     """
+    rejected = _reject_farm_only_operation("group")
+    if rejected:
+        return rejected
     try:
         if body.op == "create":
             check_group_create(body.name, body.gid, body.members)
@@ -1859,6 +1959,12 @@ def get_job_steps(kind, request_id):
     return jsonify({"request_id": str(request_id), "kind": kind,
                     "jobs": [jobs[job_id] for job_id in job_ids]}), 200
 
+
+
+if KUBERNETES_CLIENT_VALIDATE_AT_STARTUP:
+    # Helm 배포는 이 검사를 켠다. ServiceAccount 토큰/CA가 잘못된 Pod가 readiness만
+    # 통과한 뒤 첫 사용자 작업에서야 실패하지 않도록 프로세스 시작 자체를 중단한다.
+    load_k8s()
 
 
 if __name__ == "__main__":
