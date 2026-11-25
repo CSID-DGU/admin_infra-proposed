@@ -207,14 +207,17 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "list_node_gpus", lambda node, url, t: [
         (f"GPU-{node}-0", "NVIDIA RTX A5000"), (f"GPU-{node}-1", "NVIDIA GeForce RTX 3090")])
     monkeypatch.setattr(main, "resolve_k8s_node_name", lambda n: n)
-    monkeypatch.setattr(main, "resolve_farm_home_mount_root", lambda n: "/home/share/user")
+    monkeypatch.setattr(main, "resolve_home_mount_root", lambda n: "/home/share/user")
     monkeypatch.setattr(main, "load_user_image", lambda u, img: img)
     monkeypatch.setattr(main, "is_pod_ready", lambda pod: True)
     monkeypatch.setattr(main, "get_pod_failure_reason", lambda pod: None)
     monkeypatch.setattr(main, "get_pod_progress_stage", lambda *a: None)
 
     class Resp:
-        def __init__(self, code, body):
+        def __init__(self, code, body, add_cluster_identity=True):
+            if (add_cluster_identity and code == 200 and isinstance(body, dict)
+                    and ("image" in body or "gpu_nodes" in body)):
+                body = {"cluster_id": main.CLUSTER_ID, **body}
             self.status_code, self._b = code, body
 
         def json(self):
@@ -337,6 +340,22 @@ def test_duplicate_registration_and_retry_after_finish(env):
     # 같은 신청을 다시 처리하면 작업 번호로 두 시도가 구분된다
     starts = e.db.execute("SELECT job_id FROM operation_log WHERE request_id='102' AND action='PROVISION' AND phase='START'").fetchall()
     assert len({j for (j,) in starts}) == 2
+
+
+@pytest.mark.parametrize("response_cluster", [None, "OTHER"])
+def test_provision_rejects_admin_response_without_matching_cluster_identity(env, response_cluster):
+    e = env
+    body = {"image": "dguailab/decs:1", "passwd_base64": PW, "gpu_nodes": []}
+    if response_cluster is not None:
+        body["cluster_id"] = response_cluster
+    e.was = lambda url: e.Resp(200, body, add_cluster_identity=False)
+
+    assert e.api.post("/operations/provision", json={
+        "request_id": "129", "username": "exp-np-cluster-check", "account": {"passwd_base64": PW}
+    }).status_code == 202
+    tick(e)
+
+    assert result(e, "provision", "129")["error_code"] == "USER_CONFIG_INVALID_RESPONSE"
 
 
 def test_farm_timeout_is_unknown_and_ports_are_released(env, monkeypatch):
@@ -783,7 +802,9 @@ def test_user_config_fetch_sends_internal_token(env, monkeypatch):
 
     tick(e)
 
-    assert e.was_headers and all(h.get("X-Internal-Token") == "s3cret" for h in e.was_headers)
+    assert e.was_headers and all(
+        h.get("X-Internal-Token") == "s3cret" and h.get("X-Cluster-Id") == main.CLUSTER_ID
+        for h in e.was_headers)
 
 
 # ---------- 앞 단계 자원까지 정리한 실패의 재시도(되감기) ----------

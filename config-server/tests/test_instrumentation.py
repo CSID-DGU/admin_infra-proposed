@@ -121,6 +121,7 @@ def test_health_details_reports_mode_and_loss_counter(monkeypatch):
     body = main.app.test_client().get("/health/details").get_json()
     assert body["status"] == "OK"
     assert body["run_mode"] == main.VERIFY_MODE
+    assert body["cluster_id"] == main.CLUSTER_ID
     assert body["oplog_write_failures"] == 3
 
 
@@ -140,4 +141,5 @@ def test_health_does_not_touch_redis(monkeypatch):
 
     body = main.app.test_client().get("/health").get_json()
 
-    assert body["status"] == "OK" and "oplog_write_failures" not in body
+    assert body["status"] == "OK" and body["cluster_id"] == main.CLUSTER_ID
+    assert "oplog_write_failures" not in body

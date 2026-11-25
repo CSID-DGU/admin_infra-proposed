@@ -5,6 +5,8 @@ metadata:
   name: {{ include "containerssh-config-server.fullname" . }}-controller
   namespace: {{ .Values.config.namespace }}
   labels:
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
     app: containerssh-config-controller
 spec:
   replicas: 1
@@ -12,18 +14,27 @@ spec:
   # 내려간 뒤에야 새 Pod를 띄운다.
   strategy:
     type: Recreate
+  # legacy 모드는 기존 controller Deployment의 immutable selector를 정확히 유지한다.
   selector:
     matchLabels:
+      {{- if eq (include "containerssh-config-server.selectorMode" .) "legacy" }}
       app: containerssh-config-controller
+      {{- else }}
+      {{- include "containerssh-config-server.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+      {{- end }}
   template:
     metadata:
       labels:
+        {{- include "containerssh-config-server.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+        # 기존 DB·Redis·Admin BE NetworkPolicy가 이 라벨로 제어기를 허용한다.
         app: containerssh-config-controller
     spec:
       # 제어기는 SIGTERM을 받으면 새 작업을 더 받지 않고, 실행 중인 작업(Pod 생성은 최대
       # POD_READY_MAX_WAIT_SEC=500초)이 끝날 때까지 기다린다.
       terminationGracePeriodSeconds: 630
-      serviceAccountName: config-server
+      serviceAccountName: {{ include "containerssh-config-server.serviceAccountName" . }}
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}

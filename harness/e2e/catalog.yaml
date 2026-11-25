@@ -385,4 +385,3 @@ waived_codes:
   UID_RANGE_EXHAUSTED: UID 대역 소진 — 대역을 다 쓰는 시험은 비용이 커서 보류
   UNRESUMABLE_UNKNOWN: 이어갈 수 없는 결과 불명 — 가상 시험 없음
   USER_CONFIG_FETCH_FAILED: admin_be 설정 조회 실패 — admin_be 차단 장애 미구현
-  USER_CONFIG_INVALID_RESPONSE: admin_be 설정 응답 이상 — 가상 시험 없음

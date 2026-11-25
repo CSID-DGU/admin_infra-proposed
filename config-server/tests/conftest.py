@@ -1,4 +1,5 @@
 import itertools
+import os
 import pathlib
 import sys
 import types
@@ -6,6 +7,10 @@ import types
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+# 대부분의 기존 단위 시험은 운영(FARM) 동작을 검증한다. LAB의 account-global 작업 차단은
+# test_cluster_operation_guard에서 CLUSTER_ID를 명시적으로 바꿔 별도로 검증한다.
+os.environ.setdefault("CLUSTER_ID", "farm")
+os.environ.setdefault("KUBERNETES_CLIENT_MODE", "in-cluster")
 
 import main  # noqa: E402
 

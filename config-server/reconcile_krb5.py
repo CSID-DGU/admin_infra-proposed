@@ -98,7 +98,7 @@ def reconcile_krb5_orphans() -> None:
     없다. 자동 삭제로 뒀다가 farm6의 레거시 계정 여러 개(2026-09-03 dry-run으로 확인, dm20020204/
     donghyun2/jy/ohchanju3)가 한꺼번에 지워질 뻔한 적이 있다. 레거시 계정을 구분할 방법(예:
     별도 allowlist/테이블)이 생기기 전까진 사람이 로그를 보고 직접 정리하는 게 안전하다."""
-    for node in app.config["FARM_NODES"]:
+    for node in (app.config.get("INFRA_NODES") or app.config["FARM_NODES"]):
         try:
             node_info = _get_farm_node_info(node["name"])
             result = _farm_ssh(node_info["host"], node_info["port"], "list")
@@ -146,7 +146,7 @@ def reconcile_pod_nfs() -> None:
         app.logger.warning(f"[POD NFS RECONCILE] Pod 목록 조회 실패, 이번 주기는 건너뜀: {e}")
         return
 
-    for node in app.config["FARM_NODES"]:
+    for node in (app.config.get("INFRA_NODES") or app.config["FARM_NODES"]):
         try:
             listing = _farm_ssh(node["host"], node["port"], "nfs-list")
         except Exception as e:
@@ -395,7 +395,7 @@ def sync_idmap_groups(names) -> None:
     if not valid:
         return
     payload = "\n".join(valid) + "\n"
-    for node in app.config["FARM_NODES"]:
+    for node in (app.config.get("INFRA_NODES") or app.config["FARM_NODES"]):
         try:
             out = _farm_ssh(node["host"], node["port"], IDMAP_SYNC_ACTION, stdin_data=payload)
         except Exception as e:
@@ -426,7 +426,7 @@ def trigger_idmap_sync_ondemand(names) -> bool:
 
     반환값은 스레드를 띄웠는지일 뿐, 등록 성공 여부가 아니다."""
     names = sorted(set(names or []))
-    if not names or not app.config["FARM_NODES"]:
+    if not names or not (app.config.get("INFRA_NODES") or app.config["FARM_NODES"]):
         return False
 
     def _run():

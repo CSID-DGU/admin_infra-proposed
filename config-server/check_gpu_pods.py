@@ -385,7 +385,8 @@ def _node_ssh_state(node) -> str:
     """노드 sshd 응답. 노드는 22 가 아닌 포트(노드마다 다름)로 sshd 를 열어 두므로 설정의 FARM_NODES 에서
     host:port 를 찾는다. 설정에 없으면 포트를 모르므로 22 로 찔러 "응답 없음"이라고 거짓 경보를 내지 않고
     확인 불가로 남긴다."""
-    entry = next((n for n in app.config["FARM_NODES"] if n.get("name") == node.metadata.name), None)
+    nodes = app.config.get("INFRA_NODES") or app.config["FARM_NODES"]
+    entry = next((n for n in nodes if n.get("name") == node.metadata.name), None)
     if not entry or not entry.get("port"):
         return "확인 불가(이 노드의 SSH 포트가 설정에 없음)"
     host = entry.get("host") or _node_internal_ip(node)

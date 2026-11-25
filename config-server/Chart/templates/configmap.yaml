@@ -1,21 +1,47 @@
+{{- $values := .Values | toJson | fromJson -}}
+{{- $kdcHosts := .Values.krb5.kdcHosts -}}
+{{- $legacyKdcHost := "" -}}
+{{- if eq (include "containerssh-config-server.clusterId" .) "farm" -}}
+{{- $legacyKdcHost = dig "krb5" "kdcHost" "" $values -}}
+{{- end -}}
+{{- if and (empty $kdcHosts) $legacyKdcHost -}}
+{{- $kdcHosts = list $legacyKdcHost -}}
+{{- end -}}
+{{- $domain := .Values.krb5.domain -}}
+{{- if and (empty $domain) $legacyKdcHost -}}
+{{- $domain = "ailab.dgu" -}}
+{{- end -}}
+{{- if and .Values.krb5.realm (empty $kdcHosts) -}}
+{{- fail "krb5.realm을 설정하면 krb5.kdcHosts도 하나 이상 지정해야 합니다" -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: krb5-conf
-  namespace: {{ .Values.namespace }}
+  name: {{ include "containerssh-config-server.krb5ConfigMapName" . }}
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    {{- include "containerssh-config-server.labels" . | nindent 4 }}
 data:
   krb5.conf: |
     [libdefaults]
+{{- if .Values.krb5.realm }}
         default_realm = {{ .Values.krb5.realm }}
+{{- end }}
         dns_lookup_realm = false
         dns_lookup_kdc = false
+{{- if .Values.krb5.realm }}
 
     [realms]
         {{ .Values.krb5.realm }} = {
-            kdc = {{ .Values.krb5.kdcHost }}
-            admin_server = {{ .Values.krb5.kdcHost }}
+{{- range $kdcHosts }}
+            kdc = {{ . }}
+{{- end }}
+            admin_server = {{ default (first $kdcHosts) .Values.krb5.adminServer }}
         }
+{{- if $domain }}
 
     [domain_realm]
-        .ailab.dgu = {{ .Values.krb5.realm }}
-        ailab.dgu = {{ .Values.krb5.realm }}
+        .{{ $domain }} = {{ .Values.krb5.realm }}
+        {{ $domain }} = {{ .Values.krb5.realm }}
+{{- end }}
+{{- end }}

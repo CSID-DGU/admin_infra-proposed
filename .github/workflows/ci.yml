@@ -34,6 +34,11 @@ jobs:
       - run: pip install -r config-server/requirements.txt pytest pyyaml
       - name: config-server
         run: python -m pytest -q config-server
+      - name: proposed-stack contract
+        run: |
+          bash -n ops/proposed-stack/stack-up.sh
+          bash -n ops/proposed-stack/stack-down.sh
+          python -m pytest -q ops/proposed-stack/tests
       - name: harness
         working-directory: harness
         env:

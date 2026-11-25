@@ -1,0 +1,84 @@
+# 예시 전용 값이다. 문서용 TEST-NET 주소와 REPLACE_* 표시는 배포 전에 LAB 운영값으로 바꾼다.
+compatibility:
+  # 신규 릴리스용. 구 운영 Deployment를 제자리 upgrade할 때는 legacy를 유지한다.
+  deploymentSelectorMode: release
+
+cluster:
+  id: lab
+  homeMountRootTemplate: /REPLACE_WITH_LAB_HOME_MOUNT/{node}
+  ssh:
+    user: REPLACE_WITH_LAB_NODE_SERVICE_ACCOUNT
+    keyPath: /etc/infra-ssh/id_ed25519
+    nodes:
+      - name: lab1
+        host: 198.51.100.11
+        port: 22
+  adSsh:
+    user: REPLACE_WITH_LAB_AD_SERVICE_ACCOUNT
+    keyPath: /etc/infra-ad-ssh/id_ed25519
+    nodes:
+      - name: lab-ad1
+        host: 198.51.100.21
+        port: 22
+
+image:
+  tag: REPLACE_WITH_IMMUTABLE_IMAGE_TAG
+
+nfs:
+  server: 198.51.100.31
+  userSharePath: /REPLACE_WITH_LAB_USER_SHARE
+  kubeSharePath: /REPLACE_WITH_LAB_KUBE_SHARE
+
+nas:
+  ssh:
+    host: 198.51.100.31
+    port: 22
+    user: REPLACE_WITH_LAB_NAS_SERVICE_ACCOUNT
+    keyPath: /etc/nas-ssh/id_ed25519
+
+krb5:
+  realm: LAB.EXAMPLE.INVALID
+  kdcHosts: [198.51.100.21]
+  adminServer: 198.51.100.21
+  domain: lab.example.invalid
+
+infra:
+  adminBeInternalUrl: http://REPLACE_WITH_ADMIN_BE_SERVICE
+
+monitoring:
+  prometheusUrl: http://REPLACE_WITH_LAB_PROMETHEUS
+
+imageStore:
+  claimName: REPLACE_WITH_LAB_IMAGE_STORE_PVC
+
+db:
+  host: REPLACE_WITH_LAB_DB_HOST
+  name: REPLACE_WITH_LAB_LEDGER_DB
+  user: REPLACE_WITH_LAB_DB_USER
+
+logDb:
+  host: REPLACE_WITH_LAB_LOG_DB_HOST
+  name: REPLACE_WITH_LAB_LOG_DB
+  user: REPLACE_WITH_LAB_LOG_DB_USER
+
+redis:
+  host: REPLACE_WITH_LAB_REDIS_HOST
+  db: 0
+
+# 최초 LAB 배포는 API health와 read-only 경로만 검증한다. controller와
+# 주기 작업은 각각 별도 검토를 마친 뒤 한 종류씩 활성화한다.
+controller:
+  enabled: false
+
+cronjobs:
+  gpuCheck:
+    enabled: false
+  krb5Reconcile:
+    enabled: false
+
+nodeSelector:
+  provi.dgu.ac.kr/role: lab-management
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule

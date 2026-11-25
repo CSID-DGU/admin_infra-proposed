@@ -475,7 +475,7 @@ def step_fetch_user_config(ctx):
             "USER_CONFIG_INVALID_RESPONSE",
             str(e),
             was_status=resp.status_code if resp is not None else None,
-        ), 502)
+        ), 502, retry=False)
 
     # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
     if user_info.get("status") == 404 or resp.status_code == 404:
@@ -501,6 +501,23 @@ def step_fetch_user_config(ctx):
             f"WAS returned {resp.status_code} for user {username!r}",
             was_status=resp.status_code,
         ), 502)
+
+    # 오류 응답은 위에서 해당 오류 자체로 처리한다. 정상 응답은 cluster_id가 반드시 있고
+    # 요청을 보낸 Config Server의 canonical ID와 정확히 같아야 한다. 누락·불일치는
+    # 다시 요청해도 같은 계약 오류이므로 재시도/DEGRADED로 바꾸지 않고 즉시 실패한다.
+    response_cluster = user_info.get("cluster_id")
+    if response_cluster != _main.CLUSTER_ID:
+        detail = f"admin_be returned cluster_id={response_cluster!r}, expected {_main.CLUSTER_ID!r}"
+        _main.app.logger.error("[CREATE POD] invalid WAS cluster identity: %s", detail)
+        _main.log_operation(request_id=request_id, username=username,
+                      action=Action.FETCH_USER_CONFIG, phase=Phase.FAIL,
+                      error_code="USER_CONFIG_INVALID_RESPONSE", error_detail=detail)
+        raise _main.StepFailed(_main.infra_error(
+            "FETCH_USER_CONFIG",
+            "USER_CONFIG_INVALID_RESPONSE",
+            detail,
+            was_status=resp.status_code,
+        ), 502, retry=False)
 
     _fill_new_group_gids(ctx, user_info)
     _main.log_operation(request_id=request_id, username=username,
@@ -1164,7 +1181,7 @@ def build_pod_spec(
         # Pod 별 독립 NFS client 를 쓰면 아래 Kerberos 배포 뒤에 그 Pod 전용 마운트 경로로 바꾼다.
         home_volume = {
             "name": "nfs-home",
-            "hostPath": {"path": _main.resolve_farm_home_mount_root(target_node), "type": "Directory"},
+            "hostPath": {"path": _main.resolve_home_mount_root(target_node), "type": "Directory"},
         }
         volumes = [home_volume]
 

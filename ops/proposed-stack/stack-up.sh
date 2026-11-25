@@ -138,11 +138,15 @@ YAML
 }
 wait_ledger_helper() { kubectl -n "$NS" wait --for=condition=Ready pod/"$LEDGER_POD" --timeout=5m >/dev/null; }
 ledger() { kubectl -n "$NS" exec "$LEDGER_POD" -- "$@"; }
-BASE=$(mktemp); trap 'rm -f "$BASE"; ledger_cleanup' EXIT
+BASE=$(mktemp)
+CLUSTER_PROFILE=$(mktemp)
+trap 'rm -f "$BASE" "$CLUSTER_PROFILE"; ledger_cleanup' EXIT
 
 step "사전 확인"
 # NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 그대로 쓴다. 값은 릴리스에 남아 있어 운영 Pod가 없어도 읽힌다.
 helm -n "$PROD_NS" get values "$PROD_RELEASE" -o yaml > "$BASE"
+helm -n "$PROD_NS" get values "$PROD_RELEASE" -o json \
+  | python3 "$HERE/cluster_profile.py" > "$CLUSTER_PROFILE"
 KUBE_SHARE=$(sed -n 's/^[[:space:]]*kubeSharePath:[[:space:]]*//p' "$BASE" | head -1 | tr -d "\"'")
 NFS_SERVER=$(awk '/^nfs:/{f=1; next} f && /^[^[:space:]]/{f=0} f && /^[[:space:]]+server:/{sub(/^[[:space:]]+server:[[:space:]]*/, ""); gsub(/["\047]/, ""); print; exit}' "$BASE")
 [ -n "$KUBE_SHARE" ] || { echo "운영 kubeSharePath를 찾지 못함"; exit 1; }
@@ -160,6 +164,36 @@ echo "config-server nodePort $CONFIG_NODEPORT 사용 가능, 화면 호스트 $F
 step "네임스페이스 $NS"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace "$NS" ailab.dgu/proposed-stack="$STACK" --overwrite >/dev/null
+# Deployment selector는 생성 후 바꿀 수 없다. 구 차트로 만든 스택은 legacy selector와
+# 서비스 이름을 그대로 유지하고, 새 스택은 릴리스별 selector/서비스를 사용한다.
+selector_mode_of() { # $1 deployment, $2 legacy app label, $3 release component
+  local labels
+  labels=$(kubectl -n "$NS" get deployment "$1" -o json | python3 -c \
+    'import json,sys; d=json.load(sys.stdin)["spec"]["selector"]["matchLabels"]; print("|".join(str(d.get(k,"")) for k in ("app","app.kubernetes.io/name","app.kubernetes.io/instance","app.kubernetes.io/component")))')
+  case "$labels" in
+    "$2|||" ) echo legacy ;;
+    "|containerssh-config-server|$RELEASE|$3" ) echo release ;;
+    * ) echo "지원하지 않는 $1 Deployment selector라 자동 upgrade할 수 없음" >&2; return 1 ;;
+  esac
+}
+SELECTOR_MODE=release
+API_SELECTOR_MODE=
+CONTROLLER_SELECTOR_MODE=
+if kubectl -n "$NS" get deployment "$RELEASE" >/dev/null 2>&1; then
+  API_SELECTOR_MODE=$(selector_mode_of "$RELEASE" containerssh-config-server api)
+fi
+if kubectl -n "$NS" get deployment "$RELEASE-controller" >/dev/null 2>&1; then
+  CONTROLLER_SELECTOR_MODE=$(selector_mode_of "$RELEASE-controller" containerssh-config-controller controller)
+fi
+if [ -n "$API_SELECTOR_MODE" ] && [ -n "$CONTROLLER_SELECTOR_MODE" ]; then
+  [ "$CONTROLLER_SELECTOR_MODE" = "$API_SELECTOR_MODE" ] || {
+    echo "API와 controller Deployment selector 모드가 달라 자동 upgrade할 수 없음" >&2; exit 1;
+  }
+fi
+SELECTOR_MODE=${API_SELECTOR_MODE:-${CONTROLLER_SELECTOR_MODE:-release}}
+CONFIG_SERVICE=$RELEASE
+[ "$SELECTOR_MODE" = legacy ] && CONFIG_SERVICE=containerssh-config-service
+echo "config-server selector 모드: $SELECTOR_MODE"
 # 계정 대장 확인(아래 MySQL 앞 단계)에 쓸 도우미 Pod를 지금 띄워 두고, 뜨는 동안 Secret 준비 단계를 진행한다.
 start_ledger_helper "$NFS_SERVER" "$KUBE_SHARE"
 
@@ -398,7 +432,7 @@ PROMETHEUS_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc.clust
 # 이 값으로 기동하면 스키마를 바꾸지 않으므로, 이 변경은 Flyway를 넣은 admin_be(be#603)와 함께 배포한다.
 
 CONFIG_JSON=$(cat <<EOF
-{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"validate"}}},"config":{"base-url":"http://containerssh-config-service.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)"}$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE$SLACK_MEMBERSHIP_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"kubernetes":{"pod-namespace":"$NS"},"jwt":{"secret":"$(getpw jwt_secret)"}}
+{"spring":{"datasource":{"url":"jdbc:mysql://admin-mysql.$NS.svc.cluster.local:3306/web_admin?serverTimezone=Asia/Seoul&useSSL=false&allowPublicKeyRetrieval=true","username":"admin_user","password":"$(getpw admin_user)"},"data":{"redis":{"host":"admin-redis.$NS.svc.cluster.local","port":6379,"password":"$(getpw admin_redis)"}},"jpa":{"hibernate":{"ddl-auto":"validate"}}},"provi":{"clusters":{"FARM":{"base-url":"http://$CONFIG_SERVICE.$NS.svc.cluster.local","api-token":"$(getpw config_api_token)","timeout-seconds":600,"pod-timeout-seconds":300,"in-cluster":true,"pod-namespace":"$NS"}}}$SLACK_OVERRIDE$ISSUANCE_SHEET_OVERRIDE$SLACK_MEMBERSHIP_OVERRIDE,"prometheus":{"base-url":"$PROMETHEUS_URL"},"jwt":{"secret":"$(getpw jwt_secret)"}}
 EOF
 )
 kubectl -n "$NS" create secret generic admin-be-config --from-literal=SPRING_APPLICATION_JSON="$CONFIG_JSON" \
@@ -482,10 +516,12 @@ step "config-server ($RELEASE, $IMAGE)"
 if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
   helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
 fi
-helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" \
+helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" -f "$CLUSTER_PROFILE" \
   --set namespace="$NS" --set config.namespace="$NS" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
   --set service.nodePort="$CONFIG_NODEPORT" \
+  --set cluster.id=farm \
+  --set compatibility.deploymentSelectorMode="$SELECTOR_MODE" \
   --set nfs.kubeSharePath="$STACK_KUBE_SHARE" \
   --set infra.adminBeInternalUrl="http://admin-prod.$NS" \
   --set accounts.uidMin="$UID_MIN" --set accounts.uidMax="$UID_MAX" --set accounts.prefix="$PREFIX" \
@@ -494,6 +530,12 @@ helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE
   --set verifyMode="$VERIFY_MODE" --set faultInjection="$FAULT_INJECTION" \
   --set redis.host="redis-bg-master.$NS.svc.cluster.local" \
   --set db.host=infra-mysql --set logDb.host=log-mysql \
+  --set db.secretName=config-server-db-secret --set logDb.secretName=log-mysql-secret \
+  --set nas.ssh.secretName=nas-ssh-key \
+  --set cluster.ssh.secretName=farm-ssh-key --set cluster.adSsh.secretName=farm-ad-ssh-key \
+  --set apiToken.secretName=config-server-api-token \
+  --set sshKnownHosts.secretName=config-server-ssh-known-hosts \
+  --set infra.slackSecretName=config-server-infra-slack-secret \
   --set imageStore.claimName= \
   --set controller.enabled=true \
   --set priorityClassName=ailab-stack-component \
@@ -545,6 +587,7 @@ kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="${PREFIX}000" PREFIX="$PREFIX" U
 import base64, json, os, sys, time, requests
 api = requests.Session()
 api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
+api.headers["X-Cluster-Id"] = os.environ.get("CLUSTER_ID", "").strip().upper()
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 lo, hi = int(os.environ["UID_MIN"]), int(os.environ["UID_MAX"])
 ok = True
@@ -634,6 +677,7 @@ kubectl -n "$NS" exec -i "$CS_POD" -- env NAME="$PROBE_NAME" RID="$JOB_RID" RID2
 import base64, os, sys, time, requests
 api = requests.Session()
 api.headers["X-Internal-Token"] = os.environ.get("CONFIG_API_TOKEN", "")
+api.headers["X-Cluster-Id"] = os.environ.get("CLUSTER_ID", "").strip().upper()
 base, name = "http://127.0.0.1:8000", os.environ["NAME"]
 rid, rid2, node = os.environ["RID"], os.environ["RID2"], os.environ.get("NODE") or None
 ok = True
