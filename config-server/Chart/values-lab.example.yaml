@@ -65,6 +65,17 @@ redis:
   host: REPLACE_WITH_LAB_REDIS_HOST
   db: 0
 
+# 최초 LAB 배포는 API health와 read-only 경로만 검증한다. controller와
+# 주기 작업은 각각 별도 검토를 마친 뒤 한 종류씩 활성화한다.
+controller:
+  enabled: false
+
+cronjobs:
+  gpuCheck:
+    enabled: false
+  krb5Reconcile:
+    enabled: false
+
 nodeSelector:
   provi.dgu.ac.kr/role: lab-management
 tolerations:

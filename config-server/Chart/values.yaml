@@ -127,6 +127,14 @@ controller:
   pollSec: 2
   workers: 4
 
+# 기존 FARM 배포 동작은 유지하되, 신규 LAB 릴리스는 각 주기 작업을 별도로
+# 비활성화한 상태에서 health/read-only 검증부터 시작할 수 있어야 한다.
+cronjobs:
+  gpuCheck:
+    enabled: true
+  krb5Reconcile:
+    enabled: true
+
 apiToken:
   secretName: ""
 

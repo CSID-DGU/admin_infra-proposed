@@ -1,3 +1,4 @@
+{{- if .Values.cronjobs.krb5Reconcile.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -48,3 +49,4 @@ spec:
                 {{- include "containerssh-config-server.volumeMounts" . | nindent 16 }}
           volumes:
             {{- include "containerssh-config-server.volumes" . | nindent 12 }}
+{{- end }}
