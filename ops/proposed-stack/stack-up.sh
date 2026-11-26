@@ -146,7 +146,8 @@ CLUSTER_PROFILE=$(mktemp)
 trap 'rm -f "$BASE" "$CLUSTER_PROFILE"; ledger_cleanup' EXIT
 
 step "사전 확인"
-# NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 그대로 쓴다. 값은 릴리스에 남아 있어 운영 Pod가 없어도 읽힌다.
+# NFS·NAS·Kerberos·farm 노드 설정은 운영 릴리스 값을 바탕으로 쓴다. 값은 릴리스에 남아 있어 운영
+# Pod가 없어도 읽힌다. 배포에는 변환된 단일 values를 사용해 구 nodeSelector map이 재귀 병합되지 않게 한다.
 helm -n "$PROD_NS" get values "$PROD_RELEASE" -o yaml > "$BASE"
 helm -n "$PROD_NS" get values "$PROD_RELEASE" -o json \
   | python3 "$HERE/cluster_profile.py" > "$CLUSTER_PROFILE"
@@ -519,7 +520,7 @@ step "config-server ($RELEASE, $IMAGE)"
 if helm -n "$NS" status "$RELEASE" -o json 2>/dev/null | grep -q '"status":"failed"'; then
   helm -n "$NS" uninstall "$RELEASE" --wait >/dev/null && echo "실패한 이전 설치 정리"
 fi
-helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$BASE" -f "$CLUSTER_PROFILE" \
+helm upgrade --install "$RELEASE" "$ROOT/config-server/Chart" -n "$NS" -f "$CLUSTER_PROFILE" \
   --set namespace="$NS" --set config.namespace="$NS" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=IfNotPresent \
   --set service.nodePort="$CONFIG_NODEPORT" \

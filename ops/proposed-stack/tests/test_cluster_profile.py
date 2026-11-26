@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import pathlib
 import subprocess
 
@@ -58,6 +59,71 @@ def test_current_cluster_profile_wins_over_legacy_farm_values():
     assert converted["cluster"]["ssh"]["user"] == "current"
     assert converted["cluster"]["ssh"]["nodes"] == [{"name": "lab1"}]
     assert converted["cluster"]["adSsh"]["user"] == "current-ad"
+
+
+def test_management_placement_overrides_legacy_master_node_selector():
+    converted = cluster_profile.cluster_profile({
+        "nodeSelector": {"kubernetes.io/hostname": "csid-dgu-desktop"},
+        "tolerations": [],
+    })
+
+    assert converted["nodeSelector"] == {
+        "provi.dgu.ac.kr/role": "farm-management",
+    }
+    assert converted["tolerations"] == [{
+        "key": "node-role.kubernetes.io/control-plane",
+        "operator": "Exists",
+        "effect": "NoSchedule",
+    }]
+
+
+def test_lab_management_profile_uses_lab_role():
+    converted = cluster_profile.cluster_profile({}, cluster_id="lab")
+
+    assert converted["nodeSelector"] == {
+        "provi.dgu.ac.kr/role": "lab-management",
+    }
+
+
+def test_management_overlay_wins_in_actual_helm_render():
+    deploy_values = cluster_profile.deployment_values({
+        "cluster": {"id": "farm"},
+        "image": {"tag": "test"},
+        "nodeSelector": {"kubernetes.io/hostname": "csid-dgu-desktop"},
+        "controller": {"enabled": True},
+    })
+
+    rendered = subprocess.run(
+        [
+            "helm", "template", "config-server-operation",
+            str(ROOT.parents[1] / "config-server" / "Chart"),
+            "-f", "-",
+        ],
+        input=json.dumps(deploy_values),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert "kubernetes.io/hostname: csid-dgu-desktop" not in rendered
+    assert rendered.count("provi.dgu.ac.kr/role: farm-management") >= 3
+
+
+def test_deployment_values_preserve_dependencies_but_replace_placement_map():
+    converted = cluster_profile.deployment_values({
+        "nfs": {"server": "nas.example", "kubeSharePath": "/share"},
+        "nodeSelector": {"kubernetes.io/hostname": "csid-dgu-desktop"},
+        "tolerations": [],
+    })
+
+    assert converted["nfs"] == {
+        "server": "nas.example",
+        "kubeSharePath": "/share",
+    }
+    assert converted["nodeSelector"] == {
+        "provi.dgu.ac.kr/role": "farm-management",
+    }
+    assert converted["tolerations"][0]["key"] == "node-role.kubernetes.io/control-plane"
 
 
 def test_current_kdc_hosts_win_and_legacy_kdc_host_is_only_a_fallback():
