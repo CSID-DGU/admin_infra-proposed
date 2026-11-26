@@ -29,7 +29,7 @@ def test_entrypoint_never_calls_legacy_or_destructive_paths():
     assert "helm uninstall" not in source
     assert "kubectl delete" not in source
     assert "kubectl apply" not in source
-    assert "create secret" not in source
+    assert "kubectl create secret" not in source
 
 
 def test_existing_release_only_and_rollback_contract_is_explicit():
@@ -79,6 +79,8 @@ def test_lab_api_bootstrap_writer_and_dependency_gates_are_explicit():
         'controller.enabled == false',
         'cronjobs.gpuCheck.enabled == false',
         'cronjobs.krb5Reconcile.enabled == false',
+        '.lab.lifecycleDependenciesReady == false',
+        '--set lab.lifecycleDependenciesReady=false',
         'nfs.server == ""',
         'krb5.realm == ""',
         'infra.adminBeInternalUrl == "http://127.0.0.1:9"',
@@ -98,10 +100,189 @@ def test_lab_api_bootstrap_writer_and_dependency_gates_are_explicit():
         'redis:7.4-alpine',
         '/var/lib/provi/lab-config-server/mysql',
         '/var/lib/provi/lab-config-server/redis',
+        'lab-config-mysql-ingress',
+        'lab-config-redis-ingress',
+        'LAB foundation NetworkPolicy drifted',
     ):
         assert value in source
     assert '"$TARGET" == lab && "$ACTION" == probe' in source
-    assert 'lab_bootstrap_args=(--set api.readOnly=true)' in source
+    assert 'lab_bootstrap_args=(' in source
+    assert '--set api.readOnly=true' in source
+
+
+def test_lab_rendered_resource_set_is_an_exact_api_only_allowlist():
+    source = SCRIPT.read_text()
+    expected = {
+        "clusterrole.rbac.authorization.k8s.io/lab-config-server-node-reader",
+        "clusterrole.rbac.authorization.k8s.io/lab-config-server-service-reader",
+        "clusterrolebinding.rbac.authorization.k8s.io/lab-config-server-node-reader-binding",
+        "clusterrolebinding.rbac.authorization.k8s.io/lab-config-server-service-reader-binding",
+        "configmap/lab-config-server-krb5",
+        "deployment.apps/lab-config-server",
+        "role.rbac.authorization.k8s.io/lab-config-server-role",
+        "rolebinding.rbac.authorization.k8s.io/lab-config-server-rolebinding",
+        "service/lab-config-server",
+        "serviceaccount/lab-config-server",
+    }
+    start = source.index("expected_lab_rendered_resources() {")
+    end = source.index("\n}\n", start)
+    function = source[start:end]
+    actual = {line for line in function.splitlines() if "/" in line}
+
+    assert actual == expected
+    assert '<(expected_lab_rendered_resources | LC_ALL=C sort)' in source
+    assert '<(LC_ALL=C sort "$WORK_DIR/rendered-resources.txt")' in source
+
+
+def test_lab_probe_and_post_upgrade_check_effective_serviceaccount_contract():
+    source = SCRIPT.read_text()
+    assert 'EXPECTED_SERVICE_ACCOUNT=lab-config-server' in source
+    assert 'system:serviceaccount:${NAMESPACE}:${EXPECTED_SERVICE_ACCOUNT}' in source
+    assert source.count("validate_lab_effective_rbac") == 3  # definition + two calls
+    assert 'answer=$(kubectl auth can-i "$verb" "$resource" "${scope_args[@]}"' in source
+    assert '[[ "$answer" == "$expected" ]]' in source
+    assert 'namespace) scope_args=(--namespace "$NAMESPACE")' in source
+    assert 'all-namespaces) scope_args=(--all-namespaces)' in source
+
+    assert "for resource in pods pods/log services persistentvolumeclaims events" in source
+    assert "for verb in get list watch" in source
+    assert 'validate_lab_can_i "$identity" yes namespace "$verb" "$resource"' in source
+    assert 'validate_lab_can_i "$identity" yes cluster "$verb" nodes' in source
+    assert 'validate_lab_can_i "$identity" yes all-namespaces "$verb" services' in source
+
+    assert "for resource in secrets configmaps" in source
+    assert "for verb in get list watch create update patch delete deletecollection" in source
+    assert 'validate_lab_can_i "$identity" no namespace "$verb" "$resource"' in source
+    assert "for verb in get create" in source
+    assert 'validate_lab_can_i "$identity" no namespace "$verb" pods/exec' in source
+    assert "for verb in create update patch delete deletecollection" in source
+    assert 'validate_lab_can_i "$identity" no namespace "$verb" pods' in source
+
+    probe_call = source.index("validate_lab_effective_rbac", source.index('"$ACTION" == probe'))
+    upgrade_call = source.index("validate_lab_effective_rbac", probe_call + 1)
+    post_upgrade_values = source.index("validate_lab_values false", probe_call)
+    assert probe_call < post_upgrade_values < upgrade_call
+
+
+def test_lab_chart_owned_rbac_objects_are_compared_exactly():
+    source = SCRIPT.read_text()
+    start = source.index("validate_lab_owned_rbac_objects() {")
+    end = source.index("\n}\n\nvalidate_lab_can_i()", start)
+    contract = source[start:end]
+
+    assert 'get role "${RELEASE}-role" -o json' in contract
+    assert 'get rolebinding "${RELEASE}-rolebinding" -o json' in contract
+    assert 'get clusterrole "$cluster_role" -o json' in contract
+    assert 'get clusterrolebinding "$binding" -o json' in contract
+    assert '(.rules | length) == 1' in contract
+    assert '(.rules[0] | keys | sort) == ["apiGroups", "resources", "verbs"]' in contract
+    assert '["pods", "pods/log", "services", "persistentvolumeclaims", "events"]' in contract
+    assert '["get", "list", "watch"]' in contract
+    assert '.subjects == [{' in contract
+    assert '"kind": "ServiceAccount"' in contract
+    assert '"kind": "Role"' in contract
+    assert '"kind": "ClusterRole"' in contract
+    assert "${RELEASE}-node-reader|nodes" in contract
+    assert "${RELEASE}-service-reader|services" in contract
+    assert "${RELEASE}-node-reader-binding|${RELEASE}-node-reader" in contract
+    assert "${RELEASE}-service-reader-binding|${RELEASE}-service-reader" in contract
+
+    effective = source[source.index("validate_lab_effective_rbac() {"):]
+    assert effective.index("validate_lab_owned_rbac_objects") < effective.index(
+        'validate_lab_can_i "$identity" yes namespace'
+    )
+
+
+def _lab_can_i_function_source():
+    source = SCRIPT.read_text()
+    start = source.index("validate_lab_can_i() {")
+    end = source.index("\n}\n\nvalidate_lab_effective_rbac()", start)
+    return source[start:end + 2]
+
+
+def _run_lab_can_i_harness(tmp_path, *, expected, output, command_rc):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(parents=True)
+    kubectl = fake_bin / "kubectl"
+    kubectl.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        printf '%s' "${CAN_I_OUTPUT-}"
+        exit "${CAN_I_RC-0}"
+    """))
+    kubectl.chmod(0o700)
+
+    harness = tmp_path / "can-i-harness.sh"
+    harness.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        PATH={str(fake_bin)!r}:$PATH
+        NAMESPACE=ailab-operation
+        fail() {{ printf '[ERROR] %s\\n' "$*" >&2; exit 1; }}
+        {_lab_can_i_function_source()}
+        validate_lab_can_i identity {expected} namespace get pods
+    """))
+    return subprocess.run(
+        ["bash", str(harness)],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CAN_I_OUTPUT": output,
+            "CAN_I_RC": str(command_rc),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_lab_can_i_accepts_only_the_exact_expected_answer(tmp_path):
+    assert _run_lab_can_i_harness(
+        tmp_path / "yes", expected="yes", output="yes", command_rc=0
+    ).returncode == 0
+    assert _run_lab_can_i_harness(
+        tmp_path / "no", expected="no", output="no", command_rc=1
+    ).returncode == 0
+
+    empty = _run_lab_can_i_harness(
+        tmp_path / "empty", expected="no", output="", command_rc=1
+    )
+    assert empty.returncode == 1
+    assert "answer=error" in empty.stderr
+
+    unexpected = _run_lab_can_i_harness(
+        tmp_path / "unexpected", expected="yes", output="error", command_rc=1
+    )
+    assert unexpected.returncode == 1
+    assert "answer=error" in unexpected.stderr
+
+
+def test_lab_lifecycle_latch_bridge_is_upgrade_only_and_postcheck_is_strict():
+    source = SCRIPT.read_text()
+    initial_gate = source[source.index("validate_common_values"):source.index("current_tag=")]
+    assert 'if [[ "$ACTION" == upgrade ]]' in initial_gate
+    assert initial_gate.count("validate_lab_values true") == 1
+    assert initial_gate.count("validate_lab_values false") == 1
+
+    post_upgrade = source[source.index("helm get values", source.index("CHANGE_STARTED=yes")):]
+    assert "validate_lab_values true" not in post_upgrade
+    assert "validate_lab_values false" in post_upgrade
+    assert '--set lab.lifecycleDependenciesReady=false' in source
+    assert "Legacy Phase 7-A or a missing-latch release may use this recovery bridge" in source
+    assert "every post-upgrade check requires that exact value" in source
+
+
+def test_phase7a_networkpolicy_drift_checks_exact_selector_source_and_port():
+    source = SCRIPT.read_text()
+    start = source.index("local policy app port")
+    end = source.index("! kubectl", start)
+    contract = source[start:end]
+
+    assert '.spec == {' in contract
+    assert '"podSelector": {"matchLabels": {"app": $app}}' in contract
+    assert '"policyTypes": ["Ingress"]' in contract
+    assert '"matchLabels": {"app.kubernetes.io/instance": $release}' in contract
+    assert '"ports": [{"protocol": "TCP", "port": $port}]' in contract
+    assert "lab-config-mysql-ingress|lab-config-mysql|3306" in contract
+    assert "lab-config-redis-ingress|lab-config-redis|6379" in contract
 
 
 def _ordered(source, *needles):

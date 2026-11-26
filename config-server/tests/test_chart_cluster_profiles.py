@@ -182,7 +182,107 @@ def test_lab_read_only_profile_rejects_background_writers(override):
         timeout=30,
     )
     assert rendered.returncode != 0
-    assert "api.readOnly=true" in rendered.stderr
+    assert "Phase 7-B" in rendered.stderr
+
+
+@pytest.mark.parametrize(
+    "override_args",
+    [
+        ("--set", "api.readOnly=false"),
+        ("--set", "controller.enabled=true"),
+        ("--set", "cronjobs.gpuCheck.enabled=true"),
+        ("--set", "cronjobs.krb5Reconcile.enabled=true"),
+        ("--set-string", "nfs.server=198.51.100.31"),
+        ("--set-string", "nfs.userSharePath=/volume/users"),
+        ("--set-string", "nfs.kubeSharePath=/volume/ledger"),
+        ("--set-string", "krb5.realm=LAB.EXAMPLE.INVALID"),
+        ("--set-string", "krb5.kdcHosts="),
+        ("--set-json", "krb5.kdcHosts={}"),
+        ("--set-string", "krb5.kdcHosts[0]=198.51.100.21"),
+        ("--set-string", "krb5.adminServer=198.51.100.21"),
+        ("--set-string", "krb5.domain=lab.example.invalid"),
+        ("--set-string", "nas.ssh.host=198.51.100.31"),
+        ("--set-string", "nas.ssh.port=22"),
+        ("--set-string", "nas.ssh.user=lab-nas"),
+        ("--set-string", "nas.ssh.keyPath=/etc/nas-ssh/id_ed25519"),
+        ("--set-string", "cluster.homeMountRootTemplate=/home/lab/{node}"),
+        ("--set-string", "cluster.ssh.user=lab-node"),
+        ("--set-string", "cluster.ssh.keyPath=/etc/infra-ssh/id_ed25519"),
+        ("--set-string", "cluster.adSsh.user=lab-ad"),
+        ("--set-string", "cluster.adSsh.keyPath=/etc/infra-ad-ssh/id_ed25519"),
+        ("--set-string", "cluster.adSsh.nodes="),
+        ("--set-json", "cluster.adSsh.nodes={}"),
+        ("--set-string", "cluster.adSsh.nodes[0].name=lab-ad1"),
+        ("--set-string", "infra.adminBeInternalUrl=http://admin-prod"),
+        ("--set-string", "monitoring.prometheusUrl=http://prometheus:9090"),
+        ("--set-string", "kubeShare.claimName="),
+        ("--set-string", "imageStore.claimName="),
+    ],
+)
+def test_phase7b_latch_rejects_each_partial_lab_dependency(override_args):
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm is not installed")
+    version = subprocess.run([helm, "version", "--short"], capture_output=True, text=True)
+    if version.returncode:
+        pytest.skip(f"helm cannot run in this environment: {version.stderr.strip()}")
+    rendered = subprocess.run(
+        [helm, "template", "lab-config", str(CHART),
+         "-f", str(CHART / "values-lab.example.yaml"), *override_args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rendered.returncode != 0
+    assert "Phase 7-B" in rendered.stderr
+
+
+def test_lab_phase7b_latch_must_be_a_boolean():
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm is not installed")
+    version = subprocess.run([helm, "version", "--short"], capture_output=True, text=True)
+    if version.returncode:
+        pytest.skip(f"helm cannot run in this environment: {version.stderr.strip()}")
+    rendered = subprocess.run(
+        [helm, "template", "lab-config", str(CHART),
+         "-f", str(CHART / "values-lab.example.yaml"),
+         "--set-string", "lab.lifecycleDependenciesReady=false"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rendered.returncode != 0
+    assert "lab.lifecycleDependenciesReady" in rendered.stderr
+    assert "boolean" in rendered.stderr
+
+
+def test_phase7b_latch_allows_lab_lifecycle_values_only_after_explicit_release():
+    rendered = _render(
+        "lab-config", "values-lab.example.yaml",
+        "--set", "lab.lifecycleDependenciesReady=true",
+        "--set", "api.readOnly=false",
+        "--set", "controller.enabled=true",
+        "--set", "cronjobs.gpuCheck.enabled=true",
+        "--set", "cronjobs.krb5Reconcile.enabled=true",
+        "--set-string", "nfs.server=198.51.100.31",
+        "--set-string", "nfs.userSharePath=/volume/users",
+        "--set-string", "nfs.kubeSharePath=/volume/ledger",
+        "--set-string", "kubeShare.claimName=",
+    )
+    assert 'name: CONFIG_API_READ_ONLY\n              value: "false"' in rendered
+    assert "name: lab-config-controller" in rendered
+    assert "name: lab-config-gpu-check" in rendered
+    assert "name: lab-config-krb5-reconcile" in rendered
+
+
+def test_lab_lifecycle_latch_never_changes_farm_rendering():
+    baseline = _render("farm-config", "values-farm.example.yaml")
+    with_irrelevant_lab_value = _render(
+        "farm-config", "values-farm.example.yaml",
+        "--set-string", "lab.lifecycleDependenciesReady=not-a-boolean",
+    )
+    assert with_irrelevant_lab_value == baseline
 
 
 @pytest.mark.parametrize(
@@ -204,6 +304,7 @@ def test_lab_cronjobs_can_be_enabled_independently_after_initial_validation(
         value, resource_name, other_resource_name):
     rendered = _render(
         "lab-config", "values-lab.example.yaml",
+        "--set", "lab.lifecycleDependenciesReady=true",
         "--set", "api.readOnly=false",
         "--set", value,
     )
@@ -298,6 +399,7 @@ def test_chart_rejects_lab_with_farm_legacy_selector():
     rendered = subprocess.run(
         [helm, "template", "lab-config", str(CHART),
          "--set", "cluster.id=lab",
+         "--set", "lab.lifecycleDependenciesReady=true",
          "--set", "compatibility.deploymentSelectorMode=legacy",
          "--set", "image.tag=test"],
         capture_output=True, text=True, timeout=30,
@@ -311,6 +413,7 @@ def test_lab_release_does_not_inherit_farm_ssh_values():
         "lab-config",
         "values.yaml",
         "--set", "cluster.id=lab",
+        "--set", "lab.lifecycleDependenciesReady=true",
         "--set", "compatibility.deploymentSelectorMode=release",
         "--set", "image.tag=test",
         "--set", "farm.ssh.user=farm-secret-user",
@@ -332,6 +435,7 @@ def test_lab_release_ignores_legacy_farm_kdc_host_without_direct_client_config()
         "lab-config",
         "values.yaml",
         "--set", "cluster.id=lab",
+        "--set", "lab.lifecycleDependenciesReady=true",
         "--set", "compatibility.deploymentSelectorMode=release",
         "--set", "image.tag=test",
         "--set", "krb5.realm=LAB.EXAMPLE",
@@ -349,6 +453,7 @@ def test_lab_release_uses_only_its_explicit_kdc_and_domain_settings():
         "lab-config",
         "values.yaml",
         "--set", "cluster.id=lab",
+        "--set", "lab.lifecycleDependenciesReady=true",
         "--set", "compatibility.deploymentSelectorMode=release",
         "--set", "image.tag=test",
         "--set", "krb5.realm=LAB.EXAMPLE",

@@ -120,6 +120,7 @@ case "$TARGET" in
     EXPECTED_CLUSTER_ID=lab
     EXPECTED_NODE_ROLE=lab-management
     EXPECTED_NODE_PORT=30082
+    EXPECTED_SERVICE_ACCOUNT=lab-config-server
     ;;
 esac
 
@@ -266,8 +267,16 @@ validate_farm_controller_replicas() {
 }
 
 validate_lab_values() {
-  jq -e '
+  local allow_missing_lifecycle_latch=${1:-false}
+  jq -e --argjson allow_missing_lifecycle_latch "$allow_missing_lifecycle_latch" '
       .compatibility.deploymentSelectorMode == "release" and
+      (
+        .lab.lifecycleDependenciesReady == false
+        or (
+          $allow_missing_lifecycle_latch and
+          (.lab.lifecycleDependenciesReady == null)
+        )
+      ) and
       .cluster.homeMountRootTemplate == "" and
       .cluster.ssh.user == "disabled-until-phase7b" and
       .cluster.adSsh.user == "disabled-until-phase7b" and
@@ -384,6 +393,28 @@ EOF
 lab-config-mysql|mysql:8.0.36|mysql-data|/var/lib/mysql|/var/lib/provi/lab-config-server/mysql|lab-config-mysql|3306
 lab-config-redis|redis:7.4-alpine|redis-data|/data|/var/lib/provi/lab-config-server/redis|lab-config-redis|6379
 EOF
+
+  local policy app port
+  while IFS='|' read -r policy app port; do
+    kubectl -n "$NAMESPACE" get networkpolicy "$policy" -o json | jq -e \
+      --arg app "$app" --arg release "$RELEASE" --argjson port "$port" '
+        .spec == {
+          "podSelector": {"matchLabels": {"app": $app}},
+          "policyTypes": ["Ingress"],
+          "ingress": [{
+            "from": [{
+              "podSelector": {
+                "matchLabels": {"app.kubernetes.io/instance": $release}
+              }
+            }],
+            "ports": [{"protocol": "TCP", "port": $port}]
+          }]
+        }
+      ' >/dev/null || fail "LAB foundation NetworkPolicy drifted: $policy"
+  done <<'EOF'
+lab-config-mysql-ingress|lab-config-mysql|3306
+lab-config-redis-ingress|lab-config-redis|6379
+EOF
   ! kubectl -n "$NAMESPACE" get deployment "${RELEASE}-controller" >/dev/null 2>&1 \
     || fail 'LAB controller Deployment exists before deployment'
   [[ -z $(kubectl -n "$NAMESPACE" get cronjob -l "app.kubernetes.io/instance=$RELEASE" -o name) ]] \
@@ -393,6 +424,127 @@ EOF
 validate_lab_read_only_contract() {
   jq -e '.api.readOnly == true' "$WORK_DIR/current-values.json" >/dev/null \
     || fail 'LAB Config Server is not in the required read-only API-bootstrap mode'
+}
+
+validate_lab_owned_rbac_objects() {
+  kubectl -n "$NAMESPACE" get role "${RELEASE}-role" -o json | jq -e '
+    (.rules | length) == 1 and
+    ((.rules[0] | keys | sort) == ["apiGroups", "resources", "verbs"]) and
+    .rules[0].apiGroups == [""] and
+    ((.rules[0].resources | sort) ==
+      (["pods", "pods/log", "services", "persistentvolumeclaims", "events"] | sort)) and
+    ((.rules[0].verbs | sort) == (["get", "list", "watch"] | sort))
+  ' >/dev/null || fail 'LAB chart-owned Role drifted from the exact read-only contract'
+
+  kubectl -n "$NAMESPACE" get rolebinding "${RELEASE}-rolebinding" -o json | jq -e \
+    --arg namespace "$NAMESPACE" --arg service_account "$EXPECTED_SERVICE_ACCOUNT" \
+    --arg role "${RELEASE}-role" '
+      .subjects == [{
+        "kind": "ServiceAccount",
+        "name": $service_account,
+        "namespace": $namespace
+      }] and
+      .roleRef == {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": $role
+      }
+    ' >/dev/null || fail 'LAB chart-owned RoleBinding subject or roleRef drifted'
+
+  local cluster_role resource
+  while IFS='|' read -r cluster_role resource; do
+    kubectl get clusterrole "$cluster_role" -o json | jq -e --arg resource "$resource" '
+      (.aggregationRule == null) and
+      (.rules | length) == 1 and
+      ((.rules[0] | keys | sort) == ["apiGroups", "resources", "verbs"]) and
+      .rules[0].apiGroups == [""] and
+      .rules[0].resources == [$resource] and
+      ((.rules[0].verbs | sort) == (["get", "list", "watch"] | sort))
+    ' >/dev/null || fail "LAB chart-owned ClusterRole drifted: $cluster_role"
+  done <<EOF
+${RELEASE}-node-reader|nodes
+${RELEASE}-service-reader|services
+EOF
+
+  local binding role
+  while IFS='|' read -r binding role; do
+    kubectl get clusterrolebinding "$binding" -o json | jq -e \
+      --arg namespace "$NAMESPACE" --arg service_account "$EXPECTED_SERVICE_ACCOUNT" \
+      --arg role "$role" '
+        .subjects == [{
+          "kind": "ServiceAccount",
+          "name": $service_account,
+          "namespace": $namespace
+        }] and
+        .roleRef == {
+          "apiGroup": "rbac.authorization.k8s.io",
+          "kind": "ClusterRole",
+          "name": $role
+        }
+      ' >/dev/null || fail "LAB chart-owned ClusterRoleBinding drifted: $binding"
+  done <<EOF
+${RELEASE}-node-reader-binding|${RELEASE}-node-reader
+${RELEASE}-service-reader-binding|${RELEASE}-service-reader
+EOF
+}
+
+validate_lab_can_i() {
+  local identity=$1 expected=$2 scope=$3 verb=$4 resource=$5 answer
+  local -a scope_args=()
+  case "$scope" in
+    namespace) scope_args=(--namespace "$NAMESPACE") ;;
+    cluster) ;;
+    all-namespaces) scope_args=(--all-namespaces) ;;
+    *) fail "internal LAB RBAC scope is invalid: $scope" ;;
+  esac
+  answer=$(kubectl auth can-i "$verb" "$resource" "${scope_args[@]}" \
+    --as "$identity" 2>/dev/null || true)
+  [[ "$answer" == "$expected" ]] \
+    || fail "LAB API-bootstrap ServiceAccount expected $expected for $verb $resource ($scope), answer=${answer:-error}"
+}
+
+validate_lab_effective_rbac() {
+  local identity="system:serviceaccount:${NAMESPACE}:${EXPECTED_SERVICE_ACCOUNT}"
+  local verb resource
+
+  validate_lab_owned_rbac_objects
+
+  for resource in pods pods/log services persistentvolumeclaims events; do
+    for verb in get list watch; do
+      validate_lab_can_i "$identity" yes namespace "$verb" "$resource"
+    done
+  done
+  for verb in get list watch; do
+    validate_lab_can_i "$identity" yes cluster "$verb" nodes
+    validate_lab_can_i "$identity" yes all-namespaces "$verb" services
+  done
+
+  for resource in secrets configmaps; do
+    for verb in get list watch create update patch delete deletecollection; do
+      validate_lab_can_i "$identity" no namespace "$verb" "$resource"
+    done
+  done
+  for verb in get create; do
+    validate_lab_can_i "$identity" no namespace "$verb" pods/exec
+  done
+  for verb in create update patch delete deletecollection; do
+    validate_lab_can_i "$identity" no namespace "$verb" pods
+  done
+}
+
+expected_lab_rendered_resources() {
+  cat <<'EOF'
+clusterrole.rbac.authorization.k8s.io/lab-config-server-node-reader
+clusterrole.rbac.authorization.k8s.io/lab-config-server-service-reader
+clusterrolebinding.rbac.authorization.k8s.io/lab-config-server-node-reader-binding
+clusterrolebinding.rbac.authorization.k8s.io/lab-config-server-service-reader-binding
+configmap/lab-config-server-krb5
+deployment.apps/lab-config-server
+role.rbac.authorization.k8s.io/lab-config-server-role
+rolebinding.rbac.authorization.k8s.io/lab-config-server-rolebinding
+service/lab-config-server
+serviceaccount/lab-config-server
+EOF
 }
 
 snapshot_protected_pods() {
@@ -546,7 +698,14 @@ if [[ "$TARGET" == farm ]]; then
   validate_farm_values
   validate_farm_transition_values false 1 false
 else
-  validate_lab_values
+  if [[ "$ACTION" == upgrade ]]; then
+    # Legacy Phase 7-A or a missing-latch release may use this recovery bridge.
+    # A true or malformed latch is never accepted. The candidate explicitly
+    # stores false, and every post-upgrade check requires that exact value.
+    validate_lab_values true
+  else
+    validate_lab_values false
+  fi
 fi
 
 current_tag=$(jq -r '.image.tag' "$WORK_DIR/current-values.json")
@@ -566,6 +725,12 @@ if [[ "$TARGET" == farm ]]; then
     .spec.replicas == 1 and .status.availableReplicas == 1 and .status.readyReplicas == 1
   ' >/dev/null || fail 'FARM Config Server controller is not a single available replica'
 fi
+if [[ "$TARGET" == lab ]]; then
+  kubectl -n "$NAMESPACE" get deployment "$RELEASE" -o json | jq -e \
+    --arg service_account "$EXPECTED_SERVICE_ACCOUNT" '
+      .spec.template.spec.serviceAccountName == $service_account
+    ' >/dev/null || fail 'LAB Config Server Deployment uses an unexpected ServiceAccount'
+fi
 
 validate_management_placement
 snapshot_protected_pods "$WORK_DIR/protected-pods-before.tsv"
@@ -576,7 +741,10 @@ lab_bootstrap_args=()
 if [[ "$TARGET" == lab ]]; then
   # Existing Phase 7-A releases predate this value. Force the structural gate in
   # the candidate and upgrade; only the post-upgrade release must already report it.
-  lab_bootstrap_args=(--set api.readOnly=true)
+  lab_bootstrap_args=(
+    --set api.readOnly=true
+    --set lab.lifecycleDependenciesReady=false
+  )
 fi
 render_args=(template "$RELEASE" "$CHART" --namespace "$NAMESPACE" --values "$WORK_DIR/current-values.yaml" "${lab_bootstrap_args[@]}")
 if [[ "$ACTION" == upgrade ]]; then
@@ -596,6 +764,10 @@ if [[ "$TARGET" == farm ]]; then
   [[ $(grep -c '^cronjob.batch/' "$WORK_DIR/rendered-resources.txt") == 2 ]] \
     || fail 'rendered FARM CronJob count differs from two'
 else
+  cmp -s \
+    <(expected_lab_rendered_resources | LC_ALL=C sort) \
+    <(LC_ALL=C sort "$WORK_DIR/rendered-resources.txt") \
+    || fail 'rendered LAB resource kind/name set differs from the exact API-bootstrap allowlist'
   ! grep -q "^deployment.apps/${RELEASE}-controller$" "$WORK_DIR/rendered-resources.txt" \
     || fail 'rendered LAB controller is unexpectedly enabled'
   ! grep -q '^cronjob.batch/' "$WORK_DIR/rendered-resources.txt" \
@@ -621,8 +793,10 @@ jq -e --arg cluster "${EXPECTED_CLUSTER_ID^^}" --arg run_mode "$expected_run_mod
 
 if [[ "$TARGET" == lab && "$ACTION" == probe ]]; then
   # A probe must never certify the historical Phase 7-A image which predates the
-  # structural gate. Only upgrade is allowed to bridge that release once.
+  # structural gate. Only upgrade may recover a legacy/missing-latch release,
+  # and the applied release is then checked strictly for latch=false.
   validate_lab_read_only_contract
+  validate_lab_effective_rbac
   jq -e '.read_only == true' <<<"$health" >/dev/null \
     || fail 'LAB probe refuses a release whose health does not confirm read-only mode'
 fi
@@ -724,8 +898,9 @@ if [[ "$TARGET" == farm ]]; then
   validate_farm_transition_values true 0 true
   validate_farm_controller_replicas 0
 else
-  validate_lab_values
+  validate_lab_values false
   validate_lab_read_only_contract
+  validate_lab_effective_rbac
 fi
 
 validate_management_placement

@@ -20,6 +20,7 @@ config-server Helm chart가 렌더링하는 Kubernetes 리소스 템플릿이다
 | --- | --- | --- | --- |
 | `containerssh-config-server.fullname` | 리소스 이름에 사용할 fullname을 만든다. | `.Release.Name` | release name 문자열 |
 | `containerssh-config-server.clusterId` | 필수 클러스터 식별자를 검증한다. | `cluster.id` | DNS label 형식의 FARM/LAB 식별자 |
+| `containerssh-config-server.labLifecycleContract` | Phase 7-B latch가 닫힌 LAB에서 API-only 의존성 계약 전체를 fail-closed로 검증한다. FARM에는 적용하지 않는다. | `lab.lifecycleDependenciesReady`, API/controller/CronJob/NFS/Kerberos/SSH/callback/PVC values | 성공 시 빈 문자열, 위반 시 Helm 렌더 중단 |
 | `containerssh-config-server.labels` | 모든 리소스에 릴리스와 클러스터 식별 라벨을 붙인다. | release, cluster id | 공통 Kubernetes labels |
 | `containerssh-config-server.env` | API·controller·reconcile이 공유할 환경변수를 만든다. | cluster/NFS/DB/Redis/SSH values | `CLUSTER_ID`, `INFRA_*`를 포함한 env 목록 |
 | `containerssh-config-server.apiReadOnly` | LAB bootstrap의 읽기 전용 API 모드를 검증한다. FARM 또는 background writer와 함께 사용하면 렌더링을 중단한다. | `api.readOnly`, controller/CronJob enable 값 | `true` 또는 `false` |
