@@ -23,6 +23,8 @@ cluster:
 image:
   repository: dguailab/config-server
   tag: ""
+  # 운영 배포는 가능하면 registry digest로 고정한다. 비어 있으면 기존 tag 경로를 유지한다.
+  digest: ""
   pullPolicy: IfNotPresent
 
 service:
@@ -85,7 +87,21 @@ nodeport:
 verifyMode: noprobe
 faultInjection: false
 
+api:
+  # 기존 FARM 동작을 유지하는 기본값이다. LAB API-bootstrap 배포는 반드시 true로
+  # 덮어써 HTTP 쓰기 메서드와 Kubernetes 쓰기 RBAC를 함께 닫는다.
+  readOnly: false
+  # FARM controlled upgrade의 첫 revision에서만 true로 설정한다. API health는 유지하되
+  # 새 쓰기 요청을 503으로 막고, controller=0/CronJob suspend와 함께 사용한다.
+  maintenance: false
+
 imageStore:
+  claimName: ""
+
+# 계정 원장(passwd/group/shadow)을 둘 /kube_share 볼륨. 기존 FARM은 아래 값을
+# 비워 nfs.server/kubeSharePath를 그대로 사용한다. 전용 NFS export가 아직 없는
+# 신규 클러스터는 별도 영속 PVC를 지정해 FARM 원장과 물리적으로 분리할 수 있다.
+kubeShare:
   claimName: ""
 
 config:
@@ -126,6 +142,7 @@ tolerations: []
 
 controller:
   enabled: false
+  replicas: 1
   pollSec: 2
   workers: 4
 
@@ -134,8 +151,11 @@ controller:
 cronjobs:
   gpuCheck:
     enabled: true
+    # FARM controlled upgrade 동안 Helm이 임시 suspend 상태를 소유하게 한다.
+    suspend: false
   krb5Reconcile:
     enabled: true
+    suspend: false
 
 apiToken:
   secretName: ""

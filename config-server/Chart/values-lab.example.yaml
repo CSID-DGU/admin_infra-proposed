@@ -23,6 +23,13 @@ cluster:
 
 image:
   tag: REPLACE_WITH_IMMUTABLE_IMAGE_TAG
+  # 운영 workflow가 검증한 sha256 digest를 주입한다. 수동 예시에서는 비워 둔다.
+  digest: ""
+
+# Storage/Kerberos/NFS/Admin BE 쓰기 연동 전의 API-bootstrap 안전장치다.
+# HTTP 쓰기 메서드를 거절하고 차트 RBAC도 조회 전용으로 축소한다.
+api:
+  readOnly: true
 
 nfs:
   server: 198.51.100.31
@@ -50,6 +57,11 @@ monitoring:
 
 imageStore:
   claimName: REPLACE_WITH_LAB_IMAGE_STORE_PVC
+
+# LAB 계정 원장은 FARM NFS 경로를 복사하지 않는다. LAB 전용 NFS export가
+# 준비되지 않은 초기 배포에서는 LAB-MGMT 로컬 Retain PVC를 사용할 수 있다.
+kubeShare:
+  claimName: REPLACE_WITH_LAB_KUBE_SHARE_PVC
 
 db:
   host: REPLACE_WITH_LAB_DB_HOST

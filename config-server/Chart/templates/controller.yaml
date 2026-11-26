@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/component: controller
     app: containerssh-config-controller
 spec:
-  replicas: 1
+  replicas: {{ .Values.controller.replicas }}
   # 제어기 두 벌이 동시에 뜨면 같은 작업을 두 번 실행한다. RollingUpdate 금지 — 이전 Pod가 완전히
   # 내려간 뒤에야 새 Pod를 띄운다.
   strategy:
