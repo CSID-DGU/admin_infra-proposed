@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import subprocess
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -85,7 +86,30 @@ def test_stack_up_uses_cluster_registry_contract_and_release_service_name():
     assert script.count('api.headers["X-Cluster-Id"]') == 2
 
 
+def test_ledger_helper_uses_farm_management_role_instead_of_old_master():
+    script = (ROOT / "stack-up.sh").read_text()
+    helper = script.split("start_ledger_helper()", 1)[1].split("wait_ledger_helper()", 1)[0]
+
+    assert "nodeName: csid-dgu-desktop" not in script
+    assert "provi.dgu.ac.kr/role: farm-management" in helper
+    assert "key: node-role.kubernetes.io/control-plane" in helper
+    assert "operator: Exists" in helper
+    assert "effect: NoSchedule" in helper
+
+
 def test_stack_down_sends_canonical_cluster_identity():
     script = (ROOT / "stack-down.sh").read_text()
 
     assert 'api.headers["X-Cluster-Id"] = os.environ.get("CLUSTER_ID", "").strip().upper()' in script
+
+
+def test_generic_stack_down_explicitly_rejects_operation():
+    result = subprocess.run(
+        ["bash", str(ROOT / "stack-down.sh"), "operation"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "빈 계정 접두어가 모든 운영 계정을 대상으로" in result.stderr

@@ -2,13 +2,13 @@
 # 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 한 번에 띄운다. 여러 번 실행해도 결과가 같다.
 # 세 스택은 같은 코드이고 config-server의 실행 방식(RUN_MODE) 하나만 다르다.
 #
-#   stack-up.sh <baseline|noprobe|full> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
+#   stack-up.sh <baseline|noprobe|full|operation> <config-server 이미지(저장소:태그)> <프론트엔드 이미지> <admin_be 이미지>
 #
 # admin_infra의 "Deploy Proposed Stack" 워크플로가 배포 서버에서 실행한다. 공개 레포의 Actions 로그에
 # 그대로 남으므로 비밀번호, 운영 설정값, 실사용자 계정 이름은 절대 출력하지 않는다(값은 파이프로만 넘김).
 set -euo pipefail
 
-STACK=${1:?"스택 이름(baseline|noprobe|full)"}
+STACK=${1:?"스택 이름(baseline|noprobe|full|operation)"}
 IMAGE=${2:?"config-server 이미지(저장소:태그)"}
 FE_IMAGE=${3:-}   # 비우면 프론트엔드를 올리지 않는다
 # admin_be 브랜치에서 빌드한 스택 전용 이미지. 운영 admin_be 이미지는 작업 등록 인터페이스
@@ -111,11 +111,9 @@ ledger_cleanup() { kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found 
 # 뜨는 데 몇 초 걸리므로 띄우기(start)와 기다리기(wait)를 나눠, 그 사이에 대장이 필요 없는 단계를 먼저 진행한다.
 start_ledger_helper() {  # $1: NFS 서버, $2: 계정 대장 경로
   kubectl -n "$NS" delete pod "$LEDGER_POD" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
-  # kube_share NFS 마운트를 NAS가 허용하는 노드는 csid-dgu-desktop 하나뿐이다 — config-server
-  # 자신도 항상 거기 고정 배포된다(Chart/values.yaml 참고). farm 노드는 이 경로 마운트 권한이
-  # 없어(mount.nfs: Operation not permitted) 스케줄러가 임의로 farm 노드를 고르면 실패한다.
-  # nodeName을 직접 주면 스케줄러의 테인트 검사를 건너뛰므로 control-plane toleration 없이도 뜬다.
-  local pin="  nodeName: csid-dgu-desktop"
+  # 운영 Config Server와 같은 FARM 관리 역할에 배치한다. NAS는 FARM-MGMT 주소를 허용하며,
+  # 역할 라벨을 쓰면 관리 노드 교체 때 호스트명을 코드에서 다시 고칠 필요가 없다.
+  # FARM-MGMT는 control-plane taint가 있으므로 명시적으로 toleration한다.
   cat <<YAML | kubectl -n "$NS" apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
@@ -123,7 +121,12 @@ metadata:
   name: $LEDGER_POD
   labels: {app: ledger-helper}
 spec:
-$pin
+  nodeSelector:
+    provi.dgu.ac.kr/role: farm-management
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: helper
