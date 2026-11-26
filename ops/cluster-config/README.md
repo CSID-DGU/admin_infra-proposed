@@ -23,22 +23,40 @@ bash ops/cluster-config/deploy.sh --target lab --action upgrade \
 FARM 명령은 `farm-mgmt`의 `svmanager`, LAB 명령은 `lab-mgmt`의 `svmanager`에서만 실행된다. 두 호스트 모두
 root 소유, `svmanager` 그룹, mode `0640`인 `/etc/kubernetes/ci-deployer.conf`를 사용한다.
 
-LAB은 Phase 7-B 전 API bootstrap 계약을 강제한다. `api.readOnly=true`로 HTTP 쓰기 메서드와
-Kubernetes mutation RBAC를 함께 닫고 `/health.read_only=true`를 확인한다.
+LAB은 Phase 7-B 전 API bootstrap 계약을 강제한다. `api.readOnly=true`와
+`lab.lifecycleDependenciesReady=false`를 함께 저장해 HTTP 쓰기 메서드와 lifecycle dependency
+활성화를 닫고 `/health.read_only=true`를 확인한다. 렌더링한 kind/name 목록도 API Deployment,
+Service, ServiceAccount, 읽기 전용 RBAC와 Kerberos 빈 ConfigMap으로 제한한다.
 `lab-config-ledger`·`lab-config-image-store` PVC를 사용하고,
 LAB 전용 MySQL·Redis가 Ready인지를 확인하며, controller와 GPU/Kerberos CronJob, NFS, Kerberos, NAS, AD SSH,
 사용자 홈 경로와 Admin BE callback은 비활성 상태여야 한다.
 이 조건 중 하나라도 달라지면 probe와 upgrade 모두 중단한다.
+같은 계약은 Helm chart의 `lab.lifecycleDependenciesReady=false` latch에도 결속되어 있다.
+따라서 이 배포 스크립트를 우회해 Helm을 직접 실행하더라도 Storage/Kerberos/NFS나 lifecycle
+writer 하나만 열린 혼합 values는 렌더 단계에서 거절된다. Phase 7-B가 끝나기 전에는 latch를
+`true`로 바꾸지 않는다.
+
+정적 chart 검사만 신뢰하지 않는다. probe와 upgrade 후에는 정확한
+`system:serviceaccount:ailab-operation:lab-config-server` 권한을 API에 질의한다. 이 계정은 LAB namespace의
+Pod·Pod log·Service·PVC·Event와 cluster Node, 전체 namespace Service에 대해 get/list/watch가 모두
+가능해야 한다. 동시에 `pods/exec`의 get/create, Pod의 mutation, Secret·ConfigMap의
+get/list/watch와 mutation은 모두 거부되어야 한다. chart 소유 Role·RoleBinding·두 ClusterRole·두
+ClusterRoleBinding의 rules, subject, roleRef도 정확히 비교한다. 권한 질의가 오류 또는 빈 응답을
+반환해도 검증은 실패한다.
 
 기존 Phase 7-A release는 `api.readOnly`가 도입되기 전 이미지이므로 예외를 제한한다.
 `probe`는 현재 Helm values의 `api.readOnly=true`와 현재 `/health.read_only=true`를 모두 요구해
-구 bootstrap을 안전하다고 오판하지 않는다. `upgrade`만 한 번의 전환 경로로 기존 값의 부재를
-허용하며, 렌더링과 Helm 적용에 `api.readOnly=true`를 강제한 뒤 values와 health를 다시 검증한다.
+구 bootstrap을 안전하다고 오판하지 않는다. `upgrade`만 legacy 또는 missing-latch release의 복구
+bridge로 기존 latch 부재를 허용한다. 렌더링과 Helm 적용에는 `api.readOnly=true`와
+`lab.lifecycleDependenciesReady=false`를 강제하고, 적용 직후에는 latch가 명시적인 `false`인지
+엄격하게 다시 검증한다.
 
 또한 Phase 7-A foundation이 이름만 남고 내용이 바뀐 상태를 허용하지 않는다.
 `lab-config-local` StorageClass, 두 Retain PV/PVC의 정확한 volumeName·hostPath·용량·LAB-MGMT
 affinity, MySQL `8.0.36`과 Redis `7.4-alpine`의 Recreate Deployment·hostPath·관리 노드 배치,
-각 Service selector를 upgrade 전후에 모두 검증한다.
+각 Service selector를 upgrade 전후에 모두 검증한다. Phase 7-A foundation에 포함된
+`lab-config-mysql-ingress`와 `lab-config-redis-ingress` NetworkPolicy도 selector, 허용 source,
+TCP port까지 정확히 비교한다.
 
 이 진입점은 다음 작업을 하지 않는다.
 

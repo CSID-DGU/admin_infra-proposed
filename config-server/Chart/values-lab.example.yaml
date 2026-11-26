@@ -3,23 +3,26 @@ compatibility:
   # 신규 릴리스용. 구 운영 Deployment를 제자리 upgrade할 때는 legacy를 유지한다.
   deploymentSelectorMode: release
 
+lab:
+  # Storage/Kerberos/NFS와 lifecycle 쓰기 경로를 검증하는 Phase 7-B가 끝나기 전에는
+  # 반드시 false다. true 전환은 아래 API-only 잠금값을 운영값으로 한 번에 교체하는
+  # 별도 Phase 7-B 변경으로만 수행한다.
+  lifecycleDependenciesReady: false
+
 cluster:
   id: lab
-  homeMountRootTemplate: /REPLACE_WITH_LAB_HOME_MOUNT/{node}
+  homeMountRootTemplate: ""
   ssh:
-    user: REPLACE_WITH_LAB_NODE_SERVICE_ACCOUNT
-    keyPath: /etc/infra-ssh/id_ed25519
+    user: disabled-until-phase7b
+    keyPath: ""
     nodes:
       - name: lab1
         host: 198.51.100.11
         port: 22
   adSsh:
-    user: REPLACE_WITH_LAB_AD_SERVICE_ACCOUNT
-    keyPath: /etc/infra-ad-ssh/id_ed25519
-    nodes:
-      - name: lab-ad1
-        host: 198.51.100.21
-        port: 22
+    user: disabled-until-phase7b
+    keyPath: ""
+    nodes: []
 
 image:
   tag: REPLACE_WITH_IMMUTABLE_IMAGE_TAG
@@ -32,28 +35,30 @@ api:
   readOnly: true
 
 nfs:
-  server: 198.51.100.31
-  userSharePath: /REPLACE_WITH_LAB_USER_SHARE
-  kubeSharePath: /REPLACE_WITH_LAB_KUBE_SHARE
+  server: ""
+  userSharePath: ""
+  kubeSharePath: ""
 
 nas:
   ssh:
-    host: 198.51.100.31
-    port: 22
-    user: REPLACE_WITH_LAB_NAS_SERVICE_ACCOUNT
-    keyPath: /etc/nas-ssh/id_ed25519
+    host: ""
+    port: ""
+    user: disabled-until-phase7b
+    keyPath: ""
 
 krb5:
-  realm: LAB.EXAMPLE.INVALID
-  kdcHosts: [198.51.100.21]
-  adminServer: 198.51.100.21
-  domain: lab.example.invalid
+  realm: ""
+  kdcHosts: []
+  adminServer: ""
+  domain: ""
 
 infra:
-  adminBeInternalUrl: http://REPLACE_WITH_ADMIN_BE_SERVICE
+  # callback을 실서비스로 보내지 않는 discard sink다.
+  adminBeInternalUrl: http://127.0.0.1:9
 
 monitoring:
-  prometheusUrl: http://REPLACE_WITH_LAB_PROMETHEUS
+  # Phase 7-B 전에는 외부 모니터링 의존성을 열지 않는다.
+  prometheusUrl: http://127.0.0.1:9
 
 imageStore:
   claimName: REPLACE_WITH_LAB_IMAGE_STORE_PVC

@@ -10,7 +10,71 @@
 {{- if not (has $id (list "farm" "lab")) -}}
 {{- fail "cluster.id는 farm 또는 lab이어야 합니다" -}}
 {{- end -}}
+{{- if eq $id "lab" -}}
+{{- include "containerssh-config-server.labLifecycleContract" . -}}
+{{- end -}}
 {{- $id -}}
+{{- end -}}
+
+{{/*
+Phase 7-B 전 LAB은 저장소·Kerberos·NFS·원격 작업을 일부만 연 혼합 상태로
+렌더링되어서는 안 된다. latch가 false인 동안 아래의 완전한 API-only 계약을
+차트 자체가 강제한다. FARM은 이 helper를 호출하지 않으므로 기존 동작을 유지한다.
+*/}}
+{{- define "containerssh-config-server.labLifecycleContract" -}}
+{{- if not (kindIs "bool" .Values.lab.lifecycleDependenciesReady) -}}
+{{- fail "lab.lifecycleDependenciesReady는 boolean이어야 합니다" -}}
+{{- end -}}
+{{- if not .Values.lab.lifecycleDependenciesReady -}}
+{{- if ne .Values.api.readOnly true -}}
+{{- fail "Phase 7-B 전 LAB은 api.readOnly=true여야 합니다" -}}
+{{- end -}}
+{{- if ne .Values.controller.enabled false -}}
+{{- fail "Phase 7-B 전 LAB은 controller.enabled=false여야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.cronjobs.gpuCheck.enabled false) (ne .Values.cronjobs.krb5Reconcile.enabled false) -}}
+{{- fail "Phase 7-B 전 LAB은 Config Server CronJob을 모두 비활성화해야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.nfs.server "") (ne .Values.nfs.userSharePath "") (ne .Values.nfs.kubeSharePath "") -}}
+{{- fail "Phase 7-B 전 LAB은 nfs.server/userSharePath/kubeSharePath를 비워야 합니다" -}}
+{{- end -}}
+{{- if not (kindIs "slice" .Values.krb5.kdcHosts) -}}
+{{- fail "Phase 7-B 전 LAB의 krb5.kdcHosts는 빈 list여야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.krb5.realm "") (ne (len .Values.krb5.kdcHosts) 0) (ne .Values.krb5.adminServer "") (ne .Values.krb5.domain "") -}}
+{{- fail "Phase 7-B 전 LAB은 Kerberos client 설정을 비워야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.nas.ssh.host "") (ne (toString .Values.nas.ssh.port) "") (ne .Values.nas.ssh.user "disabled-until-phase7b") (ne .Values.nas.ssh.keyPath "") -}}
+{{- fail "Phase 7-B 전 LAB NAS SSH는 host/port/keyPath를 비우고 user=disabled-until-phase7b로 잠가야 합니다" -}}
+{{- end -}}
+{{- if ne .Values.cluster.homeMountRootTemplate "" -}}
+{{- fail "Phase 7-B 전 LAB은 cluster.homeMountRootTemplate을 비워야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.cluster.ssh.user "disabled-until-phase7b") (ne .Values.cluster.adSsh.user "disabled-until-phase7b") -}}
+{{- fail "Phase 7-B 전 LAB SSH/AD SSH user는 disabled-until-phase7b로 잠가야 합니다" -}}
+{{- end -}}
+{{- if or (ne .Values.cluster.ssh.keyPath "") (ne .Values.cluster.adSsh.keyPath "") -}}
+{{- fail "Phase 7-B 전 LAB은 cluster.ssh/adSsh.keyPath를 비워야 합니다" -}}
+{{- end -}}
+{{- if not (kindIs "slice" .Values.cluster.adSsh.nodes) -}}
+{{- fail "Phase 7-B 전 LAB의 cluster.adSsh.nodes는 빈 list여야 합니다" -}}
+{{- end -}}
+{{- if ne (len .Values.cluster.adSsh.nodes) 0 -}}
+{{- fail "Phase 7-B 전 LAB은 cluster.adSsh.nodes를 비워야 합니다" -}}
+{{- end -}}
+{{- if ne .Values.infra.adminBeInternalUrl "http://127.0.0.1:9" -}}
+{{- fail "Phase 7-B 전 LAB Admin BE callback은 http://127.0.0.1:9 loopback sink여야 합니다" -}}
+{{- end -}}
+{{- if ne .Values.monitoring.prometheusUrl "http://127.0.0.1:9" -}}
+{{- fail "Phase 7-B 전 LAB Prometheus endpoint는 http://127.0.0.1:9 loopback sink여야 합니다" -}}
+{{- end -}}
+{{- if or (not (kindIs "string" .Values.kubeShare.claimName)) (eq (trim .Values.kubeShare.claimName) "") -}}
+{{- fail "Phase 7-B 전 LAB은 kubeShare.claimName에 독립 원장 PVC를 지정해야 합니다" -}}
+{{- end -}}
+{{- if or (not (kindIs "string" .Values.imageStore.claimName)) (eq (trim .Values.imageStore.claimName) "") -}}
+{{- fail "Phase 7-B 전 LAB은 imageStore.claimName에 독립 image-store PVC를 지정해야 합니다" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "containerssh-config-server.selectorMode" -}}

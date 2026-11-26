@@ -4,6 +4,12 @@ compatibility:
   # 그대로 유지해 제자리 upgrade를 안전하게 하고, 새 릴리스는 반드시 release로 덮어쓴다.
   deploymentSelectorMode: legacy
 
+lab:
+  # Phase 7-B의 Storage/Kerberos/NFS 연동과 lifecycle 쓰기 경로가 모두 준비되기 전에는
+  # false를 유지한다. false인 LAB 릴리스는 차트가 API-only 계약을 통째로 검증하며,
+  # 일부 의존성만 실수로 활성화한 values는 Helm 렌더 단계에서 거절한다.
+  lifecycleDependenciesReady: false
+
 cluster:
   # 필수. 같은 코드와 차트를 여러 클러스터에 배포할 때 로그·상태·Admin BE 요청을 구분하는 식별자다.
   id: ""
