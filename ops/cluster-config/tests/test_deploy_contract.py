@@ -44,7 +44,8 @@ def test_existing_release_only_and_rollback_contract_is_explicit():
     assert "^[0-9a-f]{40}$" in source
     assert '"$IMAGE_TAG" != "$SOURCE_SHA"' in source
     assert "--untracked-files=all" in source
-    assert "archive --format=tar HEAD:config-server/Chart" in source
+    assert "archive --format=tar HEAD config-server/Chart" in source
+    assert "HEAD:config-server/Chart" not in source
     assert 'helm rollback "$RELEASE" "$PREVIOUS_REVISION"' in source
     assert "CHANGE_STARTED=yes" in source
     assert "POSTCHECK_COMPLETE=yes" in source
