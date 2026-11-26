@@ -7,7 +7,11 @@
 | stack | `baseline`, `noprobe`, `full`, `operation` |
 | ref | 이 레포의 브랜치·태그·커밋 (기본 `main`) |
 | fe_ref / be_ref | admin_fe / admin_be의 브랜치·태그·커밋 (기본 `main`) |
-| action | `up`(띄우기, 이미 있으면 재배포) / `down`(테스트 계정 정리 후 내리기) |
+| action | `up`(띄우기, 이미 있으면 재배포) / `down`(실험 스택의 테스트 계정 정리 후 내리기) |
+
+`operation down`은 범용 `stack-down.sh`에서 의도적으로 거부한다. operation은 계정 접두어가 비어 있어
+실험 스택용 접두어 정리 로직을 그대로 적용하면 모든 운영 계정을 대상으로 삼을 수 있다. 운영을 내릴 때는
+미완료 작업과 실사용자 영향을 먼저 확인하는 전용 절차를 사용해야 한다.
 
 ```bash
 gh workflow run deploy-proposed-stack.yaml -R CSID-DGU/admin_infra -f stack=baseline

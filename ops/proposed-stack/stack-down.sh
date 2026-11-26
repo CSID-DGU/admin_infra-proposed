@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 실험 스택을 내린다.
 #
-#   stack-down.sh <baseline|noprobe|full>
+#   stack-down.sh <baseline|noprobe|full>  # operation은 전용 점검 절차 필요
 #
 # 네임스페이스를 지우기 전에 이 스택이 만든 계정(접두어로 구분)과 컨테이너를 회수 작업으로 먼저 정리한다.
 # AD principal·farm keytab은 운영과 공유하는 자원이라 네임스페이스를 지워도 사라지지 않는다.
@@ -14,6 +14,10 @@ case "$STACK" in
   baseline) PREFIX=exp-bl- ;;
   noprobe) PREFIX=exp-np- ;;
   full)    PREFIX=exp-fu- ;;
+  operation)
+    echo "operation은 범용 stack-down으로 내리지 않음: 빈 계정 접두어가 모든 운영 계정을 대상으로 만들 수 있으므로 전용 점검 절차가 필요함" >&2
+    exit 2
+    ;;
   *) echo "알 수 없는 스택: $STACK"; exit 2 ;;
 esac
 NS=ailab-$STACK
