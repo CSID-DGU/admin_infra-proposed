@@ -197,24 +197,21 @@ def test_lab_release_does_not_inherit_farm_ssh_values():
         assert farm_value not in rendered
 
 
-def test_lab_release_does_not_accept_legacy_farm_kdc_host():
-    helm = shutil.which("helm")
-    if not helm:
-        pytest.skip("helm is not installed")
-    version = subprocess.run([helm, "version", "--short"], capture_output=True, text=True)
-    if version.returncode:
-        pytest.skip(f"helm cannot run in this environment: {version.stderr.strip()}")
-    rendered = subprocess.run(
-        [helm, "template", "lab-config", str(CHART),
-         "--set", "cluster.id=lab",
-         "--set", "compatibility.deploymentSelectorMode=release",
-         "--set", "image.tag=test",
-         "--set", "krb5.realm=LAB.EXAMPLE",
-         "--set", "krb5.kdcHost=192.0.2.10"],
-        capture_output=True, text=True, timeout=30,
+def test_lab_release_ignores_legacy_farm_kdc_host_without_direct_client_config():
+    rendered = _render(
+        "lab-config",
+        "values.yaml",
+        "--set", "cluster.id=lab",
+        "--set", "compatibility.deploymentSelectorMode=release",
+        "--set", "image.tag=test",
+        "--set", "krb5.realm=LAB.EXAMPLE",
+        "--set", "krb5.kdcHost=192.0.2.10",
     )
-    assert rendered.returncode != 0
-    assert "krb5.kdcHosts" in rendered.stderr
+    assert "default_realm = LAB.EXAMPLE" in rendered
+    assert "192.0.2.10" not in rendered
+    assert "[realms]" not in rendered
+    assert "\n            kdc =" not in rendered
+    assert "\n            admin_server =" not in rendered
 
 
 def test_lab_release_uses_only_its_explicit_kdc_and_domain_settings():
