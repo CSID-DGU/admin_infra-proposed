@@ -89,7 +89,7 @@ SOURCE_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD)
 if [[ "$ACTION" == upgrade && "$IMAGE_TAG" != "$SOURCE_SHA" ]]; then
   fail 'upgrade image tag must equal the exact checked-out source SHA'
 fi
-CHART_SHA256=$(git -C "$REPO_ROOT" archive --format=tar HEAD:config-server/Chart \
+CHART_SHA256=$(git -C "$REPO_ROOT" archive --format=tar HEAD config-server/Chart \
   | sha256sum | awk '{print $1}')
 [[ "$CHART_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail 'failed to calculate the immutable chart digest'
 
