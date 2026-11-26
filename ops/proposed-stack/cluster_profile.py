@@ -2,7 +2,10 @@
 
 운영 릴리스가 아직 구 차트면 SSH 값이 farm.* 아래에 있고 Kerberos KDC도 kdcHost 한 개로
 저장되어 있다. proposed-stack은 운영 값을 읽어 실험 릴리스에 재사용하므로, 차트 전환 기간에는
-두 형식을 모두 받아 새 형식만 담은 작은 overlay를 만든다.
+두 형식을 모두 받아 새 형식으로 바꾼 배포 values를 만든다.
+
+관리 Pod 배치는 구 운영 릴리스의 호스트명 고정값을 상속하지 않는다. cluster_id별 관리 역할
+라벨과 control-plane toleration을 이 overlay가 마지막 우선순위로 지정한다.
 """
 
 import json
@@ -48,9 +51,24 @@ def cluster_profile(values, cluster_id="farm"):
             "adminServer": krb5.get("adminServer") or (kdc_hosts[0] if kdc_hosts else ""),
             "domain": krb5.get("domain") or ("ailab.dgu" if krb5.get("realm") else ""),
         },
+        "nodeSelector": {
+            "provi.dgu.ac.kr/role": f"{cluster_id}-management",
+        },
+        "tolerations": [
+            {
+                "key": "node-role.kubernetes.io/control-plane",
+                "operator": "Exists",
+                "effect": "NoSchedule",
+            },
+        ],
     }
 
 
+def deployment_values(values, cluster_id="farm"):
+    """구 values의 의존성은 보존하고 cluster/배치 map은 안전한 프로필로 교체한다."""
+    return {**values, **cluster_profile(values, cluster_id=cluster_id)}
+
+
 if __name__ == "__main__":
-    json.dump(cluster_profile(json.load(sys.stdin) or {}), sys.stdout)
+    json.dump(deployment_values(json.load(sys.stdin) or {}), sys.stdout)
     sys.stdout.write("\n")
