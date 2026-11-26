@@ -9,6 +9,7 @@ metadata:
     app.kubernetes.io/component: gpu-check
     app: containerssh-config-server
 spec:
+  suspend: {{ .Values.cronjobs.gpuCheck.suspend }}
   # GPU 유실은 발견이 늦어질수록 사용자가 오래 방치되므로 krb5-reconcile(30분)보다 짧게 잡는다.
   schedule: "*/10 * * * *"
   # 앞 실행이 끝나지 않았으면 새로 만들지 않고, 끝나지 않는 실행은 제한 시간에 끊는다. 둘 다 없으면

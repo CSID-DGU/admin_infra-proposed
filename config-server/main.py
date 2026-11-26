@@ -169,6 +169,34 @@ def _resolve_run_mode(env=None):
 
 
 VERIFY_MODE = _resolve_run_mode()
+
+
+def _resolve_api_read_only(env=None):
+    """API 쓰기 차단은 명시적인 true/false만 받는다.
+
+    오타를 false로 접으면 LAB 부트스트랩 배포가 쓰기 API를 열 수 있으므로 프로세스를
+    시작하지 않는다. 값이 없을 때 false인 것은 기존 FARM 런타임 호환을 위한 기본값이다.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get("CONFIG_API_READ_ONLY") or "false").strip().lower()
+    if raw not in ("true", "false"):
+        raise SystemExit(f"CONFIG_API_READ_ONLY must be true or false, got {raw!r}")
+    return raw == "true"
+
+
+API_READ_ONLY = _resolve_api_read_only()
+
+
+def _resolve_api_maintenance(env=None):
+    """FARM controlled deployment의 임시 쓰기 차단도 엄격한 boolean만 받는다."""
+    env = os.environ if env is None else env
+    raw = (env.get("CONFIG_API_MAINTENANCE") or "false").strip().lower()
+    if raw not in ("true", "false"):
+        raise SystemExit(f"CONFIG_API_MAINTENANCE must be true or false, got {raw!r}")
+    return raw == "true"
+
+
+API_MAINTENANCE = _resolve_api_maintenance()
 # 실험 스택은 AD·Kerberos, NAS 홈, farm keytab을 운영과 같이 쓰고 이것들은 이름으로 식별된다.
 # 접두어를 주면 그 접두어로 시작하지 않는 이름은 받지 않아, 운영 계정을 덮어쓰거나 지우지 못하게 한다.
 # 비워 두면(운영) 제한 없음.
@@ -218,6 +246,43 @@ def _require_api_token():
             "AUTHENTICATE", "CLUSTER_ID_MISMATCH",
             f"요청 대상 클러스터 식별자가 {CLUSTER_ID!r}와 일치하지 않습니다")), 409
     return None
+
+
+@app.before_request
+def _reject_mutating_request_in_read_only_mode():
+    """LAB API 부트스트랩 동안 HTTP 쓰기 진입점을 구조적으로 닫는다.
+
+    인증 검사 뒤에 등록해 인증되지 않은 호출자에게 운영 모드를 먼저 노출하지 않는다.
+    GET/HEAD/OPTIONS는 health, 작업 상태 및 API 문서 조회를 위해 유지한다.
+    """
+    if not API_READ_ONLY or request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    app.logger.warning("[READ_ONLY] 쓰기 요청 거절: cluster=%s method=%s path=%s",
+                       CLUSTER_ID, request.method, request.path)
+    response = jsonify(infra_error(
+        "CHECK_API_MODE", "CONFIG_API_READ_ONLY",
+        "이 Config Server는 읽기 전용 부트스트랩 모드입니다",
+    ))
+    response.status_code = 403
+    response.headers["X-Config-Read-Only"] = "true"
+    return response
+
+
+@app.before_request
+def _reject_mutating_request_in_maintenance_mode():
+    """FARM chart/image 검증 중 새 작업이 들어와 rollback과 충돌하지 않게 한다."""
+    if not API_MAINTENANCE or request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    app.logger.warning("[MAINTENANCE] 쓰기 요청 거절: cluster=%s method=%s path=%s",
+                       CLUSTER_ID, request.method, request.path)
+    response = jsonify(infra_error(
+        "CHECK_API_MODE", "CONFIG_API_MAINTENANCE",
+        "이 Config Server는 배포 검증을 위한 maintenance 모드입니다",
+    ))
+    response.status_code = 503
+    response.headers["Retry-After"] = "30"
+    response.headers["X-Config-Maintenance"] = "true"
+    return response
 
 
 @app.before_request
@@ -380,7 +445,8 @@ def health():
     # 바깥 자원은 건드리지 않는다. 예전에는 작업 이력 기록 실패 건수를 Redis에서 함께 읽었는데,
     # Redis가 사라지자 그 조회가 17초씩 걸려 준비 상태 점검이 계속 실패했고, 설치가 대기 한도
     # 10분을 채우고 중단됐다. 부가 정보는 /health/details 로 옮겼다.
-    return jsonify(status="OK", run_mode=VERIFY_MODE, cluster_id=CLUSTER_ID), 200
+    return jsonify(status="OK", run_mode=VERIFY_MODE, cluster_id=CLUSTER_ID,
+                   read_only=API_READ_ONLY, maintenance=API_MAINTENANCE), 200
 
 
 @app.route("/health/details", methods=["GET"])
@@ -405,6 +471,7 @@ def health_details():
     """
     # 부가 저장소를 조회하므로 저장소가 멈추면 이 경로도 함께 느려진다. 준비 상태 점검에는 쓰지 않는다.
     return jsonify(status="OK", run_mode=VERIFY_MODE, cluster_id=CLUSTER_ID,
+                   read_only=API_READ_ONLY, maintenance=API_MAINTENANCE,
                    oplog_write_failures=write_failure_count()), 200
 
 def _reject_farm_only_operation(kind: str):

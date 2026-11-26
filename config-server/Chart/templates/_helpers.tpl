@@ -157,6 +157,10 @@ gpu-check-state
 {{- define "containerssh-config-server.env" -}}
 - name: CLUSTER_ID
   value: {{ include "containerssh-config-server.clusterId" . | quote }}
+- name: CONFIG_API_READ_ONLY
+  value: {{ include "containerssh-config-server.apiReadOnly" . | quote }}
+- name: CONFIG_API_MAINTENANCE
+  value: {{ include "containerssh-config-server.apiMaintenance" . | quote }}
 - name: KUBERNETES_CLIENT_MODE
   value: "in-cluster"
 - name: KUBERNETES_CLIENT_VALIDATE_AT_STARTUP
@@ -260,6 +264,37 @@ gpu-check-state
       key: token
 {{- end -}}
 
+{{- define "containerssh-config-server.apiReadOnly" -}}
+{{- $readOnly := .Values.api.readOnly -}}
+{{- if and $readOnly (ne (include "containerssh-config-server.clusterId" .) "lab") -}}
+{{- fail "api.readOnly=true는 LAB API-bootstrap 릴리스에서만 사용할 수 있습니다" -}}
+{{- end -}}
+{{- if and $readOnly .Values.controller.enabled -}}
+{{- fail "api.readOnly=true일 때 controller.enabled는 false여야 합니다" -}}
+{{- end -}}
+{{- if and $readOnly (or .Values.cronjobs.gpuCheck.enabled .Values.cronjobs.krb5Reconcile.enabled) -}}
+{{- fail "api.readOnly=true일 때 Config Server CronJob은 모두 비활성화해야 합니다" -}}
+{{- end -}}
+{{- ternary "true" "false" $readOnly -}}
+{{- end -}}
+
+{{- define "containerssh-config-server.apiMaintenance" -}}
+{{- $maintenance := .Values.api.maintenance -}}
+{{- if and $maintenance (ne (include "containerssh-config-server.clusterId" .) "farm") -}}
+{{- fail "api.maintenance=true는 FARM controlled upgrade에서만 사용할 수 있습니다" -}}
+{{- end -}}
+{{- if and $maintenance .Values.api.readOnly -}}
+{{- fail "api.maintenance와 api.readOnly는 동시에 true일 수 없습니다" -}}
+{{- end -}}
+{{- if and $maintenance (or (not .Values.controller.enabled) (ne (int .Values.controller.replicas) 0)) -}}
+{{- fail "api.maintenance=true일 때 FARM controller는 enabled=true, replicas=0이어야 합니다" -}}
+{{- end -}}
+{{- if and $maintenance (or (not .Values.cronjobs.gpuCheck.suspend) (not .Values.cronjobs.krb5Reconcile.suspend)) -}}
+{{- fail "api.maintenance=true일 때 FARM CronJob은 모두 suspend=true여야 합니다" -}}
+{{- end -}}
+{{- ternary "true" "false" $maintenance -}}
+{{- end -}}
+
 {{- define "containerssh-config-server.volumeMounts" -}}
 - name: nas-ssh-key
   mountPath: /etc/nas-ssh
@@ -314,14 +349,27 @@ gpu-check-state
   emptyDir: {}
   {{- end }}
 - name: kube-share
+  {{- if .Values.kubeShare.claimName }}
+  persistentVolumeClaim:
+    claimName: {{ .Values.kubeShare.claimName }}
+  {{- else }}
   nfs:
     server: {{ .Values.nfs.server | quote }}
     path: {{ .Values.nfs.kubeSharePath | quote }}
+  {{- end }}
 - name: krb5-conf
   configMap:
     name: {{ include "containerssh-config-server.krb5ConfigMapName" . | quote }}
 {{- end -}}
 
 {{- define "containerssh-config-server.image" -}}
-{{ .Values.image.repository }}:{{ required "image.tag를 지정해야 합니다" .Values.image.tag }}
+{{- $repository := required "image.repository를 지정해야 합니다" .Values.image.repository -}}
+{{- if .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .Values.image.digest) -}}
+{{- fail "image.digest는 sha256:<64자리 소문자 16진수> 형식이어야 합니다" -}}
+{{- end -}}
+{{- printf "%s@%s" $repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repository (required "image.tag를 지정해야 합니다" .Values.image.tag) -}}
+{{- end -}}
 {{- end -}}

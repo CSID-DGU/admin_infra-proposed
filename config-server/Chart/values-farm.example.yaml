@@ -23,6 +23,13 @@ cluster:
 
 image:
   tag: REPLACE_WITH_IMMUTABLE_IMAGE_TAG
+  # 운영 workflow가 검증한 sha256 digest를 주입한다. 수동 예시에서는 비워 둔다.
+  digest: ""
+
+# FARM 운영 API의 기존 쓰기 동작을 유지한다.
+api:
+  readOnly: false
+  maintenance: false
 
 nfs:
   server: 192.0.2.31
@@ -50,6 +57,11 @@ monitoring:
 
 imageStore:
   claimName: REPLACE_WITH_FARM_IMAGE_STORE_PVC
+
+# 비우면 기존 nfs.server/kubeSharePath를 사용한다. FARM 운영 upgrade에서는
+# 원장 저장방식을 바꾸지 않는 것이 기본값이다.
+kubeShare:
+  claimName: ""
 
 db:
   host: REPLACE_WITH_FARM_DB_HOST

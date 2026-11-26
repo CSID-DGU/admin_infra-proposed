@@ -2,7 +2,8 @@
 
 제안 시스템(config-server 제어기·실험 측정 harness) 저장소다. 실험 스택과 운영(operation) 스택이 이 코드를 쓴다.
 
-* 배포: CSID-DGU/admin_infra → Actions → **Deploy Proposed Stack** (`ops/proposed-stack/README.md`)
+* 전체 실험 스택 배포: CSID-DGU/admin_infra → Actions → **Deploy Proposed Stack** (`ops/proposed-stack/README.md`)
+* 운영 Config Server 분리 배포: CSID-DGU/admin_infra → Actions → **Deploy FARM/LAB Config Server** (`ops/cluster-config/README.md`)
 * 테스트: `pip install -r config-server/requirements.txt pytest` 후 `pytest config-server` · `(cd harness && pytest)` — PR마다 CI가 같은 명령을 돌린다
 
 ## 브랜치·배포 규칙
@@ -11,7 +12,8 @@ admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 �
 
 - 브랜치는 `main` 하나다. 작업은 `main`에서 `<커밋 타입>/v<버전>-<짧은 설명>` 브랜치를 따서(예: `fix/v3.0-returning-user-uid`) PR로 `main`에 squash 병합한다.
 - PR은 CI(테스트) 통과가 필요하다.
-- 어느 브랜치에 push해도 자동 배포는 없다. 배포는 admin_infra의 **Deploy Proposed Stack** 워크플로로만 한다.
+- 어느 브랜치에 push해도 자동 배포는 없다. 전체 실험 스택과 FARM/LAB 운영 Config Server는 서로 다른
+  수동 workflow·runner·kubeconfig 경계를 사용한다.
 - 실험 스택은 `main`(또는 작업 브랜치)을, 운영(operation)은 네 저장소에 같은 이름으로 찍은 릴리스 태그 `vX.Y.Z`만 배포한다.
 
 ---

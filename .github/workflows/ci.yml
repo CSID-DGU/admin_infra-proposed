@@ -39,6 +39,10 @@ jobs:
           bash -n ops/proposed-stack/stack-up.sh
           bash -n ops/proposed-stack/stack-down.sh
           python -m pytest -q ops/proposed-stack/tests
+      - name: FARM/LAB Config Server deployment boundary
+        run: |
+          bash -n ops/cluster-config/deploy.sh
+          python -m pytest -q ops/cluster-config/tests
       - name: harness
         working-directory: harness
         env:
