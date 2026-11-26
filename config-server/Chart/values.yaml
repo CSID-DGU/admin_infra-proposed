@@ -58,6 +58,8 @@ security:
 
 krb5:
   realm: ""
+  # Config Server의 AD 작업은 cluster.adSsh를 사용한다. Pod 안에서 직접 Kerberos client를
+  # 써야 하는 배포에서만 지정하며, 비어 있으면 [realms] client 설정을 만들지 않는다.
   kdcHosts: []
   adminServer: ""
   domain: ""
