@@ -76,6 +76,38 @@ spec:
             - name: data
               mountPath: /data
               readOnly: true
+      {{- else }}
+      # RESTORE is permitted only on the exact pre-provisioned empty target.
+      # This gate runs in the same Pod before mysqld can initialize or modify
+      # any retained data, so a deleted Helm release cannot clobber residue.
+      initContainers:
+        - name: verify-empty-restore-target
+          image: {{ include "provi-master-admin.mysqlImage" . | quote }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              test -d /data
+              test ! -L /data
+              test "$(stat -Lc '%u:%g:%a' /data)" = "999:999:700"
+              for entry in /data/.[!.]* /data/..?* /data/*; do
+                if test -e "$entry" || test -L "$entry"; then
+                  printf 'RESTORE target is not empty: %s\n' "$entry" >&2
+                  exit 1
+                fi
+              done
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
       {{- end }}
       containers:
         - name: mysql
@@ -213,6 +245,36 @@ spec:
               test "$(wc -l < "$receipt" | tr -d ' ')" = "2"
               grep -Fqx 'artifact_sha256={{ .Values.redis.expectedReceiptSha256 }}' "$receipt"
               grep -Eq '^verified_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+      {{- else }}
+      # Refuse to start a writable RESTORE Redis against any retained residue.
+      initContainers:
+        - name: verify-empty-restore-target
+          image: {{ include "provi-master-admin.redisImage" . | quote }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              test -d /data
+              test ! -L /data
+              test "$(stat -Lc '%u:%g:%a' /data)" = "999:999:700"
+              for entry in /data/.[!.]* /data/..?* /data/*; do
+                if test -e "$entry" || test -L "$entry"; then
+                  printf 'RESTORE target is not empty: %s\n' "$entry" >&2
+                  exit 1
+                fi
+              done
           securityContext:
             runAsNonRoot: false
             runAsUser: 0

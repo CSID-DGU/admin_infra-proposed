@@ -282,8 +282,36 @@ def test_restore_mode_is_the_only_empty_pv_bootstrap_contract():
 
     mysql = pod_template(indexed[("StatefulSet", "master-admin-mysql")])
     redis = pod_template(indexed[("StatefulSet", "master-admin-redis")])
-    assert "initContainers" not in mysql["spec"]
-    assert "initContainers" not in redis["spec"]
+    for datastore in (mysql, redis):
+        init_containers = datastore["spec"]["initContainers"]
+        assert len(init_containers) == 1
+        empty_gate = init_containers[0]
+        assert empty_gate["name"] == "verify-empty-restore-target"
+        assert empty_gate["image"] == datastore["spec"]["containers"][0]["image"]
+        assert "@sha256:" in empty_gate["image"]
+        assert empty_gate["imagePullPolicy"] == datastore["spec"]["containers"][0]["imagePullPolicy"]
+        assert empty_gate["command"] == ["/bin/sh", "-ec"]
+        empty_gate_script = empty_gate["args"][0]
+        assert "test -d /data" in empty_gate_script
+        assert "test ! -L /data" in empty_gate_script
+        assert "stat -Lc '%u:%g:%a' /data" in empty_gate_script
+        assert '999:999:700' in empty_gate_script
+        assert "/data/.[!.]* /data/..?* /data/*" in empty_gate_script
+        assert "RESTORE target is not empty" in empty_gate_script
+        assert ".provi-restore-receipt" not in empty_gate_script
+        for forbidden_mutation in ("rm ", "mv ", "chown ", "chmod ", "touch ", "> /data"):
+            assert forbidden_mutation not in empty_gate_script
+
+        gate_security = empty_gate["securityContext"]
+        assert gate_security["runAsNonRoot"] is False
+        assert gate_security["runAsUser"] == 0
+        assert gate_security["runAsGroup"] == 0
+        assert gate_security["allowPrivilegeEscalation"] is False
+        assert gate_security["readOnlyRootFilesystem"] is True
+        assert gate_security["capabilities"]["drop"] == ["ALL"]
+        assert empty_gate["volumeMounts"] == [
+            {"name": "data", "mountPath": "/data", "readOnly": True}
+        ]
     assert "--read-only=OFF" in mysql["spec"]["containers"][0]["args"]
     assert "+@all" in redis["spec"]["containers"][0]["args"][0]
     assert "-@dangerous" not in redis["spec"]["containers"][0]["args"][0]
