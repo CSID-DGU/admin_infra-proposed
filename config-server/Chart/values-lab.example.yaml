@@ -34,6 +34,12 @@ image:
 api:
   readOnly: true
 
+# pfSense의 LAB 전용 전달 구간과 일치시킨다. 30000~30079는 FARM 사용자,
+# 30080~30099는 관리·인프라 예외용으로 남기므로 LAB 사용자 Service에는 배정하지 않는다.
+nodeport:
+  min: 30100
+  max: 32767
+
 nfs:
   server: ""
   userSharePath: ""

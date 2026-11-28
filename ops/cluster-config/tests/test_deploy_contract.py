@@ -70,6 +70,19 @@ def test_fixed_farm_and_lab_boundaries_are_present():
     assert '.compatibility.deploymentSelectorMode == "release"' in source
 
 
+def test_farm_and_lab_user_nodeport_partitions_are_disjoint_and_enforced():
+    source = SCRIPT.read_text()
+    assert "EXPECTED_NODEPORT_MIN=30000" in source
+    assert "EXPECTED_NODEPORT_MAX=30079" in source
+    assert "EXPECTED_NODEPORT_MIN=30100" in source
+    assert "EXPECTED_NODEPORT_MAX=32767" in source
+    assert '.nodeport.min == $nodeport_min' in source
+    assert '.nodeport.max == $nodeport_max' in source
+    assert '--set "nodeport.min=$EXPECTED_NODEPORT_MIN"' in source
+    assert '--set "nodeport.max=$EXPECTED_NODEPORT_MAX"' in source
+    assert 'allow_legacy_lab_nodeport' in source
+
+
 def test_lab_api_bootstrap_writer_and_dependency_gates_are_explicit():
     source = SCRIPT.read_text()
     for value in (
