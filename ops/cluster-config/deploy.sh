@@ -520,18 +520,23 @@ EOF
 }
 
 validate_lab_can_i() {
-  local identity=$1 expected=$2 scope=$3 verb=$4 resource=$5 answer
-  local -a scope_args=()
+  local identity=$1 expected=$2 scope=$3 verb=$4 resource=$5 subresource=${6:-}
+  local answer displayed_resource=$resource
+  local -a scope_args=() subresource_args=()
   case "$scope" in
     namespace) scope_args=(--namespace "$NAMESPACE") ;;
     cluster) ;;
     all-namespaces) scope_args=(--all-namespaces) ;;
     *) fail "internal LAB RBAC scope is invalid: $scope" ;;
   esac
-  answer=$(kubectl auth can-i "$verb" "$resource" "${scope_args[@]}" \
+  if [[ -n "$subresource" ]]; then
+    subresource_args=(--subresource="$subresource")
+    displayed_resource="${resource}/${subresource}"
+  fi
+  answer=$(kubectl auth can-i "$verb" "$resource" "${subresource_args[@]}" "${scope_args[@]}" \
     --as "$identity" 2>/dev/null || true)
   [[ "$answer" == "$expected" ]] \
-    || fail "LAB API-bootstrap ServiceAccount expected $expected for $verb $resource ($scope), answer=${answer:-error}"
+    || fail "LAB API-bootstrap ServiceAccount expected $expected for $verb $displayed_resource ($scope), answer=${answer:-error}"
 }
 
 validate_lab_effective_rbac() {
@@ -540,10 +545,13 @@ validate_lab_effective_rbac() {
 
   validate_lab_owned_rbac_objects
 
-  for resource in pods pods/log services persistentvolumeclaims events; do
+  for resource in pods services persistentvolumeclaims events; do
     for verb in get list watch; do
       validate_lab_can_i "$identity" yes namespace "$verb" "$resource"
     done
+  done
+  for verb in get list watch; do
+    validate_lab_can_i "$identity" yes namespace "$verb" pods log
   done
   for verb in get list watch; do
     validate_lab_can_i "$identity" yes cluster "$verb" nodes
@@ -556,7 +564,7 @@ validate_lab_effective_rbac() {
     done
   done
   for verb in get create; do
-    validate_lab_can_i "$identity" no namespace "$verb" pods/exec
+    validate_lab_can_i "$identity" no namespace "$verb" pods exec
   done
   for verb in create update patch delete deletecollection; do
     validate_lab_can_i "$identity" no namespace "$verb" pods

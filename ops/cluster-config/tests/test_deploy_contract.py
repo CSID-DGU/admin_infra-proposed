@@ -249,14 +249,16 @@ def test_lab_probe_and_post_upgrade_check_effective_serviceaccount_contract():
     assert 'EXPECTED_SERVICE_ACCOUNT=lab-config-server' in source
     assert 'system:serviceaccount:${NAMESPACE}:${EXPECTED_SERVICE_ACCOUNT}' in source
     assert source.count("validate_lab_effective_rbac") == 3  # definition + two calls
-    assert 'answer=$(kubectl auth can-i "$verb" "$resource" "${scope_args[@]}"' in source
+    assert 'subresource_args=(--subresource="$subresource")' in source
+    assert 'answer=$(kubectl auth can-i "$verb" "$resource" "${subresource_args[@]}" "${scope_args[@]}"' in source
     assert '[[ "$answer" == "$expected" ]]' in source
     assert 'namespace) scope_args=(--namespace "$NAMESPACE")' in source
     assert 'all-namespaces) scope_args=(--all-namespaces)' in source
 
-    assert "for resource in pods pods/log services persistentvolumeclaims events" in source
+    assert "for resource in pods services persistentvolumeclaims events" in source
     assert "for verb in get list watch" in source
     assert 'validate_lab_can_i "$identity" yes namespace "$verb" "$resource"' in source
+    assert 'validate_lab_can_i "$identity" yes namespace "$verb" pods log' in source
     assert 'validate_lab_can_i "$identity" yes cluster "$verb" nodes' in source
     assert 'validate_lab_can_i "$identity" yes all-namespaces "$verb" services' in source
 
@@ -264,7 +266,9 @@ def test_lab_probe_and_post_upgrade_check_effective_serviceaccount_contract():
     assert "for verb in get list watch create update patch delete deletecollection" in source
     assert 'validate_lab_can_i "$identity" no namespace "$verb" "$resource"' in source
     assert "for verb in get create" in source
-    assert 'validate_lab_can_i "$identity" no namespace "$verb" pods/exec' in source
+    assert 'validate_lab_can_i "$identity" no namespace "$verb" pods exec' in source
+    assert 'validate_lab_can_i "$identity" no namespace "$verb" pods/exec' not in source
+    assert 'validate_lab_can_i "$identity" yes namespace "$verb" pods/log' not in source
     assert "for verb in create update patch delete deletecollection" in source
     assert 'validate_lab_can_i "$identity" no namespace "$verb" pods' in source
 
@@ -310,17 +314,23 @@ def _lab_can_i_function_source():
     return source[start:end + 2]
 
 
-def _run_lab_can_i_harness(tmp_path, *, expected, output, command_rc):
+def _run_lab_can_i_harness(
+    tmp_path, *, expected, output, command_rc, resource="pods", subresource=None
+):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True)
     kubectl = fake_bin / "kubectl"
     kubectl.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
+        if [[ -n "${CAN_I_ARGS_FILE-}" ]]; then
+          printf '%s\n' "$@" >"$CAN_I_ARGS_FILE"
+        fi
         printf '%s' "${CAN_I_OUTPUT-}"
         exit "${CAN_I_RC-0}"
     """))
     kubectl.chmod(0o700)
 
+    optional_subresource = "" if subresource is None else f" {subresource}"
     harness = tmp_path / "can-i-harness.sh"
     harness.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
@@ -329,7 +339,7 @@ def _run_lab_can_i_harness(tmp_path, *, expected, output, command_rc):
         NAMESPACE=ailab-operation
         fail() {{ printf '[ERROR] %s\\n' "$*" >&2; exit 1; }}
         {_lab_can_i_function_source()}
-        validate_lab_can_i identity {expected} namespace get pods
+        validate_lab_can_i identity {expected} namespace get {resource}{optional_subresource}
     """))
     return subprocess.run(
         ["bash", str(harness)],
@@ -338,6 +348,7 @@ def _run_lab_can_i_harness(tmp_path, *, expected, output, command_rc):
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "CAN_I_OUTPUT": output,
             "CAN_I_RC": str(command_rc),
+            "CAN_I_ARGS_FILE": str(tmp_path / "kubectl-args.txt"),
         },
         capture_output=True,
         text=True,
@@ -363,6 +374,43 @@ def test_lab_can_i_accepts_only_the_exact_expected_answer(tmp_path):
     )
     assert unexpected.returncode == 1
     assert "answer=error" in unexpected.stderr
+
+
+def test_lab_can_i_passes_subresources_with_the_explicit_kubectl_flag(tmp_path):
+    for subresource, expected, output, command_rc in (
+        ("log", "yes", "yes", 0),
+        ("exec", "no", "no", 1),
+    ):
+        case_dir = tmp_path / subresource
+        result = _run_lab_can_i_harness(
+            case_dir,
+            expected=expected,
+            output=output,
+            command_rc=command_rc,
+            resource="pods",
+            subresource=subresource,
+        )
+        assert result.returncode == 0
+        assert (case_dir / "kubectl-args.txt").read_text().splitlines() == [
+            "auth",
+            "can-i",
+            "get",
+            "pods",
+            f"--subresource={subresource}",
+            "--namespace",
+            "ailab-operation",
+            "--as",
+            "identity",
+        ]
+
+    ordinary_dir = tmp_path / "ordinary"
+    result = _run_lab_can_i_harness(
+        ordinary_dir, expected="yes", output="yes", command_rc=0
+    )
+    assert result.returncode == 0
+    ordinary_args = (ordinary_dir / "kubectl-args.txt").read_text().splitlines()
+    assert "--subresource=exec" not in ordinary_args
+    assert ordinary_args[0:4] == ["auth", "can-i", "get", "pods"]
 
 
 def test_lab_lifecycle_latch_bridge_is_upgrade_only_and_postcheck_is_strict():
