@@ -122,7 +122,7 @@ case "$TARGET" in
     EXPECTED_CLUSTER_ID=lab
     EXPECTED_NODE_ROLE=lab-management
     EXPECTED_NODE_PORT=30082
-    EXPECTED_NODEPORT_MIN=30100
+    EXPECTED_NODEPORT_MIN=30130
     EXPECTED_NODEPORT_MAX=32767
     EXPECTED_SERVICE_ACCOUNT=lab-config-server
     ;;
@@ -712,7 +712,7 @@ wait_for_no_release_pods() {
 
 if [[ "$TARGET" == lab && "$ACTION" == upgrade ]]; then
   # The API-only Phase 7-A release used the chart default 30000. Upgrade is the
-  # only bridge that may read it; the candidate and every postcheck require 30100.
+  # only bridge that may read it; the candidate and every postcheck require 30130.
   validate_common_values true
 else
   validate_common_values false
