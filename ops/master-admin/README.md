@@ -22,7 +22,7 @@ Helm은 비밀번호나 애플리케이션 설정 Secret을 만들지 않는다.
 | --- | --- |
 | `master-admin-database` | `mysql-root-password`, `mysql-username`, `mysql-password`, `redis-password` |
 | `master-admin-be-config` | 비밀값을 제거·치환한 Admin BE 설정 및 필요한 환경변수 |
-| `master-admin-farm-readonly` | 선택 사항. `kubeconfig` 키 하나인 단기 FARM 읽기 전용 kubeconfig |
+| `master-admin-farm-readonly` | 선택 사항. `kubeconfig` 키 하나인 FARM namespace 한정 읽기 전용 kubeconfig |
 
 LAB kubeconfig mount는 차트에 존재하지 않는다.
 
@@ -32,7 +32,8 @@ LAB kubeconfig mount는 차트에 존재하지 않는다.
 확보하고, `dataMode=RESTORE`에서 offline restore helper로 Retain PV 경로에 복구한다.
 RESTORE는 FE/BE가 0대이고 Ingress가 없을 때만 렌더되며, MySQL/Redis를 데이터 적재에만
 쓸 수 있게 연다. Redis RDB는 AOF가 켜진 빈 대상에 파일만 복사하면 로드되지 않으므로,
-격리된 RESTORE 창에서 native `DUMP`/`RESTORE`로 이관해 대상 AOF에 기록하고 재시작 후
+격리된 RESTORE 창에서 같은 digest의 Redis를 AOF 비활성 상태로 기동해 RDB와 값 지문을
+검증하고, 메모리의 검증된 데이터로 AOF를 만든 뒤 일반 AOF 설정으로 두 번 재시작해
 다시 검증해야 한다. 복구용 Pod를 만들기 전에 각 local PV 루트는 `999:999:0700`으로
 미리 준비한다. MySQL/Redis Pod에는 `fsGroup`을 설정하지 않는다. kubelet의 재귀 소유권
 변경이 복구 영수증을 바꾸지 못하게 하기 위해서다. 복구가 끝나면 임시 파일을 먼저
@@ -52,6 +53,11 @@ SHADOW/ACTIVE의 datastore initContainer는 정확히 두 줄인지, 일반 파�
 read-only ACL로 다시 쓰기를 막는다.
 Admin BE도 `PROVI_RUNTIME_MODE=SHADOW`, Flyway 비활성화, Hibernate `validate`, Hikari
 read-only로 뜨며 Ingress를 만들 수 없다.
+
+SHADOW Admin BE의 외부 egress는 FARM API/Config Server의 명시적 `/32` 주소와
+`provi-monitoring` namespace 안의 전용 Prometheus Pod(9090)로만 연다. Monitoring 경로는
+namespace selector와 정확한 Prometheus label을 함께 사용하므로 다른 namespace나 Pod로
+확장되지 않는다.
 
 `helm uninstall`은 데이터 삭제 절차가 아니다. keep annotation과 Retain policy로 PV/PVC를
 남기지만, 운영에서는 uninstall 대신 검증된 이전 revision으로 rollback한다. PV 디렉터리를

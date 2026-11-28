@@ -27,7 +27,7 @@ adminBackend:
   # creates, prints, or adopts application credentials.
   applicationSecretName: master-admin-be-config
   farmReadOnlyCredential:
-    # A short-lived, read-only FARM kubeconfig can be mounted for SHADOW
+    # A namespace-scoped, read-only FARM kubeconfig can be mounted for SHADOW
     # validation. LAB credentials are intentionally unsupported by this chart.
     enabled: false
     secretName: master-admin-farm-readonly
@@ -132,3 +132,11 @@ networkPolicy:
   backendExtraEgress: []
   # - cidr: 192.168.2.198/32
   #   ports: [6443]
+  # SHADOW Admin BE reads only the dedicated Prometheus Pod in the separate
+  # provi-monitoring namespace.  Keep this disabled during RESTORE, where the
+  # application replicas are zero.
+  backendMonitoringEgress:
+    enabled: false
+    namespace: provi-monitoring
+    prometheusLabel: master-monitoring-kube-prometheus-prometheus
+    port: 9090
