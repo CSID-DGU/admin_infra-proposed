@@ -65,9 +65,12 @@ spec:
               grep -Fqx 'artifact_sha256={{ .Values.mysql.expectedReceiptSha256 }}' "$receipt"
               grep -Eq '^verified_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
           securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
+            # /data is deliberately 999:999:0700.  A UID 0 process with all
+            # capabilities dropped cannot reliably traverse that directory,
+            # so the receipt gate must run as the datastore owner too.
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -97,9 +100,11 @@ spec:
                 fi
               done
           securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
+            # Match the 999:999:0700 target.  Running as capability-less UID 0
+            # can make an unreadable nonempty directory look empty to globs.
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -246,9 +251,12 @@ spec:
               grep -Fqx 'artifact_sha256={{ .Values.redis.expectedReceiptSha256 }}' "$receipt"
               grep -Eq '^verified_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
           securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
+            # /data is deliberately 999:999:0700.  A UID 0 process with all
+            # capabilities dropped cannot reliably traverse that directory,
+            # so the receipt gate must run as the datastore owner too.
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -276,9 +284,11 @@ spec:
                 fi
               done
           securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
+            # Match the 999:999:0700 target.  Running as capability-less UID 0
+            # can make an unreadable nonempty directory look empty to globs.
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
