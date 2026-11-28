@@ -1,0 +1,61 @@
+{
+  "compatibility": {"deploymentSelectorMode": "release"},
+  "lab": {"lifecycleDependenciesReady": null},
+  "cluster": {
+    "homeMountRootTemplate": "",
+    "ssh": {
+      "user": "disabled-until-phase7b",
+      "keyPath": "/etc/infra-ssh/id_ed25519",
+      "nodes": [
+        {"name": "lab1", "host": "192.168.1.11", "port": 8081},
+        {"name": "lab2", "host": "192.168.1.12", "port": 8082},
+        {"name": "lab3", "host": "192.168.1.13", "port": 8083},
+        {"name": "lab4", "host": "192.168.1.14", "port": 8084},
+        {"name": "lab5", "host": "192.168.1.15", "port": 8085},
+        {"name": "lab6", "host": "192.168.1.16", "port": 8086},
+        {"name": "lab7", "host": "192.168.1.17", "port": 8087},
+        {"name": "lab8", "host": "192.168.1.18", "port": 8088},
+        {"name": "lab9", "host": "192.168.1.19", "port": 8089},
+        {"name": "lab10", "host": "192.168.1.110", "port": 8090}
+      ]
+    },
+    "adSsh": {
+      "user": "disabled-until-phase7b",
+      "keyPath": "/etc/infra-ad-ssh/id_ed25519",
+      "nodes": []
+    }
+  },
+  "nfs": {"server": "", "userSharePath": "", "kubeSharePath": ""},
+  "nas": {
+    "ssh": {
+      "host": "",
+      "port": "",
+      "user": "disabled-until-phase7b",
+      "keyPath": "/etc/nas-ssh/id_ed25519"
+    }
+  },
+  "krb5": {"realm": "", "kdcHosts": [], "adminServer": "", "domain": ""},
+  "infra": {"adminBeInternalUrl": "http://127.0.0.1:9"},
+  "monitoring": {"prometheusUrl": "http://127.0.0.1:9"},
+  "db": {
+    "host": "lab-config-mysql.ailab-operation.svc.cluster.local",
+    "name": "pod_port_db",
+    "secretName": "lab-config-server-db"
+  },
+  "logDb": {
+    "host": "lab-config-mysql.ailab-operation.svc.cluster.local",
+    "name": "operation_state_db",
+    "secretName": "lab-config-server-log-db"
+  },
+  "redis": {"host": "lab-config-redis.ailab-operation.svc.cluster.local"},
+  "apiToken": {"secretName": "lab-config-server-api-token"},
+  "imageStore": {"claimName": "lab-config-image-store"},
+  "kubeShare": {"claimName": "lab-config-ledger"},
+  "verifyMode": "noprobe",
+  "faultInjection": false,
+  "controller": {"enabled": false},
+  "cronjobs": {
+    "gpuCheck": {"enabled": false},
+    "krb5Reconcile": {"enabled": false}
+  }
+}

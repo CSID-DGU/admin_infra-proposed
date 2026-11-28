@@ -185,6 +185,66 @@ def test_lab_read_only_profile_rejects_background_writers(override):
     assert "Phase 7-B" in rendered.stderr
 
 
+def test_phase7a_legacy_ssh_placeholders_render_only_when_the_upgrade_bridge_clears_all():
+    bridge = (
+        "--set-string", "cluster.ssh.keyPath=",
+        "--set-string", "cluster.adSsh.keyPath=",
+        "--set-string", "nas.ssh.keyPath=",
+    )
+    rendered = _render(
+        "lab-config", "values-lab.example.yaml",
+        "-f", str(CHART / "fixtures/values-lab-phase7a-keypaths.yaml"),
+        *bridge,
+    )
+
+    for legacy_path in (
+        "/etc/infra-ssh/id_ed25519",
+        "/etc/infra-ad-ssh/id_ed25519",
+        "/etc/nas-ssh/id_ed25519",
+    ):
+        assert legacy_path not in rendered
+    for variable in (
+        "INFRA_SSH_KEY_PATH",
+        "INFRA_AD_SSH_KEY_PATH",
+        "NAS_SSH_KEY_PATH",
+    ):
+        assert re.search(rf"name: {variable}\n\s+value: \"\"", rendered)
+
+    assert "name: lab-config-controller" not in rendered
+    assert "kind: CronJob" not in rendered
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    ["cluster.ssh.keyPath", "cluster.adSsh.keyPath", "nas.ssh.keyPath"],
+)
+def test_phase7a_upgrade_bridge_rejects_each_uncleared_placeholder(omitted):
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm is not installed")
+    version = subprocess.run([helm, "version", "--short"], capture_output=True, text=True)
+    if version.returncode:
+        pytest.skip(f"helm cannot run in this environment: {version.stderr.strip()}")
+
+    bridge = []
+    for field in ("cluster.ssh.keyPath", "cluster.adSsh.keyPath", "nas.ssh.keyPath"):
+        if field != omitted:
+            bridge.extend(("--set-string", f"{field}="))
+    rendered = subprocess.run(
+        [
+            helm, "template", "lab-config", str(CHART),
+            "-f", str(CHART / "values-lab.example.yaml"),
+            "-f", str(CHART / "fixtures/values-lab-phase7a-keypaths.yaml"),
+            *bridge,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rendered.returncode != 0
+    assert "Phase 7-B" in rendered.stderr
+
+
 @pytest.mark.parametrize(
     "override_args",
     [

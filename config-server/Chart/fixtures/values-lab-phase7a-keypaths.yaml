@@ -1,0 +1,11 @@
+# Phase 7-A가 Helm release에 저장한 비활성 SSH placeholder 경로만 재현한다.
+# values-lab.example.yaml 위에 겹쳐 첫 controlled upgrade의 호환 경로를 시험한다.
+cluster:
+  ssh:
+    keyPath: /etc/infra-ssh/id_ed25519
+  adSsh:
+    keyPath: /etc/infra-ad-ssh/id_ed25519
+
+nas:
+  ssh:
+    keyPath: /etc/nas-ssh/id_ed25519
