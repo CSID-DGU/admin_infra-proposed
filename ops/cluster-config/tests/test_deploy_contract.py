@@ -74,7 +74,7 @@ def test_farm_and_lab_user_nodeport_partitions_are_disjoint_and_enforced():
     source = SCRIPT.read_text()
     assert "EXPECTED_NODEPORT_MIN=30000" in source
     assert "EXPECTED_NODEPORT_MAX=30079" in source
-    assert "EXPECTED_NODEPORT_MIN=30100" in source
+    assert "EXPECTED_NODEPORT_MIN=30130" in source
     assert "EXPECTED_NODEPORT_MAX=32767" in source
     assert '.nodeport.min == $nodeport_min' in source
     assert '.nodeport.max == $nodeport_max' in source
