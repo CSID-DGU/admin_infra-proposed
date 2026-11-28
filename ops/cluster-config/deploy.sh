@@ -111,6 +111,8 @@ case "$TARGET" in
     EXPECTED_CLUSTER_ID=farm
     EXPECTED_NODE_ROLE=farm-management
     EXPECTED_NODE_PORT=30482
+    EXPECTED_NODEPORT_MIN=30000
+    EXPECTED_NODEPORT_MAX=30079
     ;;
   lab)
     EXPECTED_HOST=lab-mgmt
@@ -120,6 +122,8 @@ case "$TARGET" in
     EXPECTED_CLUSTER_ID=lab
     EXPECTED_NODE_ROLE=lab-management
     EXPECTED_NODE_PORT=30082
+    EXPECTED_NODEPORT_MIN=30100
+    EXPECTED_NODEPORT_MAX=32767
     EXPECTED_SERVICE_ACCOUNT=lab-config-server
     ;;
 esac
@@ -210,12 +214,16 @@ helm get values "$RELEASE" --namespace "$NAMESPACE" --all --output yaml >"$WORK_
 chmod 600 "$WORK_DIR"/*
 
 validate_common_values() {
+  local allow_legacy_lab_nodeport=${1:-false}
   jq -e \
     --arg cluster "$EXPECTED_CLUSTER_ID" \
     --arg role "$EXPECTED_NODE_ROLE" \
     --arg repository "$EXPECTED_IMAGE_REPOSITORY" \
     --arg namespace "$NAMESPACE" \
-    --argjson node_port "$EXPECTED_NODE_PORT" '
+    --argjson node_port "$EXPECTED_NODE_PORT" \
+    --argjson nodeport_min "$EXPECTED_NODEPORT_MIN" \
+    --argjson nodeport_max "$EXPECTED_NODEPORT_MAX" \
+    --argjson allow_legacy_lab_nodeport "$allow_legacy_lab_nodeport" '
       .cluster.id == $cluster and
       .image.repository == $repository and
       (.image.tag | test("^[0-9a-f]{40}$")) and
@@ -224,6 +232,15 @@ validate_common_values() {
       .config.namespace == $namespace and
       .service.type == "NodePort" and
       .service.nodePort == $node_port and
+      .nodeport.max == $nodeport_max and
+      (
+        .nodeport.min == $nodeport_min
+        or (
+          $allow_legacy_lab_nodeport and
+          $cluster == "lab" and
+          .nodeport.min == 30000
+        )
+      ) and
       .nodeSelector["provi.dgu.ac.kr/role"] == $role
     ' "$WORK_DIR/current-values.json" >/dev/null || fail "$TARGET release values violate the fixed deployment contract"
 }
@@ -693,7 +710,13 @@ wait_for_no_release_pods() {
   fail "timed out waiting for $component Pods to terminate"
 }
 
-validate_common_values
+if [[ "$TARGET" == lab && "$ACTION" == upgrade ]]; then
+  # The API-only Phase 7-A release used the chart default 30000. Upgrade is the
+  # only bridge that may read it; the candidate and every postcheck require 30100.
+  validate_common_values true
+else
+  validate_common_values false
+fi
 if [[ "$TARGET" == farm ]]; then
   validate_farm_values
   validate_farm_transition_values false 1 false
@@ -744,6 +767,8 @@ if [[ "$TARGET" == lab ]]; then
   lab_bootstrap_args=(
     --set api.readOnly=true
     --set lab.lifecycleDependenciesReady=false
+    --set "nodeport.min=$EXPECTED_NODEPORT_MIN"
+    --set "nodeport.max=$EXPECTED_NODEPORT_MAX"
   )
 fi
 render_args=(template "$RELEASE" "$CHART" --namespace "$NAMESPACE" --values "$WORK_DIR/current-values.yaml" "${lab_bootstrap_args[@]}")

@@ -36,6 +36,12 @@ LAB 전용 MySQL·Redis가 Ready인지를 확인하며, controller와 GPU/Kerber
 writer 하나만 열린 혼합 values는 렌더 단계에서 거절된다. Phase 7-B가 끝나기 전에는 latch를
 `true`로 바꾸지 않는다.
 
+외부 포트 전달 구간도 클러스터별로 분리한다. FARM 사용자 Service는 `30000~30079`, LAB 사용자
+Service는 `30100~32767`만 사용하고 `30080~30099`는 관리·인프라 예외용으로 남긴다. LAB upgrade는
+기존 Phase 7-A의 `nodeport.min=30000`을 입력값으로 한 번만 허용하지만, 렌더링과 적용에는
+`nodeport.min=30100`, `nodeport.max=32767`을 강제하고 적용 직후 같은 값을 다시 확인한다. LAB probe는
+처음부터 새 구간이 저장되어 있지 않으면 실패한다.
+
 정적 chart 검사만 신뢰하지 않는다. probe와 upgrade 후에는 정확한
 `system:serviceaccount:ailab-operation:lab-config-server` 권한을 API에 질의한다. 이 계정은 LAB namespace의
 Pod·Pod log·Service·PVC·Event와 cluster Node, 전체 namespace Service에 대해 get/list/watch가 모두
