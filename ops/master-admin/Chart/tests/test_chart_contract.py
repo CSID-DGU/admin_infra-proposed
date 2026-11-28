@@ -83,7 +83,8 @@ def test_shadow_write_and_exposure_guards_are_rendered():
     assert "--super-read-only=ON" in mysql_args
     mysql_receipt = mysql["spec"]["initContainers"][0]["args"][0]
     assert "artifact_sha256=1111111111111111111111111111111111111111111111111111111111111111" in mysql_receipt
-    assert "0:0:444" in mysql_receipt
+    assert 'test ! -L "$receipt"' in mysql_receipt
+    assert "0:0:444:1" in mysql_receipt
     assert "verified_at=" in mysql_receipt
 
     redis_script = redis["spec"]["containers"][0]["args"][0]
@@ -91,7 +92,18 @@ def test_shadow_write_and_exposure_guards_are_rendered():
     assert "+@all" not in redis_script
     redis_receipt = redis["spec"]["initContainers"][0]["args"][0]
     assert "artifact_sha256=2222222222222222222222222222222222222222222222222222222222222222" in redis_receipt
-    assert "0:0:444" in redis_receipt
+    assert 'test ! -L "$receipt"' in redis_receipt
+    assert "0:0:444:1" in redis_receipt
+
+    # The retained local paths are provisioned as 999:999 before the first
+    # mount.  fsGroup would recursively chgrp/chmod the root-owned receipt and
+    # make the exact restart gate nondeterministic.
+    for datastore in (mysql, redis):
+        pod_security = datastore["spec"]["securityContext"]
+        assert pod_security["runAsUser"] == 999
+        assert pod_security["runAsGroup"] == 999
+        assert "fsGroup" not in pod_security
+        assert "fsGroupChangePolicy" not in pod_security
 
     backend_container = backend["spec"]["containers"][0]
     assert "--provi.runtime-mode=SHADOW" in backend_container["args"]
