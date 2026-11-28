@@ -33,18 +33,23 @@ LAB kubeconfig mount는 차트에 존재하지 않는다.
 RESTORE는 FE/BE가 0대이고 Ingress가 없을 때만 렌더되며, MySQL/Redis를 데이터 적재에만
 쓸 수 있게 연다. Redis RDB는 AOF가 켜진 빈 대상에 파일만 복사하면 로드되지 않으므로,
 격리된 RESTORE 창에서 native `DUMP`/`RESTORE`로 이관해 대상 AOF에 기록하고 재시작 후
-다시 검증해야 한다. 복구가 끝나면 각 PV 루트에 아래 root-owned `0444` 영수증을 원자적으로
-설치한다. 시각은 UTC RFC3339 초 단위다.
+다시 검증해야 한다. 복구용 Pod를 만들기 전에 각 local PV 루트는 `999:999:0700`으로
+미리 준비한다. MySQL/Redis Pod에는 `fsGroup`을 설정하지 않는다. kubelet의 재귀 소유권
+변경이 복구 영수증을 바꾸지 못하게 하기 위해서다. 복구가 끝나면 임시 파일을 먼저
+검증한 뒤 각 PV 루트에 아래 `root:root:0444` 영수증을 원자적으로 설치한다. 시각은 UTC
+RFC3339 초 단위다.
 
 ```text
 artifact_sha256=<백업 아티팩트의 소문자 64-hex SHA-256>
 verified_at=2026-11-28T12:34:56Z
 ```
 
-SHADOW/ACTIVE의 datastore initContainer는 정확히 두 줄인지, `root:root:444`인지,
+SHADOW/ACTIVE의 datastore initContainer는 정확히 두 줄인지, 일반 파일이면서 심볼릭 링크가
+아닌지, 링크 수가 1이고 `root:root:444`인지,
 `expectedReceiptSha256`와 같은지 모두 확인한다. 하나라도 다르면 MySQL/Redis 본체가 시작되지
-않는다. SHADOW의 MySQL은 `read_only`와 `super_read_only`, Redis는 read-only ACL로 다시
-쓰기를 막는다.
+않는다. 복구 절차는 RESTORE Pod를 한 번 재기동한 뒤에도 이 메타데이터와 데이터 지문이
+그대로인지 확인해야 한다. SHADOW의 MySQL은 `read_only`와 `super_read_only`, Redis는
+read-only ACL로 다시 쓰기를 막는다.
 Admin BE도 `PROVI_RUNTIME_MODE=SHADOW`, Flyway 비활성화, Hibernate `validate`, Hikari
 read-only로 뜨며 Ingress를 만들 수 없다.
 
