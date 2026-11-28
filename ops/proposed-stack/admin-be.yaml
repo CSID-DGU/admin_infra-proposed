@@ -39,6 +39,10 @@ spec:
             - secretRef:
                 name: admin-be-config
           env:
+            # 운영/실험 FARM 배포는 실제 요청을 처리하는 활성 인스턴스다. admin_be의 새 런타임
+            # 안전장치는 값을 생략하면 기동을 거절하므로, Master shadow와 혼동되지 않게 명시한다.
+            - name: PROVI_RUNTIME_MODE
+              value: ACTIVE
             - name: SPRING_DATASOURCE_HIKARI_INITIALIZATION_FAIL_TIMEOUT
               value: "-1"
           # 운영과 같은 설정 파일(admin-prod-config 복사본). Spring Boot는 ./config/를 jar 안 설정보다 우선한다.

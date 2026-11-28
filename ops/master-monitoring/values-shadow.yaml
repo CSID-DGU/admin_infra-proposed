@@ -1,0 +1,291 @@
+# Phase 5-G2B shadow monitoring for the independent provi-master cluster.
+# This file intentionally contains no FARM/LAB credentials, remote scrape
+# endpoints, public routes, or external notification receivers.
+nameOverride: master-monitoring
+namespaceOverride: provi-monitoring
+
+commonLabels:
+  provi.dgu.ac.kr/cluster: provi-master
+  provi.dgu.ac.kr/plane: central-management
+  provi.dgu.ac.kr/release-mode: shadow
+
+crds:
+  enabled: true
+  upgradeJob:
+    enabled: false
+
+defaultRules:
+  create: true
+
+alertmanager:
+  enabled: true
+  ingress:
+    enabled: false
+  route:
+    main:
+      enabled: false
+  service:
+    type: ClusterIP
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by:
+        - namespace
+        - alertname
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: "null"
+    receivers:
+      - name: "null"
+  alertmanagerSpec:
+    replicas: 1
+    retention: 24h
+    nodeSelector:
+      provi.dgu.ac.kr/role: master-management
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    # Fail closed: do not adopt arbitrary AlertmanagerConfig objects.
+    alertmanagerConfigSelector:
+      matchLabels:
+        provi.dgu.ac.kr/notification-policy: master-local-null
+    alertmanagerConfigNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: provi-monitoring
+
+grafana:
+  enabled: true
+  ingress:
+    enabled: false
+  route:
+    main:
+      enabled: false
+  service:
+    type: ClusterIP
+  nodeSelector:
+    provi.dgu.ac.kr/role: master-management
+  persistence:
+    enabled: true
+    type: pvc
+    existingClaim: master-monitoring-grafana
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  grafana.ini:
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    security:
+      disable_gravatar: true
+    users:
+      allow_sign_up: false
+  sidecar:
+    dashboards:
+      # The independent cluster contains only provi-master namespaces. No
+      # remote cluster dashboard credential is mounted during shadow.
+      searchNamespace: ALL
+
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  nodeSelector:
+    provi.dgu.ac.kr/role: master-management
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+nodeExporter:
+  enabled: true
+  operatingSystems:
+    linux:
+      enabled: true
+    aix:
+      enabled: false
+    darwin:
+      enabled: false
+
+prometheus-node-exporter:
+  nodeSelector:
+    provi.dgu.ac.kr/role: master-management
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+prometheusOperator:
+  nodeSelector:
+    provi.dgu.ac.kr/role: master-management
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  admissionWebhooks:
+    deployment:
+      nodeSelector:
+        provi.dgu.ac.kr/role: master-management
+    patch:
+      nodeSelector:
+        provi.dgu.ac.kr/role: master-management
+
+prometheus:
+  enabled: true
+  ingress:
+    enabled: false
+  route:
+    main:
+      enabled: false
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    replicas: 1
+    shards: 1
+    nodeSelector:
+      provi.dgu.ac.kr/role: master-management
+    externalLabels:
+      cluster: provi-master
+    retention: 30d
+    retentionSize: 120GiB
+    enableAdminAPI: false
+    enableRemoteWriteReceiver: false
+    remoteRead: []
+    remoteWrite: []
+    additionalRemoteRead: []
+    additionalRemoteWrite: []
+    additionalScrapeConfigs: []
+    persistentVolumeClaimRetentionPolicy:
+      whenDeleted: Retain
+      whenScaled: Retain
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    storageSpec:
+      volumeClaimTemplate:
+        metadata:
+          labels:
+            provi.dgu.ac.kr/storage: master-monitoring-prometheus
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: provi-master-monitoring-local
+          selector:
+            matchLabels:
+              provi.dgu.ac.kr/storage: master-monitoring-prometheus
+          resources:
+            requests:
+              storage: 150Gi
+
+thanosRuler:
+  enabled: false
+
+# These retained static volumes belong only to the independent provi-master
+# monitoring release. The host directories must already exist with the
+# ownership documented in README.md before Helm is allowed to install.
+extraManifests:
+  - apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: provi-master-monitoring-local
+      annotations:
+        helm.sh/resource-policy: keep
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    reclaimPolicy: Retain
+    allowVolumeExpansion: false
+  - apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: provi-master-monitoring-prometheus
+      annotations:
+        helm.sh/resource-policy: keep
+      labels:
+        provi.dgu.ac.kr/storage: master-monitoring-prometheus
+    spec:
+      capacity:
+        storage: 150Gi
+      volumeMode: Filesystem
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: provi-master-monitoring-local
+      local:
+        path: /var/lib/provi/master-monitoring/prometheus
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: provi.dgu.ac.kr/role
+                  operator: In
+                  values:
+                    - master-management
+  - apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: provi-master-monitoring-grafana
+      annotations:
+        helm.sh/resource-policy: keep
+      labels:
+        provi.dgu.ac.kr/storage: master-monitoring-grafana
+    spec:
+      capacity:
+        storage: 10Gi
+      volumeMode: Filesystem
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: provi-master-monitoring-local
+      claimRef:
+        namespace: provi-monitoring
+        name: master-monitoring-grafana
+      local:
+        path: /var/lib/provi/master-monitoring/grafana
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: provi.dgu.ac.kr/role
+                  operator: In
+                  values:
+                    - master-management
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: master-monitoring-grafana
+      namespace: provi-monitoring
+      annotations:
+        helm.sh/resource-policy: keep
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: provi-master-monitoring-local
+      volumeName: provi-master-monitoring-grafana
+      resources:
+        requests:
+          storage: 10Gi

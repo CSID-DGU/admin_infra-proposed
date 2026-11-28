@@ -1,0 +1,312 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: master-admin-mysql
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: mysql
+spec:
+  clusterIP: None
+  selector:
+    {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 4 }}
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: master-admin-mysql
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: mysql
+spec:
+  serviceName: master-admin-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 8 }}
+      annotations:
+        provi.dgu.ac.kr/infra-sha: {{ .Values.provenance.infraSha | quote }}
+        provi.dgu.ac.kr/runtime-mode: {{ .Values.runtimeMode | quote }}
+        provi.dgu.ac.kr/data-mode: {{ .Values.dataMode | quote }}
+        provi.dgu.ac.kr/restore-receipt-sha256: {{ .Values.mysql.expectedReceiptSha256 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        {{- include "provi-master-admin.nodeSelector" . | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if ne .Values.dataMode "RESTORE" }}
+      initContainers:
+        - name: verify-restore-receipt
+          image: {{ include "provi-master-admin.mysqlImage" . | quote }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              receipt=/data/.provi-restore-receipt
+              test -f "$receipt"
+              test "$(stat -c '%u:%g:%a' "$receipt")" = "0:0:444"
+              test "$(wc -l < "$receipt" | tr -d ' ')" = "2"
+              grep -Fqx 'artifact_sha256={{ .Values.mysql.expectedReceiptSha256 }}' "$receipt"
+              grep -Eq '^verified_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: mysql
+          image: {{ include "provi-master-admin.mysqlImage" . | quote }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy }}
+          args:
+            - --skip-name-resolve
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            - --innodb-flush-log-at-trx-commit=1
+            - --sync-binlog=1
+            - {{ ternary "--read-only=ON" "--read-only=OFF" .Values.mysql.readOnly | quote }}
+            - {{ ternary "--super-read-only=ON" "--super-read-only=OFF" .Values.mysql.readOnly | quote }}
+          env:
+            - name: MYSQL_DATABASE
+              value: {{ .Values.database.name | quote }}
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.mysqlRootPassword }}
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.mysqlUsername }}
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.mysqlPassword }}
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - name: mysql
+              containerPort: 3306
+          startupProbe:
+            exec:
+              command: ["sh", "-ec", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: ["sh", "-ec", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["sh", "-ec", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 15
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: {{ .Values.mysql.resources.requests.cpu }}
+              memory: {{ .Values.mysql.resources.requests.memory }}
+              ephemeral-storage: {{ .Values.mysql.resources.requests.ephemeralStorage }}
+            limits:
+              cpu: {{ .Values.mysql.resources.limits.cpu | quote }}
+              memory: {{ .Values.mysql.resources.limits.memory }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: master-admin-mysql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: master-admin-redis
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  clusterIP: None
+  selector:
+    {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: master-admin-redis
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: master-admin-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 8 }}
+      annotations:
+        provi.dgu.ac.kr/infra-sha: {{ .Values.provenance.infraSha | quote }}
+        provi.dgu.ac.kr/runtime-mode: {{ .Values.runtimeMode | quote }}
+        provi.dgu.ac.kr/data-mode: {{ .Values.dataMode | quote }}
+        provi.dgu.ac.kr/restore-receipt-sha256: {{ .Values.redis.expectedReceiptSha256 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        {{- include "provi-master-admin.nodeSelector" . | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if ne .Values.dataMode "RESTORE" }}
+      initContainers:
+        - name: verify-restore-receipt
+          image: {{ include "provi-master-admin.redisImage" . | quote }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              receipt=/data/.provi-restore-receipt
+              test -f "$receipt"
+              test "$(stat -c '%u:%g:%a' "$receipt")" = "0:0:444"
+              test "$(wc -l < "$receipt" | tr -d ' ')" = "2"
+              grep -Fqx 'artifact_sha256={{ .Values.redis.expectedReceiptSha256 }}' "$receipt"
+              grep -Eq '^verified_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "provi-master-admin.redisImage" . | quote }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              {
+                printf '%s\n' \
+                  'bind 0.0.0.0' \
+                  'protected-mode yes' \
+                  'port 6379' \
+                  'dir /data' \
+                  'appendonly yes' \
+                  'aof-use-rdb-preamble yes' \
+                  'appendfsync everysec' \
+                  'save 900 1' \
+                  'save 300 10' \
+                  'save 60 10000' \
+                  'user default off'
+                {{- if eq .Values.dataMode "RESTORE" }}
+                # RESTORE is isolated: application replicas and ingress are zero.
+                # The maintenance importer needs the native RESTORE command so
+                # Redis can persist a binary-safe RDB clone into the target AOF.
+                printf 'user default on >%s ~* +@all\n' "$REDIS_PASSWORD"
+                {{- else if .Values.redis.readOnly }}
+                printf 'user default on >%s ~* +@read +ping +select -@dangerous\n' "$REDIS_PASSWORD"
+                {{- else }}
+                printf 'user default on >%s ~* +@all -@dangerous\n' "$REDIS_PASSWORD"
+                {{- end }}
+              } > /run/redis/redis.conf
+              exec redis-server /run/redis/redis.conf
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.redisPassword }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          startupProbe:
+            exec:
+              command: ["sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+            periodSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["sh", "-ec", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping"]
+            periodSeconds: 15
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: {{ .Values.redis.resources.requests.cpu }}
+              memory: {{ .Values.redis.resources.requests.memory }}
+              ephemeral-storage: {{ .Values.redis.resources.requests.ephemeralStorage }}
+            limits:
+              cpu: {{ .Values.redis.resources.limits.cpu | quote }}
+              memory: {{ .Values.redis.resources.limits.memory }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: runtime
+              mountPath: /run/redis
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: master-admin-redis
+        - name: runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
