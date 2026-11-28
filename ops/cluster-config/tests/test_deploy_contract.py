@@ -1,11 +1,15 @@
 from pathlib import Path
+from copy import deepcopy
+import json
 import os
+import re
 import subprocess
 import textwrap
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy.sh"
+PHASE7A_VALUES = Path(__file__).parent / "fixtures" / "lab-phase7a-values.json"
 
 
 def test_shell_syntax_and_help_are_valid():
@@ -121,6 +125,99 @@ def test_lab_api_bootstrap_writer_and_dependency_gates_are_explicit():
     assert '"$TARGET" == lab && "$ACTION" == probe' in source
     assert 'lab_bootstrap_args=(' in source
     assert '--set api.readOnly=true' in source
+
+
+def test_lab_phase7a_ssh_placeholder_bridge_is_exact_and_postcheck_is_strict():
+    source = SCRIPT.read_text()
+    bootstrap_start = source.index(
+        "lab_bootstrap_args=(", source.index("lab_bootstrap_args=()") + 1
+    )
+    bootstrap_end = source.index("\n  )", bootstrap_start)
+    bootstrap = source[bootstrap_start:bootstrap_end]
+
+    for override in (
+        '--set-string "cluster.ssh.keyPath="',
+        '--set-string "cluster.adSsh.keyPath="',
+        '--set-string "nas.ssh.keyPath="',
+    ):
+        assert bootstrap.count(override) == 1
+    assert source.count('"${lab_bootstrap_args[@]}"') == 3
+
+    validator_start = source.index("validate_lab_values() {")
+    validator_end = source.index(
+        "\n}\n\nvalidate_lab_read_only_contract", validator_start
+    )
+    validator = source[validator_start:validator_end]
+    for legacy_path in (
+        "/etc/infra-ssh/id_ed25519",
+        "/etc/infra-ad-ssh/id_ed25519",
+        "/etc/nas-ssh/id_ed25519",
+    ):
+        assert validator.count(legacy_path) == 1
+
+    assert 'local allow_legacy_phase7a=${1:-false}' in validator
+    assert '.cluster.ssh.keyPath == ""' in validator
+    assert '.cluster.adSsh.keyPath == ""' in validator
+    assert '.nas.ssh.keyPath == ""' in validator
+    assert '.nas.ssh.port == ""' in validator
+    assert '$allow_legacy_phase7a and' in validator
+
+
+def _run_lab_values_validator(values, allow_legacy_phase7a):
+    source = SCRIPT.read_text()
+    validator_start = source.index("validate_lab_values() {")
+    validator_end = source.index(
+        "\n}\n\nvalidate_lab_read_only_contract", validator_start
+    )
+    validator = source[validator_start:validator_end]
+    match = re.search(
+        r"jq -e --argjson allow_legacy_phase7a "
+        r'"\$allow_legacy_phase7a" \'(.*?)\' "\$WORK_DIR/current-values.json"',
+        validator,
+        re.DOTALL,
+    )
+    assert match, "validate_lab_values jq filter not found"
+    return subprocess.run(
+        [
+            "jq", "-e", "--argjson", "allow_legacy_phase7a",
+            str(allow_legacy_phase7a).lower(), match.group(1),
+        ],
+        input=json.dumps(values),
+        text=True,
+        capture_output=True,
+    )
+
+
+def test_lab_values_validator_executes_exact_phase7a_transition_matrix():
+    legacy = json.loads(PHASE7A_VALUES.read_text())
+    assert _run_lab_values_validator(legacy, True).returncode == 0
+    assert _run_lab_values_validator(legacy, False).returncode != 0
+
+    normalized = deepcopy(legacy)
+    normalized["lab"]["lifecycleDependenciesReady"] = False
+    normalized["cluster"]["ssh"]["keyPath"] = ""
+    normalized["cluster"]["adSsh"]["keyPath"] = ""
+    normalized["nas"]["ssh"]["keyPath"] = ""
+    assert _run_lab_values_validator(normalized, True).returncode == 0
+    assert _run_lab_values_validator(normalized, False).returncode == 0
+
+    for field_path in (
+        ("cluster", "ssh", "keyPath"),
+        ("cluster", "adSsh", "keyPath"),
+        ("nas", "ssh", "keyPath"),
+    ):
+        mixed = deepcopy(legacy)
+        mixed[field_path[0]][field_path[1]][field_path[2]] = ""
+        assert _run_lab_values_validator(mixed, True).returncode != 0
+
+    arbitrary = deepcopy(legacy)
+    arbitrary["cluster"]["ssh"]["keyPath"] = "/tmp/unreviewed-key"
+    assert _run_lab_values_validator(arbitrary, True).returncode != 0
+
+    nonempty_port = deepcopy(normalized)
+    nonempty_port["nas"]["ssh"]["port"] = "22"
+    assert _run_lab_values_validator(nonempty_port, True).returncode != 0
+    assert _run_lab_values_validator(nonempty_port, False).returncode != 0
 
 
 def test_lab_rendered_resource_set_is_an_exact_api_only_allowlist():

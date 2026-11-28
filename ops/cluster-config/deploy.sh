@@ -284,19 +284,32 @@ validate_farm_controller_replicas() {
 }
 
 validate_lab_values() {
-  local allow_missing_lifecycle_latch=${1:-false}
-  jq -e --argjson allow_missing_lifecycle_latch "$allow_missing_lifecycle_latch" '
+  local allow_legacy_phase7a=${1:-false}
+  jq -e --argjson allow_legacy_phase7a "$allow_legacy_phase7a" '
       .compatibility.deploymentSelectorMode == "release" and
       (
         .lab.lifecycleDependenciesReady == false
         or (
-          $allow_missing_lifecycle_latch and
+          $allow_legacy_phase7a and
           (.lab.lifecycleDependenciesReady == null)
         )
       ) and
       .cluster.homeMountRootTemplate == "" and
       .cluster.ssh.user == "disabled-until-phase7b" and
       .cluster.adSsh.user == "disabled-until-phase7b" and
+      (
+        (
+          .cluster.ssh.keyPath == "" and
+          .cluster.adSsh.keyPath == "" and
+          .nas.ssh.keyPath == ""
+        )
+        or (
+          $allow_legacy_phase7a and
+          .cluster.ssh.keyPath == "/etc/infra-ssh/id_ed25519" and
+          .cluster.adSsh.keyPath == "/etc/infra-ad-ssh/id_ed25519" and
+          .nas.ssh.keyPath == "/etc/nas-ssh/id_ed25519"
+        )
+      ) and
       ((.cluster.adSsh.nodes // []) | length == 0) and
       .cluster.ssh.nodes == [
         {"name":"lab1", "host":"192.168.1.11", "port":8081},
@@ -314,6 +327,7 @@ validate_lab_values() {
       .nfs.userSharePath == "" and
       .nfs.kubeSharePath == "" and
       .nas.ssh.host == "" and
+      .nas.ssh.port == "" and
       .nas.ssh.user == "disabled-until-phase7b" and
       .krb5.realm == "" and
       ((.krb5.kdcHosts // []) | length == 0) and
@@ -762,13 +776,18 @@ snapshot_managed_workloads \
 
 lab_bootstrap_args=()
 if [[ "$TARGET" == lab ]]; then
-  # Existing Phase 7-A releases predate this value. Force the structural gate in
-  # the candidate and upgrade; only the post-upgrade release must already report it.
+  # Existing Phase 7-A releases predate the lifecycle latch and retained three
+  # placeholder SSH key paths even though every corresponding remote operation
+  # was disabled. Normalize only those reviewed legacy placeholders in the same
+  # Helm upgrade. The strict post-upgrade values check requires all three empty.
   lab_bootstrap_args=(
     --set api.readOnly=true
     --set lab.lifecycleDependenciesReady=false
     --set "nodeport.min=$EXPECTED_NODEPORT_MIN"
     --set "nodeport.max=$EXPECTED_NODEPORT_MAX"
+    --set-string "cluster.ssh.keyPath="
+    --set-string "cluster.adSsh.keyPath="
+    --set-string "nas.ssh.keyPath="
   )
 fi
 render_args=(template "$RELEASE" "$CHART" --namespace "$NAMESPACE" --values "$WORK_DIR/current-values.yaml" "${lab_bootstrap_args[@]}")
