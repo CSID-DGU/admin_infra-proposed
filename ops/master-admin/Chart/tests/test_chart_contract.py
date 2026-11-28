@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import shlex
 import subprocess
 
 import yaml
@@ -38,6 +40,28 @@ def by_kind_name(objects):
 
 def pod_template(obj):
     return obj["spec"]["template"]
+
+
+def run_restore_empty_gate(script: str, data_dir: Path):
+    """Execute the rendered gate against a same-owner 0700 fixture.
+
+    Kubernetes mounts the real target as 999:999:0700 and the chart now runs
+    the gate as 999:999.  The unprivileged test process cannot chown to 999, so
+    this substitutes only the mount path and its expected owner with the
+    current test identity while preserving the rendered glob and symlink
+    checks byte-for-byte.
+    """
+    assert "test \"$(stat -Lc '%u:%g:%a' /data)\" = \"999:999:700\"" in script
+    fixture_script = script.replace("/data", shlex.quote(str(data_dir)))
+    fixture_script = fixture_script.replace(
+        "999:999:700", f"{os.getuid()}:{os.getgid()}:700"
+    )
+    return subprocess.run(
+        ["/bin/sh", "-ec", fixture_script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_shadow_render_is_isolated_and_data_retaining():
@@ -104,6 +128,14 @@ def test_shadow_write_and_exposure_guards_are_rendered():
         assert pod_security["runAsGroup"] == 999
         assert "fsGroup" not in pod_security
         assert "fsGroupChangePolicy" not in pod_security
+
+        receipt_gate_security = datastore["spec"]["initContainers"][0]["securityContext"]
+        assert receipt_gate_security["runAsNonRoot"] is True
+        assert receipt_gate_security["runAsUser"] == 999
+        assert receipt_gate_security["runAsGroup"] == 999
+        assert receipt_gate_security["allowPrivilegeEscalation"] is False
+        assert receipt_gate_security["readOnlyRootFilesystem"] is True
+        assert receipt_gate_security["capabilities"]["drop"] == ["ALL"]
 
     backend_container = backend["spec"]["containers"][0]
     assert "--provi.runtime-mode=SHADOW" in backend_container["args"]
@@ -303,9 +335,9 @@ def test_restore_mode_is_the_only_empty_pv_bootstrap_contract():
             assert forbidden_mutation not in empty_gate_script
 
         gate_security = empty_gate["securityContext"]
-        assert gate_security["runAsNonRoot"] is False
-        assert gate_security["runAsUser"] == 0
-        assert gate_security["runAsGroup"] == 0
+        assert gate_security["runAsNonRoot"] is True
+        assert gate_security["runAsUser"] == 999
+        assert gate_security["runAsGroup"] == 999
         assert gate_security["allowPrivilegeEscalation"] is False
         assert gate_security["readOnlyRootFilesystem"] is True
         assert gate_security["capabilities"]["drop"] == ["ALL"]
@@ -315,6 +347,46 @@ def test_restore_mode_is_the_only_empty_pv_bootstrap_contract():
     assert "--read-only=OFF" in mysql["spec"]["containers"][0]["args"]
     assert "+@all" in redis["spec"]["containers"][0]["args"][0]
     assert "-@dangerous" not in redis["spec"]["containers"][0]["args"][0]
+
+
+def test_restore_empty_gate_executes_same_owner_normal_hidden_and_symlink_fixtures(tmp_path):
+    objects = rendered_objects(
+        "--set-string", "dataMode=RESTORE",
+        "--set", "mysql.readOnly=false",
+        "--set", "redis.readOnly=false",
+        "--set", "adminBackend.replicas=0",
+        "--set", "adminFrontend.replicas=0",
+        "--set-string", "mysql.expectedReceiptSha256=",
+        "--set-string", "redis.expectedReceiptSha256=",
+    )
+    indexed = by_kind_name(objects)
+    scripts = [
+        pod_template(indexed[("StatefulSet", "master-admin-mysql")])["spec"]
+        ["initContainers"][0]["args"][0],
+        pod_template(indexed[("StatefulSet", "master-admin-redis")])["spec"]
+        ["initContainers"][0]["args"][0],
+    ]
+
+    for index, script in enumerate(scripts):
+        empty = tmp_path / f"empty-{index}"
+        empty.mkdir(mode=0o700)
+        empty.chmod(0o700)
+        assert run_restore_empty_gate(script, empty).returncode == 0
+
+        fixtures = (
+            ("normal", lambda path: path.write_text("not-empty", encoding="utf-8")),
+            (".hidden", lambda path: path.write_text("not-empty", encoding="utf-8")),
+            ("..double-hidden", lambda path: path.write_text("not-empty", encoding="utf-8")),
+            ("dangling", lambda path: path.symlink_to(path.parent / "missing-target")),
+        )
+        for fixture_name, create_fixture in fixtures:
+            target = tmp_path / f"{fixture_name}-{index}"
+            target.mkdir(mode=0o700)
+            target.chmod(0o700)
+            create_fixture(target / fixture_name)
+            result = run_restore_empty_gate(script, target)
+            assert result.returncode != 0, fixture_name
+            assert "RESTORE target is not empty:" in result.stderr
 
 
 def test_restore_mode_rejects_any_application_replica_or_ingress():
