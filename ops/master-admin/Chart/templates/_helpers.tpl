@@ -141,6 +141,17 @@ capabilities:
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if .Values.networkPolicy.backendMonitoringEgress.enabled -}}
+{{- if ne .Values.networkPolicy.backendMonitoringEgress.namespace "provi-monitoring" -}}
+{{- fail "networkPolicy.backendMonitoringEgress.namespace is fixed at provi-monitoring" -}}
+{{- end -}}
+{{- if ne .Values.networkPolicy.backendMonitoringEgress.prometheusLabel "master-monitoring-kube-prometheus-prometheus" -}}
+{{- fail "networkPolicy.backendMonitoringEgress.prometheusLabel is fixed at the dedicated Master Prometheus" -}}
+{{- end -}}
+{{- if ne (int .Values.networkPolicy.backendMonitoringEgress.port) 9090 -}}
+{{- fail "networkPolicy.backendMonitoringEgress.port is fixed at 9090" -}}
+{{- end -}}
+{{- end -}}
 {{- if eq .Values.dataMode "RESTORE" -}}
 {{- if ne .Values.runtimeMode "SHADOW" -}}
 {{- fail "RESTORE requires runtimeMode=SHADOW" -}}

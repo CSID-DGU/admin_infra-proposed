@@ -33,3 +33,5 @@ networkPolicy:
   backendExtraEgress:
     - cidr: 192.168.2.198/32
       ports: [6443]
+  backendMonitoringEgress:
+    enabled: true

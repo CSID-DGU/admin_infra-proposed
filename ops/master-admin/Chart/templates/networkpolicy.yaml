@@ -119,6 +119,18 @@ spec:
           port: {{ . }}
         {{- end }}
     {{- end }}
+    {{- if .Values.networkPolicy.backendMonitoringEgress.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.backendMonitoringEgress.namespace }}
+          podSelector:
+            matchLabels:
+              prometheus: {{ .Values.networkPolicy.backendMonitoringEgress.prometheusLabel }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.backendMonitoringEgress.port }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

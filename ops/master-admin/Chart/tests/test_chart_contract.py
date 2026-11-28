@@ -126,6 +126,34 @@ def test_shadow_write_and_exposure_guards_are_rendered():
         for volume in volumes.values()
     )
 
+    backend_policy = indexed[("NetworkPolicy", "master-admin-backend")]
+    monitoring_egress = [
+        rule
+        for rule in backend_policy["spec"]["egress"]
+        if any(
+            peer.get("namespaceSelector", {}).get("matchLabels", {}).get(
+                "kubernetes.io/metadata.name"
+            )
+            == "provi-monitoring"
+            for peer in rule.get("to", [])
+        )
+    ]
+    assert len(monitoring_egress) == 1
+    monitoring_rule = monitoring_egress[0]
+    assert monitoring_rule["to"] == [
+        {
+            "namespaceSelector": {
+                "matchLabels": {"kubernetes.io/metadata.name": "provi-monitoring"}
+            },
+            "podSelector": {
+                "matchLabels": {
+                    "prometheus": "master-monitoring-kube-prometheus-prometheus"
+                }
+            },
+        }
+    ]
+    assert monitoring_rule["ports"] == [{"protocol": "TCP", "port": 9090}]
+
 
 def test_provenance_and_immutable_images_are_live_workload_identity():
     objects = rendered_objects()
@@ -192,6 +220,15 @@ def test_unsafe_value_combinations_fail_before_render():
         ("--set-string", "mysql.expectedReceiptSha256="),
         ("--set-string", "redis.expectedReceiptSha256=bad"),
         ("--set", "networkPolicy.enabled=false"),
+        (
+            "--set-string",
+            "networkPolicy.backendMonitoringEgress.namespace=default",
+        ),
+        (
+            "--set-string",
+            "networkPolicy.backendMonitoringEgress.prometheusLabel=prometheus",
+        ),
+        ("--set", "networkPolicy.backendMonitoringEgress.port=9091"),
         ("--set-string", "adminBackend.image.digest=latest"),
         ("--set-string", "provenance.backendSha=short"),
     )
