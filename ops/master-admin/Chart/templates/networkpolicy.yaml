@@ -1,0 +1,243 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-default-deny
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-frontend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "frontend") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              provi.dgu.ac.kr/probe: master-admin
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- if .Values.ingress.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressController.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressController.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-backend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "frontend") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              provi.dgu.ac.kr/probe: master-admin
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- range .Values.networkPolicy.backendExtraEgress }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-database-maintenance
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      provi.dgu.ac.kr/database-maintenance: master-admin
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-probe
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      provi.dgu.ac.kr/probe: master-admin
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["frontend", "backend"]
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-mysql
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "mysql") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              provi.dgu.ac.kr/database-maintenance: master-admin
+      ports:
+        - protocol: TCP
+          port: 3306
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: master-admin-redis
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "redis") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              provi.dgu.ac.kr/database-maintenance: master-admin
+      ports:
+        - protocol: TCP
+          port: 6379
+{{- end }}

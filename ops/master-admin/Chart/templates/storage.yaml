@@ -1,0 +1,58 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: provi-master-admin-local
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+{{- range $name, $volume := .Values.storage }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: provi-master-admin-{{ $name }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "provi-master-admin.commonLabels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}-storage
+spec:
+  capacity:
+    storage: {{ $volume.size }}
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: provi-master-admin-local
+  local:
+    path: /var/lib/provi/master-admin/{{ $name }}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: provi.dgu.ac.kr/role
+              operator: In
+              values: ["master-management"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: master-admin-{{ $name }}
+  namespace: {{ include "provi-master-admin.namespace" $ }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "provi-master-admin.commonLabels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}-storage
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: provi-master-admin-local
+  volumeName: provi-master-admin-{{ $name }}
+  resources:
+    requests:
+      storage: {{ $volume.size }}
+---
+{{- end }}

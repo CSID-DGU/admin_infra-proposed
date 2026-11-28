@@ -1,0 +1,134 @@
+# This chart is a singleton. Install it as release `master-admin` in namespace
+# `provi-admin`. Its defaults intentionally describe a non-public, non-writing
+# shadow. Image digests and source provenance are required at render time.
+# RESTORE is the only mode allowed to initialize empty PVs. It keeps both
+# application replicas at zero and creates no ingress. SHADOW and ACTIVE refuse
+# to start either datastore without verified restore receipts.
+dataMode: SHADOW
+runtimeMode: SHADOW
+
+activation:
+  # ACTIVE is rejected unless the deployment workflow has proved that the old
+  # writer is stopped and the final database/Redis synchronization completed.
+  confirmSingleWriter: false
+
+provenance:
+  infraSha: ""
+  backendSha: ""
+  frontendSha: ""
+
+adminBackend:
+  replicas: 1
+  image:
+    repository: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # Created outside Helm after secret-safe configuration synthesis. Helm never
+  # creates, prints, or adopts application credentials.
+  applicationSecretName: master-admin-be-config
+  farmReadOnlyCredential:
+    # A short-lived, read-only FARM kubeconfig can be mounted for SHADOW
+    # validation. LAB credentials are intentionally unsupported by this chart.
+    enabled: false
+    secretName: master-admin-farm-readonly
+    key: kubeconfig
+    mountPath: /etc/provi/kubeconfigs/farm-readonly.yaml
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+      ephemeralStorage: 1Gi
+    limits:
+      memory: 1Gi
+
+adminFrontend:
+  replicas: 1
+  image:
+    repository: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+      ephemeralStorage: 256Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+database:
+  # This Secret is also created outside Helm and is never included in release
+  # history. It contains only the Admin MySQL/Redis credentials.
+  secretName: master-admin-database
+  name: web_admin
+  keys:
+    mysqlRootPassword: mysql-root-password
+    mysqlUsername: mysql-username
+    mysqlPassword: mysql-password
+    redisPassword: redis-password
+
+mysql:
+  image:
+    repository: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # SHADOW requires true; ACTIVE requires false. A restored clone therefore
+  # cannot become a second writer merely because a Pod starts.
+  readOnly: true
+  expectedReceiptSha256: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+      ephemeralStorage: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+redis:
+  image:
+    repository: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # In SHADOW the Redis ACL allows only read-category commands.
+  readOnly: true
+  expectedReceiptSha256: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+      ephemeralStorage: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+storage:
+  mysql:
+    size: 100Gi
+  redis:
+    size: 10Gi
+  backup:
+    size: 100Gi
+
+ingress:
+  # No public route is created during shadow validation.
+  enabled: false
+  className: nginx
+  host: ""
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+networkPolicy:
+  enabled: true
+  ingressController:
+    namespaceSelector:
+      kubernetes.io/metadata.name: ingress-nginx
+    podSelector:
+      app.kubernetes.io/component: controller
+  # Optional, explicit read-only dependency destinations (for example a FARM
+  # API reached with a read-only credential). Broad CIDRs are rejected.
+  backendExtraEgress: []
+  # - cidr: 192.168.2.198/32
+  #   ports: [6443]

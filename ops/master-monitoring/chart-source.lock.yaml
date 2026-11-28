@@ -1,0 +1,9 @@
+apiVersion: provi.dgu.ac.kr/v1alpha1
+kind: HelmChartSourceLock
+metadata:
+  name: kube-prometheus-stack-80.2.2
+spec:
+  repository: oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack
+  version: 80.2.2
+  ociDigest: sha256:552cf360469ef8275297ec9c88a2042847bcc6b9b3be8849d42eda2201bc34ae
+  archiveSha256: 33896f603cdbbcaad03ee618cda2da61ce6549b469582682a85d715ae4aea1d3

@@ -1,0 +1,35 @@
+runtimeMode: SHADOW
+
+provenance:
+  infraSha: 63015e92eb2930e4662863a744ba1ea97d324bd1
+  backendSha: a4af5f32075cf825374cc92de1870fcf8c3efada
+  frontendSha: d253c76390c68710cecd842e7b34127606cca880
+
+adminBackend:
+  image:
+    repository: docker.io/dguailab/admin-prod-exp
+    digest: sha256:ce13258eaffa6711ad53cdf393f9e44bf97ef1f8b1718df80c257fb44b92230d
+  farmReadOnlyCredential:
+    enabled: true
+
+adminFrontend:
+  image:
+    repository: docker.io/dguailab/ailab-frontend-exp
+    digest: sha256:a568e66cca84514fdba41762da435d0541939200d19e0b6fc7fb939b0cd30d24
+
+mysql:
+  expectedReceiptSha256: "1111111111111111111111111111111111111111111111111111111111111111"
+  image:
+    repository: docker.io/library/mysql
+    digest: sha256:a532724022429812ec797c285c1b540a644c15e248579c6bfdf12a8fbaab4964
+
+redis:
+  expectedReceiptSha256: "2222222222222222222222222222222222222222222222222222222222222222"
+  image:
+    repository: docker.io/library/redis
+    digest: sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+
+networkPolicy:
+  backendExtraEgress:
+    - cidr: 192.168.2.198/32
+      ports: [6443]

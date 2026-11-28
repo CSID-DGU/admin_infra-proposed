@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: master-admin-backend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  selector:
+    {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: master-admin-backend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  replicas: {{ .Values.adminBackend.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "backend") | nindent 8 }}
+      annotations:
+        provi.dgu.ac.kr/infra-sha: {{ .Values.provenance.infraSha | quote }}
+        provi.dgu.ac.kr/backend-sha: {{ .Values.provenance.backendSha | quote }}
+        provi.dgu.ac.kr/runtime-mode: {{ .Values.runtimeMode | quote }}
+    spec:
+      serviceAccountName: master-admin-backend
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 330
+      nodeSelector:
+        {{- include "provi-master-admin.nodeSelector" . | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          image: {{ include "provi-master-admin.backendImage" . | quote }}
+          imagePullPolicy: {{ .Values.adminBackend.image.pullPolicy }}
+          args:
+            - --spring.profiles.active=prod
+            - --provi.runtime-mode={{ .Values.runtimeMode }}
+            - --spring.datasource.url=jdbc:mysql://master-admin-mysql:3306/{{ .Values.database.name }}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+            - --spring.datasource.hikari.read-only={{ ternary "true" "false" (eq .Values.runtimeMode "SHADOW") }}
+            - --spring.jpa.hibernate.ddl-auto=validate
+            - --spring.flyway.enabled=false
+            - --issuance-sheet.enabled=false
+            - --slack.membership-check.enabled=false
+            - --spring.data.redis.host=master-admin-redis
+            - --spring.data.redis.port=6379
+          envFrom:
+            - secretRef:
+                name: {{ .Values.adminBackend.applicationSecretName }}
+          env:
+            - name: PROVI_RUNTIME_MODE
+              value: {{ .Values.runtimeMode | quote }}
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.mysqlUsername }}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.mysqlPassword }}
+            - name: SPRING_DATA_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.keys.redisPassword }}
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 3
+            failureThreshold: 120
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: {{ .Values.adminBackend.resources.requests.cpu }}
+              memory: {{ .Values.adminBackend.resources.requests.memory }}
+              ephemeral-storage: {{ .Values.adminBackend.resources.requests.ephemeralStorage }}
+            limits:
+              memory: {{ .Values.adminBackend.resources.limits.memory }}
+          volumeMounts:
+            - name: application-config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.adminBackend.farmReadOnlyCredential.enabled }}
+            - name: farm-readonly-kubeconfig
+              mountPath: {{ .Values.adminBackend.farmReadOnlyCredential.mountPath }}
+              subPath: {{ .Values.adminBackend.farmReadOnlyCredential.key }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: application-config
+          secret:
+            secretName: {{ .Values.adminBackend.applicationSecretName }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        {{- if .Values.adminBackend.farmReadOnlyCredential.enabled }}
+        - name: farm-readonly-kubeconfig
+          secret:
+            secretName: {{ .Values.adminBackend.farmReadOnlyCredential.secretName }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.adminBackend.farmReadOnlyCredential.key }}
+                path: {{ .Values.adminBackend.farmReadOnlyCredential.key }}
+        {{- end }}

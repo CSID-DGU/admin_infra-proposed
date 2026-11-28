@@ -1,0 +1,6 @@
+apiVersion: v2
+name: provi-master-admin
+description: Isolated Admin control plane for the single-node provi-master cluster
+type: application
+version: 0.1.0
+appVersion: "1.0"

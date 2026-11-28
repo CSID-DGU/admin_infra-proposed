@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: master-admin-frontend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  selector:
+    {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "frontend") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: master-admin-frontend
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.adminFrontend.replicas }}
+  selector:
+    matchLabels:
+      {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "frontend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "provi-master-admin.componentLabels" (dict "root" . "component" "frontend") | nindent 8 }}
+      annotations:
+        provi.dgu.ac.kr/infra-sha: {{ .Values.provenance.infraSha | quote }}
+        provi.dgu.ac.kr/frontend-sha: {{ .Values.provenance.frontendSha | quote }}
+        provi.dgu.ac.kr/runtime-mode: {{ .Values.runtimeMode | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        {{- include "provi-master-admin.nodeSelector" . | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: {{ include "provi-master-admin.frontendImage" . | quote }}
+          imagePullPolicy: {{ .Values.adminFrontend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 15
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: {{ .Values.adminFrontend.resources.requests.cpu }}
+              memory: {{ .Values.adminFrontend.resources.requests.memory }}
+              ephemeral-storage: {{ .Values.adminFrontend.resources.requests.ephemeralStorage }}
+            limits:
+              cpu: {{ .Values.adminFrontend.resources.limits.cpu }}
+              memory: {{ .Values.adminFrontend.resources.limits.memory }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: run
+          emptyDir:
+            sizeLimit: 8Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi

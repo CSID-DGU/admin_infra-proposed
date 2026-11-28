@@ -1,0 +1,19 @@
+{{- include "provi-master-admin.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: master-admin-release-contract
+  namespace: {{ include "provi-master-admin.namespace" . }}
+  labels:
+    {{- include "provi-master-admin.commonLabels" . | nindent 4 }}
+data:
+  data-mode: {{ .Values.dataMode | quote }}
+  runtime-mode: {{ .Values.runtimeMode | quote }}
+  infra-sha: {{ .Values.provenance.infraSha | quote }}
+  backend-sha: {{ .Values.provenance.backendSha | quote }}
+  frontend-sha: {{ .Values.provenance.frontendSha | quote }}
+  ingress-enabled: {{ .Values.ingress.enabled | quote }}
+  mysql-read-only: {{ .Values.mysql.readOnly | quote }}
+  redis-read-only: {{ .Values.redis.readOnly | quote }}
+  mysql-receipt-sha256: {{ .Values.mysql.expectedReceiptSha256 | quote }}
+  redis-receipt-sha256: {{ .Values.redis.expectedReceiptSha256 | quote }}
